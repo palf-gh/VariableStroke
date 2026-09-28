@@ -11,7 +11,7 @@ DEFAULT_WIDTH = 40.0
 
 
 def enabled(path):
-    return bool(path.userData.get(PATH_KEY))
+    return bool(path.attributes.get(PATH_KEY))
 
 
 def width(node):
@@ -60,8 +60,8 @@ def segments_for_path(path):
 
 def polygons_for_path(path):
     return outline(segments_for_path(path), bool(path.closed),
-                   path.userData.get(CAP_START_KEY, 'flat'),
-                   path.userData.get(CAP_END_KEY, 'flat'))
+                   path.attributes.get(CAP_START_KEY, 'flat'),
+                   path.attributes.get(CAP_END_KEY, 'flat'))
 
 
 def generated_paths(path):

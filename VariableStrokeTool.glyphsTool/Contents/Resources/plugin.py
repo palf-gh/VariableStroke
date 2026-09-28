@@ -104,9 +104,9 @@ class VariableStrokeTool(SelectTool):
         layer.beginChanges()
         try:
             for path in paths:
-                path.userData[PATH_KEY] = True
-                path.userData[CAP_START_KEY] = path.userData.get(CAP_START_KEY, 'flat')
-                path.userData[CAP_END_KEY] = path.userData.get(CAP_END_KEY, 'flat')
+                path.attributes[PATH_KEY] = True
+                path.attributes[CAP_START_KEY] = path.attributes.get(CAP_START_KEY, 'flat')
+                path.attributes[CAP_END_KEY] = path.attributes.get(CAP_END_KEY, 'flat')
                 path.attributes['fill'] = False
                 for node in path.nodes:
                     if node.type != OFFCURVE and WIDTH_KEY not in node.userData:
@@ -127,7 +127,7 @@ class VariableStrokeTool(SelectTool):
         try:
             for path in self._selected_paths(layer):
                 if enabled(path) and not path.closed:
-                    path.userData[key] = style
+                    path.attributes[key] = style
         finally:
             layer.endChanges()
         self._redraw()

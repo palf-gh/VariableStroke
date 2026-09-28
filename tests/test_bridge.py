@@ -23,7 +23,7 @@ class Path:
     def __init__(self, nodes, closed=False):
         self.nodes = nodes
         self.closed = closed
-        self.userData = {'com.codex.VariableStroke.enabled': True}
+        self.attributes = {'com.codex.VariableStroke.enabled': True}
 
 
 fake.GSPath = Path
