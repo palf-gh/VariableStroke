@@ -31,7 +31,7 @@ class VariableStrokeTool(SelectTool):
     def _build_cap_menus(self):
         for side in ('start', 'end'):
             for style, label in CAP_NAMES:
-                method = getattr(self, 'cap_%s_%s_' % (side, style))
+                method = getattr(self, 'cap%s%s_' % (side.title(), style.title()))
                 self.generalContextMenus.append({
                     'name': 'Variable Stroke: %s cap → %s' % (side.title(), label),
                     'action': method,
@@ -92,7 +92,6 @@ class VariableStrokeTool(SelectTool):
         selected = list(layer.selection)
         return [path for path in layer.paths if any(node in selected for node in path.nodes)]
 
-    @objc.python_method
     def enableSelectedPaths_(self, sender):
         layer = self._layer()
         if layer is None:
@@ -133,18 +132,17 @@ class VariableStrokeTool(SelectTool):
             layer.endChanges()
         self._redraw()
 
-    def cap_start_flat_(self, sender): self._set_cap('start', 'flat')
-    def cap_start_round_(self, sender): self._set_cap('start', 'round')
-    def cap_start_square_(self, sender): self._set_cap('start', 'square')
-    def cap_start_horizontal_(self, sender): self._set_cap('start', 'horizontal')
-    def cap_start_vertical_(self, sender): self._set_cap('start', 'vertical')
-    def cap_end_flat_(self, sender): self._set_cap('end', 'flat')
-    def cap_end_round_(self, sender): self._set_cap('end', 'round')
-    def cap_end_square_(self, sender): self._set_cap('end', 'square')
-    def cap_end_horizontal_(self, sender): self._set_cap('end', 'horizontal')
-    def cap_end_vertical_(self, sender): self._set_cap('end', 'vertical')
+    def capStartFlat_(self, sender): self._set_cap('start', 'flat')
+    def capStartRound_(self, sender): self._set_cap('start', 'round')
+    def capStartSquare_(self, sender): self._set_cap('start', 'square')
+    def capStartHorizontal_(self, sender): self._set_cap('start', 'horizontal')
+    def capStartVertical_(self, sender): self._set_cap('start', 'vertical')
+    def capEndFlat_(self, sender): self._set_cap('end', 'flat')
+    def capEndRound_(self, sender): self._set_cap('end', 'round')
+    def capEndSquare_(self, sender): self._set_cap('end', 'square')
+    def capEndHorizontal_(self, sender): self._set_cap('end', 'horizontal')
+    def capEndVertical_(self, sender): self._set_cap('end', 'vertical')
 
-    @objc.python_method
     def convertSelectedLayer_(self, sender):
         layer = self._layer()
         if layer is None:
