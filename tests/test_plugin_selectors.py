@@ -20,14 +20,26 @@ class SelectorTests(unittest.TestCase):
             with self.subTest(method=method.name):
                 self.assertEqual(method.name.count('_'), len(method.args.args) - 1)
 
-    def test_all_cap_menu_selectors_exist(self):
+    def test_inspector_actions_exist(self):
         module = ast.parse(PLUGIN.read_text())
         plugin = next(node for node in module.body if isinstance(node, ast.ClassDef)
                       and node.name == 'VariableStrokeTool')
         methods = {method.name for method in plugin.body if isinstance(method, ast.FunctionDef)}
-        for side in ('Start', 'End'):
-            for style in ('Flat', 'Round', 'Square', 'Horizontal', 'Vertical'):
-                self.assertIn('cap%s%s_' % (side, style), methods)
+        for name in ('view', 'toggleFromInspector_', 'widthFromInspector_',
+                     'startCapFromInspector_', 'endCapFromInspector_',
+                     'convertSelectedLayer_'):
+            self.assertIn(name, methods)
+
+    def test_context_menu_is_compact(self):
+        module = ast.parse(PLUGIN.read_text())
+        plugin = next(node for node in module.body if isinstance(node, ast.ClassDef)
+                      and node.name == 'VariableStrokeTool')
+        settings = next(node for node in plugin.body if isinstance(node, ast.FunctionDef)
+                        and node.name == 'settings')
+        assignment = next(node for node in settings.body if isinstance(node, ast.Assign)
+                          and any(isinstance(target, ast.Attribute) and
+                                  target.attr == 'generalContextMenus' for target in node.targets))
+        self.assertEqual(len(assignment.value.elts), 2)
 
 
 if __name__ == '__main__':
