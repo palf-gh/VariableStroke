@@ -1,8 +1,9 @@
+import math
 import sys
 import unittest
 from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from variable_stroke_core import outline, outline_curves
+from variable_stroke_core import outline, outline_curves, node_edges
 
 
 class GeometryTests(unittest.TestCase):
@@ -51,6 +52,42 @@ class GeometryTests(unittest.TestCase):
         horizontal = [points for kind, points in contour if kind == 'line'
                       and abs(points[0][1]) < 0.001 and abs(points[-1][1]) < 0.001]
         self.assertTrue(horizontal)
+
+    def test_corner_handles_sit_on_the_outline_corner(self):
+        segments = [('line', ((0, 0), (300, 0)), (40, 40, 0), (40, 40, 0)),
+                    ('line', ((300, 0), (300, 300)), (100, 100, 0), (100, 100, 0))]
+        edges = node_edges(segments)
+        left, right = edges[1]
+        # Turning left: the left side is the inner corner, the right side the miter.
+        self.assertAlmostEqual(left[0], 250.0)
+        self.assertAlmostEqual(left[1], 20.0)
+        self.assertAlmostEqual(right[0], 350.0)
+        self.assertAlmostEqual(right[1], -20.0)
+        self.assertEqual(sorted(edges), [0, 1, 2])
+
+    def test_custom_angle_cut(self):
+        seg = [('line', ((0, 0), (0, 300)), 60, 60)]
+        contour = outline_curves(seg, False, 'flat', 'angle', end_angle=30)[0]
+        # The end cap is a single line through (0, 300) at 30 degrees.
+        cap = [points for kind, points in contour if kind == 'line'
+               and abs(points[0][1] - 300) < 40 and abs(points[1][1] - 300) < 40][0]
+        (x0, y0), (x1, y1) = cap
+        self.assertAlmostEqual(math.degrees(math.atan2(y1 - y0, x1 - x0)) % 180, 30, places=3)
+        self.assertAlmostEqual((y0 - 300) * math.cos(math.radians(30)) -
+                               x0 * math.sin(math.radians(30)), 0, places=3)
+
+    def test_corner_moves_continuously(self):
+        previous = None
+        for step in range(0, 1700):
+            angle = math.radians(step * 0.1 + 0.05)
+            end = (400 + 300*math.cos(angle), 300*math.sin(angle))
+            segments = [('line', ((0, 0), (400, 0)), 60, 60), ('line', ((400, 0), end), 60, 60)]
+            left, right = node_edges(segments)[1]
+            if previous:
+                jump = max(math.hypot(left[0]-previous[0][0], left[1]-previous[0][1]),
+                           math.hypot(right[0]-previous[1][0], right[1]-previous[1][1]))
+                self.assertLess(jump, 2.0, 'jump at %.1f degrees' % (step * 0.1))
+            previous = (left, right)
 
     def test_bad_width(self):
         with self.assertRaises(ValueError):

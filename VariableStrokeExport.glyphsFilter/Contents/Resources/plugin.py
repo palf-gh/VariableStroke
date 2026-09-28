@@ -18,6 +18,13 @@ class VariableStrokeExport(FilterWithoutDialog):
     def filter(self, layer, inEditView, customParameters):
         convert_layer(layer)
 
+    @objc.signature(b'v@:@@')
+    def processGlyph_withArguments_(self, glyph, arguments):
+        # 'PreInterpolationFilter': expand every master before interpolation. The
+        # outline structure is fixed, so the expanded masters stay compatible.
+        for layer in glyph.layers:
+            convert_layer(layer)
+
     @objc.python_method
     def __file__(self):
         return __file__

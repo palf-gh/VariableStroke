@@ -33,9 +33,10 @@ class SelectorTests(unittest.TestCase):
         plugin = next(node for node in module.body if isinstance(node, ast.ClassDef)
                       and node.name == 'VariableStrokeTool')
         methods = {method.name for method in plugin.body if isinstance(method, ast.FunctionDef)}
-        for name in ('activate', 'view', 'toggleFromInspector_', 'widthFromInspector_',
-                     'startCapFromInspector_', 'endCapFromInspector_',
-                     'convertSelectedLayer_'):
+        for name in ('activate', 'deactivate', 'toggleFromInspector_',
+                     'resetWidthFromInspector_', 'showSettingsFromInspector_',
+                     'startCapFromInspector_', 'endCapFromInspector_', '_field_edit',
+                     '_apply_field'):
             self.assertIn(name, methods)
 
     def test_context_menu_is_global_submenu(self):
@@ -46,13 +47,50 @@ class SelectorTests(unittest.TestCase):
         self.assertIn('submenu.setAutoenablesItems_(False)', source)
         self.assertIn('GSCallbackHandler.addCallback_forOperation_', source)
 
+    def test_inspector_uses_glyphs_callback(self):
+        source = PLUGIN.read_text()
+        module = ast.parse(source)
+        provider = next(node for node in module.body if isinstance(node, ast.ClassDef)
+                        and node.name == 'VariableStrokeInspectorProvider')
+        self.assertIn('inspectorViewControllersForLayer_',
+                      {item.name for item in provider.body if isinstance(item, ast.FunctionDef)})
+        self.assertIn("'GSInspectorViewControllersCallback'", source)
+        self.assertIn('addCallback_forOperation_(self._inspector_provider, INSPECTOR_CALLBACK)', source)
+
+    def test_outline_is_built_in_glyphs_prepared_layer(self):
+        source = PLUGIN.read_text()
+        module = ast.parse(source)
+        processor = next(node for node in module.body if isinstance(node, ast.ClassDef)
+                         and node.name == 'VariableStrokeLayerProcessor')
+        method = next(item for item in processor.body if isinstance(item, ast.FunctionDef)
+                      and item.name == 'processLayer_extraHandles_error_')
+        self.assertEqual(len(method.args.args) - 1, 3)
+        self.assertIn("objc.signature(b'Z@:@@o^@')", source)
+        self.assertIn("'GSPrepareLayerCallback'", source)
+        self.assertIn('addCallback_forOperation_(self._layer_processor, PREPARE_LAYER_CALLBACK)', source)
+
+    def test_fields_preview_live_and_tab_between_each_other(self):
+        source = PLUGIN.read_text()
+        module = ast.parse(source)
+        delegate = next(node for node in module.body if isinstance(node, ast.ClassDef)
+                        and node.name == 'VariableStrokeFieldDelegate')
+        methods = {item.name: len(item.args.args) - 1 for item in delegate.body
+                   if isinstance(item, ast.FunctionDef)}
+        self.assertEqual(methods['controlTextDidChange_'], 1)
+        self.assertEqual(methods['controlTextDidEndEditing_'], 1)
+        self.assertEqual(methods['stepped_'], 1)
+        self.assertIn('setNextKeyView_', source)
+        self.assertIn('disableUndoRegistration', source)
+
     def test_panel_has_distinct_on_off_controls(self):
         source = PLUGIN.read_text()
         self.assertIn('InspectorGroup(', source)
-        self.assertIn('width_px, height_px = 590, 58', source)
+        self.assertIn('PANEL_SIZE = (442, 52)', source)
+        self.assertIn('setTranslatesAutoresizingMaskIntoConstraints_(False)', source)
         self.assertIn("{'title': 'ON'}, {'title': 'OFF'}", source)
-        self.assertIn('group.startCap = PopUpButton(', source)
-        self.assertIn('group.endCap = PopUpButton(', source)
+        self.assertIn('group.startCap = SegmentedButton(', source)
+        self.assertIn('group.endCap = SegmentedButton(', source)
+        self.assertIn("{'imageObject': _cap_icon(value)", source)
 
 
 if __name__ == '__main__':
