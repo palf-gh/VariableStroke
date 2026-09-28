@@ -415,6 +415,24 @@ class _Side(object):
                 break  # already far below what anyone can see
             us = [min(max(i/64.0, 1e-3), 1-1e-3) for i in nearest]
         controls = best[1]
+        # A tight inner offset can fold back near a smooth node. Least squares
+        # then collapses its end handle to zero, turning the joined outline
+        # into a flat spot followed by a kink. Preserve the source tangent at
+        # that node and give it enough length to form a visible smooth bend.
+        if not gentle and chord > EPS:
+            p0, p1, p2, p3 = controls
+            for at_end, edge, center in ((False, d0, center0), (True, d1, center1)):
+                handle = length(sub(p3, p2) if at_end else sub(p1, p0))
+                source_handle = length(sub(self.pts[-1], self.pts[-2]) if at_end
+                                       else sub(self.pts[1], self.pts[0]))
+                alignment = edge[0]*center[0] + edge[1]*center[1]
+                if handle < 0.03*chord and source_handle > 0.1*source_chord and alignment > 0.8:
+                    size = min(0.16*chord, 0.6*source_handle)
+                    if at_end:
+                        p2 = sub(p3, mul(center, size))
+                    else:
+                        p1 = add(p0, mul(center, size))
+            controls = (p0, p1, p2, p3)
         # A true normal offset can cancel a gentle centerline's bend entirely.
         # For display outlines, retain some of that bend rather than producing
         # an almost straight edge beside a visibly curved centerline.

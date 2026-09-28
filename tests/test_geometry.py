@@ -186,6 +186,24 @@ class GeometryTests(unittest.TestCase):
         self.assertAlmostEqual(a.end[0], 357)
         self.assertLess(math.dist(a.at(a.tb), a.end), 0.5)
 
+    def test_thick_hook_keeps_smooth_inner_turn(self):
+        # User's 198 x 700 hook: the inner offset briefly folds back near
+        # the bottom node, but the displayed curve must keep a real handle.
+        nib = (165, 140, 0)
+        segments = [
+            ('cubic', ((33, 0), (12, 117), (0, 213), (0, 352)), nib, nib),
+            ('cubic', ((0, 352), (0, 574), (44, 700), (124, 700)), nib, nib),
+            ('cubic', ((124, 700), (148, 700), (178, 695), (198, 684)), nib, nib),
+        ]
+        contour = outline_curves(segments, cap_end='vertical')[0]
+        # Right side runs backwards through the contour. Both handles at its
+        # smooth bottom node should point horizontally and stay substantial.
+        incoming, outgoing = contour[4][1], contour[5][1]
+        self.assertEqual(incoming[-1], outgoing[0])
+        self.assertLess(abs(incoming[-1][1] - incoming[-2][1]), 2)
+        self.assertLess(abs(outgoing[1][1] - outgoing[0][1]), 2)
+        self.assertGreater(math.dist(outgoing[0], outgoing[1]), 30)
+
     def test_svg_mountain_horizontal_cuts_follow_curves(self):
         from variable_stroke_core import _normalized_bend
         left = ((0, 315), (93, 251), (306, 55), (357, 0))
