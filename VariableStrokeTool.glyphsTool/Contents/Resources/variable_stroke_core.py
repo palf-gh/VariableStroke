@@ -464,7 +464,18 @@ class _Side(object):
                         q1 = add(q1, mul(chord_direction, v1-u1))
                         q2 = add(q2, mul(chord_direction, v2-u2))
                         controls = (p0, q1, q2, p3)
-        return ('cubic', controls)
+        # Section tilt positions the two outline nodes, but must not tilt the
+        # Bézier handles at the source node. Adjacent segments may have quite
+        # different tilt gradients; using their offset derivatives here makes
+        # an otherwise smooth centerline acquire a visible kink.
+        p0, p1, p2, p3 = controls
+        if abs(ta) < EPS and abs(self.n0[3]) > EPS:
+            handle = min(max(length(sub(p1, p0)), 0.05*chord), 0.75*chord)
+            p1 = add(p0, mul(center0, handle))
+        if abs(tb-1) < EPS and abs(self.n1[3]) > EPS:
+            handle = min(max(length(sub(p3, p2)), 0.05*chord), 0.75*chord)
+            p2 = sub(p3, mul(center1, handle))
+        return ('cubic', (p0, p1, p2, p3))
 
 
 def _nearest_along(samples, curve, window=24):

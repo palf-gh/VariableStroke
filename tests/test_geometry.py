@@ -4,7 +4,7 @@ import unittest
 from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from variable_stroke_core import (outline, outline_curves, node_edges, nib_edges,
-                                  _Side, _join, sub, unit)
+                                  _Side, _join, sub, unit, length)
 
 
 class GeometryTests(unittest.TestCase):
@@ -22,6 +22,23 @@ class GeometryTests(unittest.TestCase):
         self.assertEqual(contour[0][1][0], (0.0, 70.0))
         self.assertLess(contour[0][1][1][0], 100)
         self.assertGreater(contour[2][1][0][0], 100)
+
+    def test_rotated_smooth_node_keeps_source_handle_angle(self):
+        plain, tilted = (165, 140, 0, 0), (165, 140, 0, 30)
+        segments = [
+            ('cubic', ((0, 0), (70, 0), (130, 100), (200, 100)), plain, tilted),
+            ('cubic', ((200, 100), (270, 100), (330, 0), (400, 0)), tilted, plain),
+        ]
+        contour = outline_curves(segments)[0]
+        for incoming, outgoing in ((contour[0][1], contour[1][1]),
+                                    (contour[3][1], contour[4][1])):
+            self.assertEqual(incoming[-1], outgoing[0])
+            before = sub(incoming[-1], incoming[-2])
+            after = sub(outgoing[1], outgoing[0])
+            self.assertGreater(length(before), 1)
+            self.assertGreater(length(after), 1)
+            self.assertAlmostEqual(before[1], 0, places=5)
+            self.assertAlmostEqual(after[1], 0, places=5)
 
     def test_cut_extension_does_not_change_the_curve_handles(self):
         segment = [('cubic', ((0, 0), (50, 50), (150, 100), (200, 150)),
