@@ -227,32 +227,14 @@ def _nib(value):
     return (w, h, max(-1.0, min(1.0, o)))
 
 
-def _nib_matrix_apply(q, a, b, slant):
-    # Unit circle -> nib ellipse: semi-axis a horizontal, b along the italic
-    # direction (0, 1) sheared by `slant` = tan(italic angle).
-    return (a*q[0] + b*slant*q[1], b*q[1])
-
-
-def _nib_direction(n, a, b, slant):
-    """Unit-circle parameter of the nib point that lies furthest in direction n."""
-    v = (a*n[0], b*(slant*n[0] + n[1]))
-    return unit(v) if length(v) > EPS else (0.0, 0.0)
-
-
-def _support(n, a, b, slant):
-    return _nib_matrix_apply(_nib_direction(n, a, b, slant), a, b, slant)
-
-
 def _half_thickness(n, w, h, slant):
     """Half the stroke thickness across direction n (unit normal of the stroke).
 
     Vertical strokes get the width, horizontal ones the height and diagonals a
-    smooth blend (the reach of a w x h ellipse whose height axis follows the
-    italic angle). The edges themselves are always placed along n, so ends
-    and caps stay perpendicular to the stroke.
+    smooth blend. The axes must stay independent even when an italic angle is
+    set; that angle controls cuts, not the thickness of a vertical stroke.
     """
-    edge = _support(n, w/2.0, h/2.0, slant)
-    return max(edge[0]*n[0] + edge[1]*n[1], 0.0)
+    return math.hypot(w*n[0], h*n[1]) / 2.0
 
 
 def nib_edges(point, tangent, nib, italic_angle=0.0):
@@ -335,6 +317,8 @@ class _Side(object):
         self.w0, self.w1 = self.n0[0], self.n1[0]
         self.ta, self.tb = 0.0, 1.0
         self.start, self.end = self.at(0.0), self.at(1.0)
+        self.override_piece = None
+        self.join_extension_ratio = 0.0
 
     def nib(self, t):
         return tuple(x*(1-t) + y*t for x, y in zip(self.n0, self.n1))
@@ -357,6 +341,15 @@ class _Side(object):
         # node share it, so smooth centerline nodes stay smooth in the outline.
         return unit(_derivative(self.kind, self.pts, t))
 
+    def edge_tangent(self, t):
+        """Direction of the offset edge, including changing width and curvature."""
+        step = max((self.tb - self.ta) * 1e-4, 1e-6)
+        lo, hi = max(self.ta, t-step), min(self.tb, t+step)
+        if hi <= lo:
+            return self.tangent(t)
+        direction = sub(self.at(hi), self.at(lo))
+        return unit(direction) if length(direction) > EPS else self.tangent(t)
+
     def polyline(self, count=48):
         return [self.start] + [self.at(self.ta + (self.tb-self.ta)*i/float(count))
                                for i in range(1, count)] + [self.end]
@@ -364,23 +357,116 @@ class _Side(object):
     def piece(self):
         if self.kind == 'line':
             return ('line', (self.start, self.end))
+        ta, tb = self.ta, self.tb
         p0, p3 = self.start, self.end
         chord = length(sub(p3, p0))
-        d0, d1 = self.tangent(self.ta), self.tangent(self.tb)
+        d0, d1 = self.edge_tangent(ta), self.edge_tangent(tb)
         count = 16
+        step = (tb-ta) / count
+        # A corner join or angled cut can move an endpoint far from the true
+        # offset curve. Its old tangent then points away from the first interior
+        # sample and can force a loop or S-bend into the fitted cubic.
+        if length(sub(p0, self.at(ta))) > 0.05:
+            d0 = unit(sub(self.at(ta+step), p0))
+        if length(sub(p3, self.at(tb))) > 0.05:
+            d1 = unit(sub(p3, self.at(tb-step)))
+        # When the stroke is wider than the local radius of curvature, the
+        # mathematical offset can turn backwards even though the centerline is
+        # gentle. Keep the outline visually flowing forward in that case.
+        source_chord = length(sub(self.pts[-1], self.pts[0]))
+        source_hull = sum(length(sub(self.pts[i+1], self.pts[i])) for i in range(3))
+        center0, center1 = self.tangent(ta), self.tangent(tb)
+        gentle = (source_chord > EPS and length(sub(p0, self.at(ta))) < 0.05 and
+                  length(sub(p3, self.at(tb))) < 0.05 and
+                  source_hull < 1.4*source_chord and
+                  center0[0]*center1[0] + center0[1]*center1[1] > 0.7)
+        chord_direction = unit(sub(p3, p0))
+        if gentle:
+            for index, (edge, center) in enumerate(((d0, center0), (d1, center1))):
+                if edge[0]*chord_direction[0] + edge[1]*chord_direction[1] < 0.5 or \
+                        edge[0]*center[0] + edge[1]*center[1] < 0.2:
+                    direction = unit(add(mul(center, 0.7), mul(chord_direction, 0.3)))
+                    if index == 0:
+                        d0 = direction
+                    else:
+                        d1 = direction
         us = [i/float(count) for i in range(1, count)]
-        samples = [self.at(self.ta + (self.tb-self.ta)*u) for u in us]
+        samples = [self.at(ta + (tb-ta)*u) for u in us]
         best = None
         for _ in range(4):
             controls = _handles(p0, p3, d0, d1, samples, us, chord)
+            if gentle:
+                alpha = min(max(length(sub(controls[1], p0)), 0.05*chord), 0.75*chord)
+                beta = min(max(length(sub(p3, controls[2])), 0.05*chord), 0.75*chord)
+                progress = (alpha*(d0[0]*chord_direction[0] + d0[1]*chord_direction[1]) +
+                            beta*(d1[0]*chord_direction[0] + d1[1]*chord_direction[1]))
+                if progress > 0.9*chord:
+                    scale = 0.9*chord/progress
+                    alpha, beta = alpha*scale, beta*scale
+                controls = (p0, add(p0, mul(d0, alpha)),
+                            sub(p3, mul(d1, beta)), p3)
             curve = [cubic(*controls, i/64.0) for i in range(65)]
-            nearest = [min(range(65), key=lambda i: length(sub(p, curve[i]))) for p in samples]
+            nearest = _nearest_along(samples, curve)
             error = max(min(_point_segment_distance(p, curve[j], curve[j+1])
                             for j in (i-1, i) if 0 <= j < 64) for p, i in zip(samples, nearest))
             if best is None or error < best[0]:
                 best = (error, controls)
+            if error <= FIT_TOLERANCE / 4.0:
+                break  # already far below what anyone can see
             us = [min(max(i/64.0, 1e-3), 1-1e-3) for i in nearest]
-        return ('cubic', best[1])
+        controls = best[1]
+        # A true normal offset can cancel a gentle centerline's bend entirely.
+        # For display outlines, retain some of that bend rather than producing
+        # an almost straight edge beside a visibly curved centerline.
+        if gentle and abs(ta) < EPS and abs(tb-1) < EPS and source_chord > EPS:
+            bend_normal = normal(unit(sub(self.pts[-1], self.pts[0])))
+            source_mid = cubic(*self.pts, 0.5)
+            source_bend = sum((source_mid[i] - (self.pts[0][i]+self.pts[-1][i])*0.5)
+                              * bend_normal[i] for i in range(2))
+            if abs(source_bend) > 2.0:
+                mid = cubic(*controls, 0.5)
+                fitted_bend = sum((mid[i] - (p0[i]+p3[i])*0.5)*bend_normal[i]
+                                  for i in range(2))
+                if source_bend*fitted_bend < 0.7*source_bend*source_bend:
+                    offset0, offset1 = sub(p0, self.pts[0]), sub(p3, self.pts[-1])
+                    shape = (p0,
+                             add(self.pts[1], add(mul(offset0, 2/3), mul(offset1, 1/3))),
+                             add(self.pts[2], add(mul(offset0, 1/3), mul(offset1, 2/3))),
+                             p3)
+                    shape_mid = cubic(*shape, 0.5)
+                    shape_bend = sum((shape_mid[i] - (p0[i]+p3[i])*0.5)*bend_normal[i]
+                                     for i in range(2))
+                    difference = shape_bend-fitted_bend
+                    if abs(difference) > EPS:
+                        weight = min(1.0, max(0.0,
+                            (0.7*source_bend-fitted_bend)/difference))
+                        q1 = add(mul(controls[1], 1-weight), mul(shape[1], weight))
+                        q2 = add(mul(controls[2], 1-weight), mul(shape[2], weight))
+                        # Keep the control polygon moving along the edge chord.
+                        u1 = sum((q1[i]-p0[i])*chord_direction[i] for i in range(2))
+                        u2 = sum((q2[i]-p0[i])*chord_direction[i] for i in range(2))
+                        v1 = min(chord, max(0.0, u1))
+                        v2 = min(chord, max(v1, u2))
+                        q1 = add(q1, mul(chord_direction, v1-u1))
+                        q2 = add(q2, mul(chord_direction, v2-u2))
+                        controls = (p0, q1, q2, p3)
+        return ('cubic', controls)
+
+
+def _nearest_along(samples, curve, window=24):
+    """Index of the closest curve point for each sample. Samples run along the
+    curve in order, so each search starts just before the previous match."""
+    result, start, last = [], 0, len(curve)
+    for x, y in samples:
+        best_i, best_d = start, float('inf')
+        for i in range(start, min(last, start + window)):
+            dx, dy = curve[i][0] - x, curve[i][1] - y
+            d = dx*dx + dy*dy
+            if d < best_d:
+                best_i, best_d = i, d
+        result.append(best_i)
+        start = max(0, best_i - 4)
+    return result
 
 
 def _handles(p0, p3, d0, d1, samples, us, chord):
@@ -419,6 +505,65 @@ def _segment_intersection(a, b, c, d):
     return None
 
 
+def _curve_line_join(a, b, reach):
+    """Join a cubic and a line at their actual intersection, continuing the cubic.
+
+    The cubic's existing interval stays exactly the same polynomial. Only its
+    parameter interval changes, so the corner cannot pull a handle inward.
+    """
+    curve, line = (a, b) if a.kind == 'cubic' else (b, a)
+    at_end = curve is a
+    edge = 1.0 if at_end else 0.0
+    controls = (curve.override_piece or curve.piece())[1]
+    origin, direction = line.start, unit(sub(line.end, line.start))
+    if length(sub(line.end, line.start)) < EPS:
+        return False
+
+    def signed(t):
+        delta = sub(cubic(*controls, t), origin)
+        return delta[0]*direction[1] - delta[1]*direction[0]
+
+    original = cubic(*controls, edge)
+    line_end = line.start if at_end else line.end
+    initial = unit(cubic_derivative(*controls, edge))
+    choices = []
+    for step, count in ((-1.0 if at_end else 1.0, 32),
+                        (1.0 if at_end else -1.0, 16)):
+        previous_t, previous = edge, signed(edge)
+        for i in range(1, count+1):
+            t = edge + step*i/32.0
+            current = signed(t)
+            if previous == 0 or (previous > 0) != (current > 0):
+                lo, hi = previous_t, t
+                for _ in range(24):
+                    mid = (lo+hi)/2.0
+                    if (signed(mid) > 0) == (previous > 0):
+                        lo = mid
+                    else:
+                        hi = mid
+                hit_t = (lo+hi)/2.0
+                hit = cubic(*controls, hit_t)
+                curve_distance = length(sub(hit, original))
+                line_distance = length(sub(hit, line_end))
+                if curve_distance <= reach and line_distance <= reach:
+                    tangent = unit(cubic_derivative(*controls, hit_t))
+                    if 0.0 <= hit_t <= 1.0 or \
+                            tangent[0]*initial[0] + tangent[1]*initial[1] > 0.85:
+                        choices.append((curve_distance+line_distance, hit_t, hit))
+                break  # nearest crossing in this direction
+            previous_t, previous = t, current
+    if not choices:
+        return False
+    _, hit_t, hit = min(choices)
+    interval = (0.0, hit_t) if at_end else (hit_t, 1.0)
+    curve.override_piece = ('cubic', _cubic_interval(controls, *interval))
+    if at_end:
+        curve.end = line.start = hit
+    else:
+        curve.start = line.end = hit
+    return True
+
+
 def _join(a, b, width):
     """Make side `a` end and side `b` start on one shared point at a centerline node.
 
@@ -437,6 +582,9 @@ def _join(a, b, width):
         return
     reach = MITER_LIMIT * width / 2.0
     ta, tb = a.tangent(a.tb), b.tangent(b.ta)
+    bend = abs(ta[0]*tb[1] - ta[1]*tb[0])
+    if a.kind != b.kind and bend > NEAR_STRAIGHT and _curve_line_join(a, b, reach):
+        return
     middle = mul(add(a.end, b.start), 0.5)
     denominator = ta[0]*tb[1] - ta[1]*tb[0]
     if abs(denominator) < 1e-9:
@@ -463,15 +611,69 @@ def _join(a, b, width):
     distance = length(sub(point, middle))
     if distance > reach:
         point = add(middle, mul(sub(point, middle), reach / distance))
+    a_controls = (a.override_piece or a.piece())[1] if a.kind == 'cubic' else None
+    b_controls = (b.override_piece or b.piece())[1] if b.kind == 'cubic' else None
+    a_trim = ((a_tb-a.ta)/(a.tb-a.ta) if a_controls is not None and a.tb-a.ta > EPS
+              else 1.0)
+    b_trim = ((b_ta-b.ta)/(b.tb-b.ta) if b_controls is not None and b.tb-b.ta > EPS
+              else 0.0)
+    a_on_curve = (a_controls is not None and a_trim < 1-1e-4 and
+                  length(sub(a.at(a_tb), point)) < max(0.5, 0.01*width))
+    b_on_curve = (b_controls is not None and b_trim > 1e-4 and
+                  length(sub(b.at(b_ta), point)) < max(0.5, 0.01*width))
+    if a.kind != b.kind and not \
+            (a_on_curve or b_on_curve):
+        # Only a miter built from tangent extensions needs a visual bound.
+        # A true intersection on the offset curve must stay where it is.
+        center = mul(add(a.pts[-1], b.pts[0]), 0.5)
+        nib_width = max(a.n1[0]*(1+abs(a.n1[2])),
+                        b.n0[0]*(1+abs(b.n0[2]))) / 2.0
+        nib_height = max(a.n1[1]*(1+abs(a.n1[2])),
+                         b.n0[1]*(1+abs(b.n0[2]))) / 2.0
+        x_limit = max(1.35*nib_width, abs(a.end[0]-center[0]),
+                      abs(b.start[0]-center[0]))
+        y_limit = max(1.35*nib_height, abs(a.end[1]-center[1]),
+                      abs(b.start[1]-center[1]))
+        point = (min(center[0]+x_limit, max(center[0]-x_limit, point[0])),
+                 min(center[1]+y_limit, max(center[1]-y_limit, point[1])))
     a.tb, b.ta = a_tb, b_ta
     a.end = b.start = point
+    if a_controls is not None:
+        if a_on_curve:
+            part = _cubic_interval(a_controls, 0.0, a_trim)
+            delta = sub(point, part[-1])
+            controls = (part[0], part[1], add(part[2], delta), point)
+        else:
+            controls = _bend_join_endpoint(a_controls, True, point)
+            direction = unit(sub(a_controls[-1], a_controls[-2]))
+            delta = sub(point, a_controls[-1])
+            if delta[0]*direction[0] + delta[1]*direction[1] > 0:
+                a.join_extension_ratio = max(a.join_extension_ratio,
+                    length(delta)/max(length(sub(a_controls[-1], a_controls[0])), EPS))
+        a.override_piece = ('cubic', controls)
+    if b_controls is not None:
+        if b_on_curve:
+            part = _cubic_interval(b_controls, b_trim, 1.0)
+            delta = sub(point, part[0])
+            controls = (point, add(part[1], delta), part[2], part[3])
+        else:
+            controls = _bend_join_endpoint(b_controls, False, point)
+            direction = unit(sub(b_controls[1], b_controls[0]))
+            delta = sub(point, b_controls[0])
+            if delta[0]*direction[0] + delta[1]*direction[1] < 0:
+                b.join_extension_ratio = max(b.join_extension_ratio,
+                    length(delta)/max(length(sub(b_controls[-1], b_controls[0])), EPS))
+        b.override_piece = ('cubic', controls)
 
 
 def _side_crossing(a, b, ta, tb, reach):
     """Where side a (extended past its end) crosses side b (extended before its
     start), measured along the sides from the corner: (cost, point, a.tb, b.ta).
     Only crossings within 2*reach along the sides count."""
-    count = 48
+    # Curves are already smooth here; 24 chords locate the overlap to well below
+    # an outline unit in ordinary glyph geometry while halving the expensive
+    # offset evaluations made for every neighbouring pair during live editing.
+    count = 24
     extension = reach * 2
     pa = a.polyline(count) + [add(a.end, mul(ta, extension))]
     pb = [sub(b.start, mul(tb, extension))] + b.polyline(count)
@@ -508,68 +710,290 @@ def _side_crossing(a, b, ta, tb, reach):
     return best
 
 
-def _side_contour(sides, widths, closed):
+def _side_contour(sides, widths, closed, joined=False):
     count = len(sides)
-    for k in range(count if closed else count-1):
-        _join(sides[k], sides[(k+1) % count], widths[k])
-    return [side.piece() for side in sides]
+    if not joined:
+        for k in range(count if closed else count-1):
+            _join(sides[k], sides[(k+1) % count], widths[k])
+    return [side.override_piece or side.piece() for side in sides]
+
+
+def _normalized_bend(points):
+    chord = sub(points[-1], points[0])
+    distance = length(chord)
+    if distance < EPS:
+        return 0.0
+    middle = cubic(*points, 0.5)
+    midpoint = mul(add(points[0], points[-1]), 0.5)
+    offset = sub(middle, midpoint)
+    direction = normal(unit(chord))
+    return (offset[0]*direction[0] + offset[1]*direction[1]) / distance
+
+
+def _optical_outer_curve(side):
+    """Give an extended outer edge the visual bend of its source stroke."""
+    if side.kind != 'cubic' or side.join_extension_ratio <= 0.05:
+        return
+    source = side.pts
+    start, end = side.tangent(0.0), side.tangent(1.0)
+    turn = start[0]*end[1] - start[1]*end[0]
+    if turn*side.sign <= 0 or start[0]*end[0] + start[1]*end[1] < 0.7:
+        return
+    source_chord = length(sub(source[-1], source[0]))
+    hull = sum(length(sub(source[i+1], source[i])) for i in range(3))
+    if source_chord < EPS or hull > 1.4*source_chord:
+        return
+    source_bend = _normalized_bend(source)
+    controls = (side.override_piece or side.piece())[1]
+    actual_bend = _normalized_bend(controls)
+    if source_bend*actual_bend <= 0 or abs(actual_bend) >= 1.25*abs(source_bend):
+        return
+    progress = min(1.0, (side.join_extension_ratio-0.05)/0.2)
+    progress = progress*progress*(3-2*progress)
+    scale = 1 + progress*(min(3.0, 1.25*abs(source_bend/actual_bend))-1)
+    p0, p1, p2, p3 = controls
+    chord = sub(p3, p0)
+    direction = unit(chord)
+    for _ in range(5):
+        q1 = add(p0, mul(sub(p1, p0), scale))
+        q2 = sub(p3, mul(sub(p3, p2), scale))
+        u1 = sub(q1, p0)[0]*direction[0] + sub(q1, p0)[1]*direction[1]
+        u2 = sub(q2, p0)[0]*direction[0] + sub(q2, p0)[1]*direction[1]
+        if 0 <= u1 <= u2 <= length(chord):
+            side.override_piece = ('cubic', (p0, q1, q2, p3))
+            return
+        scale = 1 + (scale-1)*0.5
 
 
 def _reverse(pieces):
     return [(kind, tuple(reversed(points))) for kind, points in reversed(pieces)]
 
 
-def _trim(side, at_end, center, m):
-    """Cut `side` back to where it crosses the line through `center` with normal m."""
-    count = 64
-    ts = [side.ta + (side.tb-side.ta)*i/float(count) for i in range(count+1)]
+def _cubic_interval(controls, t0, t1):
+    """Exactly reparameterize a cubic, including a short interval beyond 0..1."""
+    p0, p3 = cubic(*controls, t0), cubic(*controls, t1)
+    span = (t1-t0)/3.0
+    return (p0, add(p0, mul(cubic_derivative(*controls, t0), span)),
+            sub(p3, mul(cubic_derivative(*controls, t1), span)), p3)
+
+
+def _bend_curve_endpoint(controls, at_end, target):
+    """Keep a requested cut when an exact cubic continuation turns away from it."""
+    p0, p1, p2, p3 = controls
     if at_end:
-        ts.reverse()
-
-    def distance(point):
-        return (point[0]-center[0])*m[0] + (point[1]-center[1])*m[1]
-
-    previous_t, previous = ts[0], distance(side.end if at_end else side.start)
-    for t in ts[1:]:
-        current = distance(side.at(t))
-        if previous == 0 or (previous > 0) != (current > 0):
-            f = previous / (previous-current) if previous != current else 0.0
-            hit_t = previous_t + (t-previous_t)*f
-            point = side.at(hit_t)
-            point = sub(point, mul(m, distance(point)))  # exactly on the cut line
-            if at_end:
-                side.tb, side.end = hit_t, point
-            else:
-                side.ta, side.start = hit_t, point
-            return True
-        previous_t, previous = t, current
-    return False
+        chord = sub(target, p0)
+        direction = unit(sub(p3, p2))
+        if direction[0]*chord[0] + direction[1]*chord[1] < 0.5*length(chord):
+            direction = unit(chord)
+        handle = min(max(length(sub(p3, p2)), 0.08*length(chord)),
+                     0.4*length(chord))
+        return (p0, p1, sub(target, mul(direction, handle)), target)
+    chord = sub(p3, target)
+    direction = unit(sub(p1, p0))
+    if direction[0]*chord[0] + direction[1]*chord[1] < 0.5*length(chord):
+        direction = unit(chord)
+    handle = min(max(length(sub(p1, p0)), 0.08*length(chord)),
+                 0.4*length(chord))
+    return (target, add(target, mul(direction, handle)), p2, p3)
 
 
-def _apply_cap(side, at_end, center, tangent, style, nib, slant, angle=0.0):
-    """Move the side's end onto the cap: extend along the end tangent or trim back.
-    The side keeps its single piece, so every cap has the same node count."""
-    p = side.end if at_end else side.start
-    outward = tangent if at_end else mul(tangent, -1)
-    target = None
-    if style == 'square':
-        # Extend by half the stroke thickness: square corners, like a square cap.
-        w, h, _ = nib
-        target = add(p, mul(outward, _half_thickness(normal(tangent), w, h, slant)))
-    elif style in CUTS:
-        m = normal(_cut_direction(style, slant, angle))
-        along = outward[0]*m[0] + outward[1]*m[1]
-        if abs(along) > 1e-6:  # otherwise the stroke runs along the cut
-            s = ((center[0]-p[0])*m[0] + (center[1]-p[1])*m[1]) / along
-            if s >= 0:
-                target = add(p, mul(outward, s))
-            elif not _trim(side, at_end, center, m):
-                target = add(p, mul(outward, s))
-    if target is not None:
+def _fit_join_extension(controls, at_end, target):
+    """Fit one longer cubic through the existing offset curve's interior."""
+    old_length = sum(length(sub(cubic(*controls, (i+1)/12.0),
+                                cubic(*controls, i/12.0))) for i in range(12))
+    extension = length(sub(target, controls[-1] if at_end else controls[0]))
+    if old_length < EPS or extension < EPS:
+        return None
+    occupied = old_length/(old_length+extension)
+    p0, p3 = (controls[0], target) if at_end else (target, controls[-1])
+    c00 = c01 = c11 = 0.0
+    x0 = [0.0, 0.0]
+    x1 = [0.0, 0.0]
+    for i in range(13):
+        s = i/12.0
+        t = s*occupied if at_end else 1-occupied+s*occupied
+        v = 1-t
+        a, b = 3*v*v*t, 3*v*t*t
+        sample = cubic(*controls, s)
+        baseline = add(mul(p0, v*v*v), mul(p3, t*t*t))
+        residual = sub(sample, baseline)
+        c00 += a*a
+        c01 += a*b
+        c11 += b*b
+        for j in range(2):
+            x0[j] += a*residual[j]
+            x1[j] += b*residual[j]
+    determinant = c00*c11-c01*c01
+    if abs(determinant) < EPS:
+        return None
+    p1 = tuple((x0[j]*c11-x1[j]*c01)/determinant for j in range(2))
+    p2 = tuple((x1[j]*c00-x0[j]*c01)/determinant for j in range(2))
+    return (p0, p1, p2, p3)
+
+
+def _bend_join_endpoint(controls, at_end, target):
+    """Extend one cubic while retaining the width-derived offset interval."""
+    bent = _bend_curve_endpoint(controls, at_end, target)
+    original = controls[-1] if at_end else controls[0]
+    source_chord = length(sub(controls[-1], controls[0]))
+    if source_chord < EPS:
+        return bent
+    ratio = length(sub(target, original)) / source_chord
+    tangent = unit(sub(controls[-1], controls[-2]) if at_end else
+                   sub(controls[1], controls[0]))
+    displacement = sub(target, original)
+    along = displacement[0]*tangent[0] + displacement[1]*tangent[1]
+    if ratio <= 0.05 or (along <= 0 if at_end else along >= 0):
+        return bent
+    fitted = _fit_join_extension(controls, at_end, target)
+    if fitted is None:
+        return bent
+    activation = min(1.0, (ratio-0.05)/0.13)
+    activation = activation*activation*(3-2*activation)
+    weight = min(1.0, 0.3/ratio)*activation
+    p0, p3 = bent[0], bent[-1]
+    chord = sub(p3, p0)
+    chord_length = length(chord)
+    if chord_length < EPS:
+        return bent
+    direction = unit(chord)
+    for _ in range(4):
+        far_weight = min(1.0, 1.75*weight)
+        first_weight, second_weight = ((far_weight, weight) if at_end else
+                                       (weight, far_weight))
+        p1 = add(mul(bent[1], 1-first_weight), mul(fitted[1], first_weight))
+        p2 = add(mul(bent[2], 1-second_weight), mul(fitted[2], second_weight))
+        u1 = sub(p1, p0)[0]*direction[0] + sub(p1, p0)[1]*direction[1]
+        u2 = sub(p2, p0)[0]*direction[0] + sub(p2, p0)[1]*direction[1]
+        if 0 <= u1 <= u2 <= chord_length:
+            return (p0, p1, p2, p3)
+        weight *= 0.5
+    return bent
+
+
+def _cap_on_curve(side, at_end, center, tangent, style, nib, slant, angle=0.0):
+    """Trim or extend the fitted outline cubic itself, with no connector node."""
+    edge = 1.0 if at_end else 0.0
+    outward = 1.0 if at_end else -1.0
+    if side.kind == 'line':
+        p = side.end if at_end else side.start
+        if style == 'square':
+            w, h, _ = nib
+            point = add(p, mul(tangent, outward *
+                               _half_thickness(normal(tangent), w, h, slant)))
+        else:
+            m = normal(_cut_direction(style, slant, angle))
+            direction = mul(tangent, outward)
+            along = direction[0]*m[0] + direction[1]*m[1]
+            if abs(along) < 1e-6:
+                return False
+            distance = ((center[0]-p[0])*m[0] + (center[1]-p[1])*m[1]) / along
+            point = add(p, mul(direction, distance))
+        if at_end:
+            side.end = point
+        else:
+            side.start = point
+        return True
+
+    controls = (side.override_piece or side.piece())[1]
+    edge_point = cubic(*controls, edge)
+    fallback_direction = mul(tangent, outward)
+
+    def keep_cut():
+        if style == 'square':
+            w, h, _ = nib
+            target = add(edge_point, mul(fallback_direction,
+                             _half_thickness(normal(tangent), w, h, slant)))
+        else:
+            m = normal(_cut_direction(style, slant, angle))
+            along = fallback_direction[0]*m[0] + fallback_direction[1]*m[1]
+            if abs(along) < EPS:
+                return False
+            delta = sub(center, edge_point)
+            target = add(edge_point, mul(fallback_direction,
+                         (delta[0]*m[0] + delta[1]*m[1]) / along))
+        side.override_piece = ('cubic', _bend_curve_endpoint(controls, at_end, target))
         if at_end:
             side.end = target
         else:
             side.start = target
+        return True
+
+    derivative = mul(cubic_derivative(*controls, edge), outward)
+    if length(derivative) < EPS:
+        return keep_cut()
+    initial = unit(derivative)
+    max_travel = min(0.75*side.extent(side.tb if at_end else side.ta),
+                     0.5*length(sub(side.pts[-1], side.pts[0])))
+    if max_travel < EPS:
+        return keep_cut()
+    if style == 'square':
+        w, h, _ = nib
+        target = _half_thickness(normal(tangent), w, h, slant)
+        max_travel = max(max_travel, target*1.05)
+        search = outward
+        m = None
+    else:
+        m = normal(_cut_direction(style, slant, angle))
+        offset = sub(edge_point, center)
+        signed = offset[0]*m[0] + offset[1]*m[1]
+        if abs(signed) < 1e-7:
+            return True
+        speed = derivative[0]*m[0] + derivative[1]*m[1]
+        if abs(speed) < EPS:
+            return keep_cut()
+        search = outward if -signed/speed >= 0 else -outward
+        target = None
+
+    previous_t, previous_point = edge, edge_point
+    previous_signed = signed if m is not None else None
+    travelled = 0.0
+    steps = 64 if m is None or search != outward else 32
+    for i in range(1, steps+1):
+        t = edge + search*i/64.0
+        point = cubic(*controls, t)
+        segment_length = length(sub(point, previous_point))
+        travelled += segment_length
+        if search == outward:
+            direction = mul(cubic_derivative(*controls, t), outward)
+            if length(direction) < EPS or unit(direction)[0]*initial[0] + \
+                    unit(direction)[1]*initial[1] < 0.85 or travelled > max_travel:
+                return keep_cut()
+        if m is None:
+            crossed = travelled >= target
+        else:
+            delta = sub(point, center)
+            current_signed = delta[0]*m[0] + delta[1]*m[1]
+            crossed = previous_signed * current_signed <= 0
+        if crossed:
+            lo, hi = previous_t, t
+            for _ in range(25):
+                mid = (lo+hi)/2.0
+                if m is None:
+                    # Arc length over this small interval is sufficiently linear.
+                    fraction = (target-(travelled-segment_length)) / segment_length
+                    hit = previous_t + (t-previous_t)*fraction
+                    break
+                delta = sub(cubic(*controls, mid), center)
+                value = delta[0]*m[0] + delta[1]*m[1]
+                if (value > 0) == (previous_signed > 0):
+                    lo = mid
+                else:
+                    hi = mid
+            else:
+                hit = (lo+hi)/2.0
+            interval = (0.0, hit) if at_end else (hit, 1.0)
+            piece = ('cubic', _cubic_interval(controls, *interval))
+            side.override_piece = piece
+            if at_end:
+                side.end = piece[1][-1]
+            else:
+                side.start = piece[1][0]
+            return True
+        previous_t, previous_point = t, point
+        if m is not None:
+            previous_signed = current_signed
+    return keep_cut()
 
 
 def _usable_cap(style, tangent, slant=0.0, angle=0.0):
@@ -585,46 +1009,275 @@ def _usable_cap(style, tangent, slant=0.0, angle=0.0):
     return style
 
 
+# ---------------------------------------------------------------------------
+# Live corners: round outline vertices with a fixed radius, independent of the width.
+
+
+def _piece_point(piece, t):
+    kind, pts = piece
+    return add(mul(pts[0], 1-t), mul(pts[1], t)) if kind == 'line' else cubic(*pts, t)
+
+
+def _piece_tangent(piece, t):
+    kind, pts = piece
+    if kind == 'line':
+        return unit(sub(pts[1], pts[0]))
+    return unit(_derivative('cubic', pts, t))
+
+
+def _piece_samples(piece, count=32):
+    """[(t, cumulative length)] along a piece."""
+    result, total, previous = [(0.0, 0.0)], 0.0, _piece_point(piece, 0.0)
+    for i in range(1, count+1):
+        t = i / float(count)
+        point = _piece_point(piece, t)
+        total += length(sub(point, previous))
+        result.append((t, total))
+        previous = point
+    return result
+
+
+def _t_at_length(samples, distance):
+    for (t0, l0), (t1, l1) in zip(samples, samples[1:]):
+        if l1 >= distance:
+            return t0 + (t1-t0) * ((distance-l0) / (l1-l0) if l1 > l0 else 0.0)
+    return 1.0
+
+
+def _split_cubic(pts, t):
+    p0, p1, p2, p3 = pts
+    a, b, c = add(mul(p0, 1-t), mul(p1, t)), add(mul(p1, 1-t), mul(p2, t)), add(mul(p2, 1-t), mul(p3, t))
+    d, e = add(mul(a, 1-t), mul(b, t)), add(mul(b, 1-t), mul(c, t))
+    f = add(mul(d, 1-t), mul(e, t))
+    return (p0, a, d, f), (f, e, c, p3)
+
+
+def _sub_piece(piece, t0, t1):
+    kind, pts = piece
+    if kind == 'line':
+        return ('line', (_piece_point(piece, t0), _piece_point(piece, t1)))
+    part = pts
+    if t1 < 1.0:
+        part = _split_cubic(part, t1)[0]
+    if t0 > 0.0:
+        part = _split_cubic(part, t0 / t1 if t1 > EPS else 0.0)[1]
+    return ('cubic', part)
+
+
+def _corner_spec(value):
+    """Normalize a node's live corner: None (sharp), a radius, or a dict with
+    'outer', 'inner' (radii), 'tension' (%, 100 = circular) and 'ratio' (%,
+    100 = symmetric; above 100 the side before the node, in path direction,
+    is rounded over a longer stretch)."""
+    if value is None:
+        return None
+    if not isinstance(value, dict):
+        value = {'outer': value}
+    outer = max(float(value.get('outer') or 0.0), 0.0)
+    inner = value.get('inner')
+    return {'outer': outer, 'inner': outer if inner is None else max(float(inner), 0.0),
+            'tension': max(float(value.get('tension') if value.get('tension') is not None
+                                 else 100.0), 0.0) / 100.0,
+            'ratio': max(float(value.get('ratio') if value.get('ratio') is not None
+                               else 100.0), 1.0) / 100.0}
+
+
+def _round_contour(contour, vertices, report=None):
+    """Round contour vertices. vertices[i] describes the vertex before piece i:
+    None (sharp) or dict(corner=spec, which='outer'|'inner', flip=bool, cap=bool,
+    node=index). `flip` marks contour runs against the path direction, so the
+    aspect ratio stays tied to the centerline's before/after sides.
+
+    Each rounded vertex becomes one cubic whatever the values, so the node
+    structure only depends on which nodes are rounded; a straight-through vertex
+    just gets a zero-size arc. Trims are limited to half of each neighbouring
+    piece so arcs never overlap. Rounded vertices are reported (see outline_curves)
+    when `report` is a list.
+    """
+    count = len(contour)
+    if count < 2 or not any(v is not None for v in vertices):
+        return contour
+    samples = [_piece_samples(piece) for piece in contour]
+    lengths = [s[-1][1] for s in samples]
+    trim_start, trim_end, arcs = [0.0]*count, [0.0]*count, {}
+    for i, vertex in enumerate(vertices):
+        if vertex is None:
+            continue
+        corner = vertex['corner']
+        radius = corner['outer'] if vertex['which'] == 'outer' else corner['inner']
+        before, after = contour[i-1], contour[i]
+        t_in, t_out = _piece_tangent(before, 1.0), _piece_tangent(after, 0.0)
+        cross = t_in[0]*t_out[1] - t_in[1]*t_out[0]
+        dot = t_in[0]*t_out[0] + t_in[1]*t_out[1]
+        turn = math.atan2(abs(cross), dot)  # 0 straight .. pi hairpin
+        reach = radius * math.tan(min(turn, math.pi - 1e-3) / 2.0)
+        ratio = 1.0 if vertex.get('cap') else math.sqrt(corner['ratio'])
+        # Path-direction sides: before the node gets reach*ratio, after reach/ratio.
+        first, second = reach * ratio, reach / ratio
+        if vertex.get('flip'):
+            first, second = second, first
+        first = min(first, lengths[i-1] / 2.0)
+        second = min(second, lengths[i] / 2.0)
+        trim_end[i-1], trim_start[i] = first, second
+        arcs[i] = (turn, first, second, corner['tension'], vertex, t_in, t_out)
+    trimmed = []
+    for i, piece in enumerate(contour):
+        t0 = _t_at_length(samples[i], trim_start[i]) if trim_start[i] > 0 else 0.0
+        t1 = _t_at_length(samples[i], lengths[i] - trim_end[i]) if trim_end[i] > 0 else 1.0
+        trimmed.append(_sub_piece(piece, t0, max(t0, t1)) if (t0 > 0 or t1 < 1) else piece)
+    result = []
+    for i, piece in enumerate(trimmed):
+        if i in arcs:
+            turn, first, second, tension, vertex, t_in, t_out = arcs[i]
+            before = trimmed[i-1]
+            p1, p2 = before[1][-1], piece[1][0]
+            d1, d2 = _piece_tangent(before, 1.0), _piece_tangent(piece, 0.0)
+            # Circular-arc handle proportion (4/3 tan(turn/4) / tan(turn/2)),
+            # scaled by each side's trim so uneven sides give an elliptic arc.
+            k = (4.0/3.0 * math.tan(turn/4.0) / math.tan(turn/2.0)) if turn > 1e-6 else 2.0/3.0
+            arc = ('cubic', (p1, add(p1, mul(d1, first * k * tension)),
+                             sub(p2, mul(d2, second * k * tension)), p2))
+            result.append(arc)
+            if report is not None:
+                p1, c1, c2, p2 = arc[1]
+                report.append({'node': vertex['node'], 'which': vertex['which'],
+                               'corner': contour[i][1][0], 'middle': cubic(*arc[1], 0.5),
+                               'p1': p1, 'c1': c1, 'c2': c2, 'p2': p2, 'turn': turn,
+                               'first': first, 'second': second, 'arc_factor': k,
+                               'flip': bool(vertex.get('flip')), 'cap': bool(vertex.get('cap')),
+                               'in': t_in, 'out': t_out})
+        result.append(piece)
+    return result
+
+
+def _turns_left(before, after):
+    """True when the centerline turns left (counter-clockwise) at the node joining
+    side `before` to side `after`."""
+    t_in, t_out = before.tangent(1.0), after.tangent(0.0)
+    return t_in[0]*t_out[1] - t_in[1]*t_out[0] > 0
+
+
+def _open_vertices(lefts, indices, cap_pieces_end, cap_pieces_start,
+                   corner_of, cap_end, cap_start):
+    """Vertex descriptions for an open contour: left sides, end cap, reversed right
+    sides, start cap. Round caps are already smooth and keep their joins."""
+    n = len(indices)
+    start_node, end_node = indices[0], indices[-1] + 1
+
+    def at(node, which, flip=False, cap=False):
+        corner = corner_of(node)
+        return None if corner is None else {'corner': corner, 'which': which, 'flip': flip,
+                                            'cap': cap, 'node': node}
+
+    def interior(k, flip):
+        # Left of the path is the inside of a left turn.
+        left_turn = _turns_left(lefts[k-1], lefts[k])
+        which = ('inner' if left_turn else 'outer') if not flip else \
+            ('outer' if left_turn else 'inner')
+        return at(indices[k], which, flip)
+
+    start = at(start_node, 'outer', cap=True) if cap_start != 'round' else None
+    end = at(end_node, 'outer', cap=True) if cap_end != 'round' else None
+    vertices = [start] + [interior(k, False) for k in range(1, n)]
+    vertices += [end] + [None] * (cap_pieces_end - 1)
+    vertices += [dict(end, flip=True) if end else None]
+    vertices += [interior(n-j, True) for j in range(1, n)]
+    vertices += [dict(start, flip=True) if start else None] + [None] * (cap_pieces_start - 1)
+    return vertices
+
+
 def outline_curves(segments, closed=False, cap_start='flat', cap_end='flat',
-                   tolerance=FIT_TOLERANCE, italic_angle=0.0, start_angle=0.0, end_angle=0.0):
+                   tolerance=FIT_TOLERANCE, italic_angle=0.0, start_angle=0.0, end_angle=0.0,
+                   corner_radii=None, report=None):
     """Return closed contours of ('line'|'cubic', control points) segments.
 
     Each segment is (kind, points, start, end) where start/end is a width or a
-    (width, height, offset) nib; see _nib. `italic_angle` (degrees) tilts the
-    nib's height axis and vertical cuts. `start_angle` / `end_angle` (degrees
-    on the page) are the cut directions of 'angle' caps.
+    (width, height, offset) nib; see _nib. `italic_angle` (degrees) tilts
+    vertical cuts. `start_angle` / `end_angle` (degrees
+    on the page) are the cut directions of 'angle' caps. `corner_radii[i]` is the
+    live corner of on-curve node i (segment i starts at node i): None (sharp), a
+    radius or a dict (see _corner_spec). `report`, if a list, collects a dict per
+    rounded corner: node, which ('outer'|'inner'), corner point, arc midpoint, the
+    arc's points p1 c1 c2 p2, the turn angle, both trims and orientation flags.
     """
     for style in (cap_start, cap_end):
         if style not in CAPS:
             raise ValueError('Unknown cap: ' + str(style))
     slant = math.tan(math.radians(italic_angle or 0.0))
-    lefts, rights, widths = [], [], []
-    for kind, pts, e0, e1 in segments:
+    lefts, rights, widths, indices = [], [], [], []
+    for index, (kind, pts, e0, e1) in enumerate(segments):
         if all(length(sub(p, pts[0])) < EPS for p in pts):
             continue  # zero-length segment
         lefts.append(_Side(kind, pts, e0, e1, 1, slant))
         rights.append(_Side(kind, pts, e0, e1, -1, slant))
         widths.append(lefts[-1].extent(1.0))
+        indices.append(index)
     if not lefts:
         return []
+
+    def corner_of(node):
+        if not corner_radii:
+            return None
+        node = node % len(corner_radii) if closed else node
+        return _corner_spec(corner_radii[node]) if 0 <= node < len(corner_radii) else None
+
     if closed:
-        return [_side_contour(lefts, widths, True),
-                _reverse(_side_contour(rights, widths, True))]
+        n = len(indices)
+        turns = [_turns_left(lefts[k-1], lefts[k]) for k in range(n)]  # at node indices[k]
+
+        def closed_vertex(k, flip):
+            corner = corner_of(indices[k])
+            if corner is None:
+                return None
+            inner_side = turns[k] != flip  # left side is inside of a left turn
+            return {'corner': corner, 'which': 'inner' if inner_side else 'outer',
+                    'flip': flip, 'node': indices[k]}
+        for sides in (lefts, rights):
+            for k in range(n):
+                _join(sides[k], sides[(k+1) % n], widths[k])
+        for side in lefts + rights:
+            _optical_outer_curve(side)
+        outer = _side_contour(lefts, widths, True, joined=True)
+        inner = _reverse(_side_contour(rights, widths, True, joined=True))
+        return [_round_contour(outer, [closed_vertex(k, False) for k in range(n)], report),
+                _round_contour(inner, [closed_vertex((n-j) % n, True) for j in range(n)],
+                               report)]
     first, last = lefts[0], lefts[-1]
     start_center, start_tangent = first.pts[0], first.tangent(0.0)
     end_center, end_tangent = last.pts[-1], last.tangent(1.0)
     cap_start = _usable_cap(cap_start, start_tangent, slant, start_angle)
     cap_end = _usable_cap(cap_end, end_tangent, slant, end_angle)
     for sides in (lefts, rights):
-        _apply_cap(sides[0], False, start_center, start_tangent, cap_start, first.n0, slant,
-                   start_angle)
-        _apply_cap(sides[-1], True, end_center, end_tangent, cap_end, last.n1, slant, end_angle)
-    left = _side_contour(lefts, widths, False)
-    right = _side_contour(rights, widths, False)
-    contour = left
-    contour += _cap_segments(end_center, last.w1, end_tangent, cap_end, True,
-                             lefts[-1].end, rights[-1].end, last.n1, slant)
-    contour += _reverse(right)
-    contour += _cap_segments(start_center, first.w0, start_tangent, cap_start, False,
-                             lefts[0].start, rights[0].start, first.n0, slant)
+        for k in range(len(sides)-1):
+            _join(sides[k], sides[k+1], widths[k])
+
+    def apply_cap_pair(at_end, center, tangent, style, nib, angle):
+        if style not in CUTS and style != 'square':
+            return style
+        pair = (lefts[-1], rights[-1]) if at_end else (lefts[0], rights[0])
+        saved = [(side.start, side.end, side.override_piece) for side in pair]
+        for side in pair:
+            if not _cap_on_curve(side, at_end, center, tangent, style, nib, slant, angle):
+                for old_side, (start, end, piece) in zip(pair, saved):
+                    old_side.start, old_side.end, old_side.override_piece = start, end, piece
+                return 'flat'
+        return style
+
+    cap_start = apply_cap_pair(False, start_center, start_tangent, cap_start, first.n0,
+                               start_angle)
+    cap_end = apply_cap_pair(True, end_center, end_tangent, cap_end, last.n1,
+                             end_angle)
+    for side in lefts + rights:
+        _optical_outer_curve(side)
+    left = _side_contour(lefts, widths, False, joined=True)
+    right = _side_contour(rights, widths, False, joined=True)
+    end_cap = _cap_segments(end_center, last.w1, end_tangent, cap_end, True,
+                            lefts[-1].end, rights[-1].end, last.n1, slant)
+    start_cap = _cap_segments(start_center, first.w0, start_tangent, cap_start, False,
+                              lefts[0].start, rights[0].start, first.n0, slant)
+    contour = left + end_cap + _reverse(right) + start_cap
+    if corner_radii:
+        contour = _round_contour(contour, _open_vertices(
+            lefts, indices, len(end_cap), len(start_cap), corner_of,
+            cap_end, cap_start), report)
     return [contour]

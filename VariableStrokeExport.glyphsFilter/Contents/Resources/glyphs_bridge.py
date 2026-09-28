@@ -1,4 +1,6 @@
 """Glyphs 3 adapters shared by the editing tool and the export filter."""
+import collections
+import threading
 from GlyphsApp import GSPath, GSNode, LINE, CURVE, OFFCURVE
 from variable_stroke_core import outline_curves, node_edges
 
@@ -9,6 +11,20 @@ STROKE_WIDTH_KEY = 'com.codex.VariableStroke.strokeWidth'  # per path, font unit
 SCALE_KEY = 'com.codex.VariableStroke.scale'  # per node, percent of the path width
 STROKE_HEIGHT_KEY = 'com.codex.VariableStroke.strokeHeight'  # per path, font units
 OFFSET_KEY = 'com.codex.VariableStroke.offset'  # per node, -100 (right) .. 100 (left)
+# Live corners, per node. The radius key alone (older files) also means ON.
+CORNER_ON_KEY = 'com.codex.VariableStroke.corner'  # bool
+CORNER_KEY = 'com.codex.VariableStroke.cornerRadius'  # outer radius, font units
+CORNER_INNER_KEY = 'com.codex.VariableStroke.cornerInner'  # inner radius; absent = outer
+CORNER_TENSION_KEY = 'com.codex.VariableStroke.cornerTension'  # %, 100 = circular arc
+CORNER_RATIO_KEY = 'com.codex.VariableStroke.cornerRatio'  # %, 100 = symmetric
+DEFAULT_CORNER_RADIUS = 20.0
+# Written by interpolate_layer on interpolated (instance) layers, whose glyph copy
+# does not carry the ON/OFF state or the master's italic angle.
+LAYER_STATE_KEY = 'com.codex.VariableStroke.layerGlyphEnabled'
+LAYER_ITALIC_KEY = 'com.codex.VariableStroke.layerItalicAngle'
+ZERO_CORNER = {'outer': 0.0, 'inner': 0.0, 'tension': 100.0, 'ratio': 100.0}
+_CORNER_PARTS = ('outer', 'inner', 'tension', 'ratio')
+
 MASTER_WIDTH_KEY = 'com.codex.VariableStroke.defaultWidth'  # per master, font units
 MASTER_HEIGHT_KEY = 'com.codex.VariableStroke.defaultHeight'  # per master; unset = width
 CAP_START_KEY = 'com.codex.VariableStroke.capStart'
@@ -19,11 +35,41 @@ DEFAULT_CUT_ANGLE = 45.0
 EXPORT_FILTER = 'VariableStrokeExport'
 DEFAULT_WIDTH = 40.0
 GLYPH_KEY = 'com.codex.VariableStroke.glyphEnabled'
-GENERATED_KEY = 'com.codex.VariableStroke.generated'
+# Set on a glyph once any of its nodes has a live corner, so glyphs without
+# corners skip looking at their other masters (see corner_specs).
+GLYPH_CORNERS_KEY = 'com.codex.VariableStroke.glyphHasCorners'
+GENERATED_KEY = 'com.codex.VariableStroke.generated'  # legacy in-layer outlines
+# Marks outlines this plugin produced, so they are never taken for centerlines
+# again (a layer prepared twice, an interpolated or exported copy).
+OUTLINE_KEY = 'com.codex.VariableStroke.outline'
 ORIGINAL_FILL_KEY = 'com.codex.VariableStroke.originalFill'
 # Keys written by an earlier build that stored outlines in the layer itself.
 LEGACY_KEYS = ('com.codex.VariableStroke.id', 'com.codex.VariableStroke.signature')
 LEGACY_HAIRLINE_KEY = 'com.codex.VariableStroke.hairline'
+
+
+# Path attributes that define the stroke (copied onto interpolated layers).
+_STROKE_ATTRIBUTES = (PATH_KEY, CAP_START_KEY, CAP_END_KEY, CAP_START_ANGLE_KEY, CAP_END_ANGLE_KEY)
+
+# Outline geometry is recomputed constantly (Glyphs' preview, handle drawing,
+# hit tests) for unchanged input, so results are kept by their exact input.
+# Layers are also prepared off the main thread, hence the lock.
+_CACHE = collections.OrderedDict()
+_CACHE_SIZE = 512
+_CACHE_LOCK = threading.Lock()
+
+
+def _cached(key, compute):
+    with _CACHE_LOCK:
+        if key in _CACHE:
+            _CACHE.move_to_end(key)
+            return _CACHE[key]
+    value = compute()
+    with _CACHE_LOCK:
+        _CACHE[key] = value
+        while len(_CACHE) > _CACHE_SIZE:
+            _CACHE.popitem(last=False)
+    return value
 
 
 def enabled(path):
@@ -124,16 +170,11 @@ def stroke_width(path, defaults=None):
 
 
 def stroke_height(path, defaults=None):
-    """The path's base height: its own value, else the master's, else its width."""
+    """The path's independent height: its own value, else the master's default."""
     if has_height_override(path):
         return _number(path.attributes.get(STROKE_HEIGHT_KEY), DEFAULT_WIDTH)
     defaults = _resolve(defaults, path)
-    if defaults.height is not None and not has_width_override(path):
-        return defaults.height
-    if defaults.height is not None and has_width_override(path):
-        # A path-specific width keeps the master's width:height proportion.
-        return stroke_width(path, defaults) * defaults.height / defaults.width
-    return stroke_width(path, defaults)
+    return defaults.height if defaults.height is not None else DEFAULT_WIDTH
 
 
 def scale(node):
@@ -148,6 +189,36 @@ def offset(node):
     except (TypeError, ValueError):
         return 0.0
     return max(-100.0, min(100.0, value))
+
+
+def corner_on(node):
+    data = node.userData
+    return bool(data.get(CORNER_ON_KEY, CORNER_KEY in data))
+
+
+def _corner_value(node, key, default):
+    try:
+        value = node.userData.get(key)
+        return default if value is None else float(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def corner_radius(node):
+    """Outer live-corner radius at a node, or None when its corners stay sharp."""
+    if not corner_on(node):
+        return None
+    return max(0.0, _corner_value(node, CORNER_KEY, DEFAULT_CORNER_RADIUS))
+
+
+def corner_spec(node):
+    """The node's live corner for the outline code, or None when it is off."""
+    outer = corner_radius(node)
+    if outer is None:
+        return None
+    return {'outer': outer, 'inner': max(0.0, _corner_value(node, CORNER_INNER_KEY, outer)),
+            'tension': _corner_value(node, CORNER_TENSION_KEY, 100.0),
+            'ratio': _corner_value(node, CORNER_RATIO_KEY, 100.0)}
 
 
 def width(node, path=None, base=None):
@@ -230,18 +301,27 @@ def segments_for_path(path, defaults=None):
     return result
 
 
-def edges_for_path(path, defaults=None):
-    """[(node, (left, right))] for each on-curve node: where the outline really
-    passes on both sides of it (miter/crossing points at corners)."""
-    defaults = _resolve(defaults, path)
+def _on_curve_nodes(path):
+    """On-curve nodes in segment order (segment i starts at node i)."""
     nodes = list(path.nodes)
     first = next((i for i, n in enumerate(nodes) if n.type != OFFCURVE), None)
     if first is None:
         return []
     ordered = nodes[first:] + (nodes[:first] if path.closed else [])
-    on_curve = [node for node in ordered if node.type != OFFCURVE]
-    edges = node_edges(segments_for_path(path, defaults), bool(path.closed),
-                       defaults.italic_angle)
+    return [node for node in ordered if node.type != OFFCURVE]
+
+
+def edges_for_path(path, defaults=None):
+    """[(node, (left, right))] for each on-curve node: where the outline really
+    passes on both sides of it (miter/crossing points at corners)."""
+    defaults = _resolve(defaults, path)
+    on_curve = _on_curve_nodes(path)
+    if not on_curve:
+        return []
+    segments = tuple(segments_for_path(path, defaults))
+    closed = bool(path.closed)
+    edges = _cached(('edges', segments, closed, defaults.italic_angle),
+                    lambda: node_edges(list(segments), closed, defaults.italic_angle))
     return [(on_curve[i], pair) for i, pair in sorted(edges.items()) if i < len(on_curve)]
 
 
@@ -252,14 +332,110 @@ def cut_angle(path, key):
         return DEFAULT_CUT_ANGLE
 
 
-def curves_for_path(path, defaults=None):
+def _sibling_paths(path):
+    """The same path in the glyph's other layers (masters, brace layers), when
+    compatible: needed so every layer rounds the same corners."""
+    layer = getattr(path, 'parent', None)
+    glyph = getattr(layer, 'parent', None) if layer is not None else None
+    if glyph is None:
+        return []
+    try:
+        paths = list(layer.paths)
+        index = next(i for i, other in enumerate(paths) if other == path)
+        layers = list(glyph.layers)
+    except Exception:
+        return []
+    count = len(_on_curve_nodes(path))
+    result = []
+    for other_layer in layers:
+        if other_layer == layer:
+            continue
+        other_paths = list(other_layer.paths)
+        if index < len(other_paths) and len(_on_curve_nodes(other_paths[index])) == count:
+            result.append(other_paths[index])
+    return result
+
+
+def _glyph_of(item):
+    """The glyph a path or node belongs to, or None."""
+    while item is not None and not hasattr(item, 'layers'):
+        item = getattr(item, 'parent', None)
+    return item
+
+
+def _glyph_has_corners(path):
+    glyph = _glyph_of(path)
+    try:
+        return bool(glyph is not None and glyph.userData.get(GLYPH_CORNERS_KEY))
+    except Exception:
+        return False
+
+
+def note_corner(node):
+    """Remember that this node's glyph uses live corners (see corner_specs)."""
+    glyph = _glyph_of(node)
+    try:
+        if glyph is not None and not glyph.userData.get(GLYPH_CORNERS_KEY):
+            glyph.userData[GLYPH_CORNERS_KEY] = True
+    except Exception:
+        pass
+
+
+def corner_specs(path):
+    """Live corner per on-curve node. A corner that is on in any other master of
+    the glyph gets a zero-size arc here, so masters keep compatible outlines while
+    each master switches its corners on or off on its own."""
+    nodes = _on_curve_nodes(path)
+    specs = [corner_spec(node) for node in nodes]
+    if all(spec is not None for spec in specs) or not _glyph_has_corners(path):
+        return specs
+    rounded_elsewhere = set()
+    for sibling in _sibling_paths(path):
+        for k, node in enumerate(_on_curve_nodes(sibling)):
+            if corner_on(node):
+                rounded_elsewhere.add(k)
+    return [spec if spec is not None or k not in rounded_elsewhere else dict(ZERO_CORNER)
+            for k, spec in enumerate(specs)]
+
+
+def corner_widgets(path, defaults=None):
+    """One dict per rounded outline corner (see outline_curves' report), with
+    'node' set to the GSNode it belongs to."""
+    report = []
+    try:
+        curves_for_path(path, defaults, report)
+    except ValueError:
+        return []
+    on_curve = _on_curve_nodes(path)
+    if not on_curve:
+        return []
+    for widget in report:
+        widget['node'] = on_curve[widget['node'] % len(on_curve)]
+    return report
+
+
+def curves_for_path(path, defaults=None, report=None):
     defaults = _resolve(defaults, path)
-    return outline_curves(segments_for_path(path, defaults), bool(path.closed),
-                          path.attributes.get(CAP_START_KEY, 'flat'),
-                          path.attributes.get(CAP_END_KEY, 'flat'),
-                          italic_angle=defaults.italic_angle,
-                          start_angle=cut_angle(path, CAP_START_ANGLE_KEY),
-                          end_angle=cut_angle(path, CAP_END_ANGLE_KEY))
+    segments = tuple(segments_for_path(path, defaults))
+    closed = bool(path.closed)
+    caps = (path.attributes.get(CAP_START_KEY, 'flat'), path.attributes.get(CAP_END_KEY, 'flat'))
+    angles = (cut_angle(path, CAP_START_ANGLE_KEY), cut_angle(path, CAP_END_ANGLE_KEY))
+    corners = corner_specs(path)
+    key = ('curves', segments, closed, caps, angles, defaults.italic_angle,
+           tuple(None if c is None else tuple(sorted(c.items())) for c in corners))
+
+    def compute():
+        collected = []
+        contours = outline_curves(list(segments), closed, caps[0], caps[1],
+                                  italic_angle=defaults.italic_angle,
+                                  start_angle=angles[0], end_angle=angles[1],
+                                  corner_radii=corners, report=collected)
+        return contours, collected
+
+    contours, collected = _cached(key, compute)
+    if report is not None:
+        report.extend(dict(widget) for widget in collected)  # callers annotate them
+    return contours
 
 
 def generated_paths(path, defaults=None):
@@ -268,6 +444,7 @@ def generated_paths(path, defaults=None):
         if not contour:
             continue
         new_path = GSPath()
+        new_path.attributes[OUTLINE_KEY] = True
         new_path.closed = True
         start = contour[0][1][0]
         new_path.nodes.append(GSNode(start, LINE))
@@ -307,14 +484,39 @@ def set_glyph_enabled(glyph, state):
         normalize_layer(layer, state)
 
 
+def is_outline(path):
+    return bool(path.attributes.get(OUTLINE_KEY))
+
+
+def _valid_structure(path):
+    """Only lines and cubics (two off-curves before a curve node): what
+    segments_for_path accepts, checked without computing any widths."""
+    nodes = list(path.nodes)
+    types = [node.type for node in nodes]
+    if not any(kind != OFFCURVE for kind in types):
+        return False
+    if path.closed:
+        first = next(i for i, kind in enumerate(types) if kind != OFFCURVE)
+        types = types[first+1:] + types[:first+1]
+    else:
+        if types[0] == OFFCURVE:
+            types = types[next(i for i, kind in enumerate(types) if kind != OFFCURVE):]
+        types = types[1:]
+    controls = 0
+    for kind in types:
+        if kind == OFFCURVE:
+            controls += 1
+            continue
+        if controls not in (0, 2) or (controls == 2 and kind != CURVE):
+            return False
+        controls = 0
+    return controls == 0
+
+
 def _is_centerline(path):
-    if generated(path) or not path.nodes:
+    if generated(path) or is_outline(path) or not path.nodes:
         return False
-    try:
-        segments_for_path(path)
-    except ValueError:
-        return False
-    return True
+    return _valid_structure(path)
 
 
 def normalize_layer(layer, state):
@@ -347,6 +549,13 @@ def normalize_layer(layer, state):
                 path.attributes[key] = 'flat'
                 changed = True
         changed = migrate_path(path) or changed
+    if state:
+        # Corners can arrive by paste; make sure the glyph is known to use them.
+        paths = list(layer.paths)
+        if paths and not _glyph_has_corners(paths[0]):
+            if any(node.type != OFFCURVE and corner_on(node)
+                   for path in paths for node in path.nodes):
+                note_corner(paths[0])
     return changed
 
 
@@ -375,6 +584,30 @@ def cleanup_legacy_layer(layer):
     return changed
 
 
+def _expansion_plan(layer, glyph_on=None, defaults=None):
+    if defaults is None:
+        defaults = layer_defaults(layer)
+    if glyph_on is False:
+        return []
+    plan = []
+    for path in [shape for shape in list(layer.shapes) if isinstance(shape, GSPath)]:
+        if not (_is_centerline(path) and (glyph_on or enabled(path))):
+            continue
+        try:
+            plan.append((path, generated_paths(path, defaults)))
+        except ValueError:
+            continue
+    return plan
+
+
+def _apply_plan(layer, plan):
+    for path, replacements in plan:
+        layer.shapes.remove(path)
+        for replacement in replacements:
+            layer.shapes.append(replacement)
+    return len(plan)
+
+
 def expand_layer(layer, glyph_on=None, defaults=None):
     """Replace every centerline in `layer` by its Bézier outline.
 
@@ -388,32 +621,18 @@ def expand_layer(layer, glyph_on=None, defaults=None):
     italic angle; pass it when the layer is a detached copy that cannot find its
     master.
     """
-    if defaults is None:
-        defaults = layer_defaults(layer)
-    if glyph_on is False:
-        return 0
-    count = 0
-    for path in [shape for shape in list(layer.shapes) if isinstance(shape, GSPath)]:
-        if not (_is_centerline(path) and (glyph_on or enabled(path))):
-            continue
-        try:
-            replacements = generated_paths(path, defaults)
-        except ValueError:
-            continue
-        layer.shapes.remove(path)
-        for replacement in replacements:
-            layer.shapes.append(replacement)
-        count += 1
-    return count
+    return _apply_plan(layer, _expansion_plan(layer, glyph_on, defaults))
 
 
-def interpolate_widths(layer, glyph, interpolation):
-    """Give an interpolated layer the blended stroke widths of its source layers.
+def interpolate_layer(layer, glyph, interpolation):
+    """Carry the strokes over to a layer Glyphs has just interpolated (instances in
+    the preview, interpolation previews by other plugins, virtual masters).
 
-    Glyphs interpolates node positions but copies path attributes and node
-    userData from one source, so width, height, node percentages and offsets are
-    blended here from `interpolation` ({layerId: factor}). Outlines themselves
-    have a fixed node structure, so the layer stays compatible either way.
+    Glyphs interpolates node positions only, and the interpolated glyph does not
+    know the ON/OFF state, so this writes the state and the blended italic angle
+    onto the layer, the stroke attributes onto its paths, and blends width,
+    height, node %, position and live corners (a corner off in a source counts as
+    radius 0) from `interpolation` ({layerId: factor}).
     """
     sources = []
     for layer_id, factor in dict(interpolation or {}).items():
@@ -422,39 +641,60 @@ def interpolate_widths(layer, glyph, interpolation):
         except (KeyError, IndexError, TypeError):
             source = None
         if source is not None:
-            sources.append((list(source.paths), float(factor)))
+            sources.append((source, list(source.paths), float(factor)))
     if not sources:
         return False
-    changed = False
+    state = glyph_enabled(glyph)
+    layer.userData[LAYER_STATE_KEY] = state
+    layer.userData[LAYER_ITALIC_KEY] = sum(factor * layer_defaults(source).italic_angle
+                                           for source, _, factor in sources)
+    if not state:
+        return True
     for index, path in enumerate(layer.paths):
-        if not enabled(path):
+        others = [(paths[index], factor) for _, paths, factor in sources
+                  if index < len(paths) and len(paths[index].nodes) == len(path.nodes)]
+        if len(others) != len(sources):
             continue
-        base_w = base_h = 0.0
-        widths, offsets = {}, {}
-        for paths, factor in sources:
-            if index >= len(paths) or len(paths[index].nodes) != len(path.nodes):
-                break
-            other = paths[index]
-            other_w, other_h = stroke_width(other), stroke_height(other)
-            base_w += factor * other_w
-            base_h += factor * other_h
-            for position, node in enumerate(other.nodes):
-                if node.type != OFFCURVE:
-                    widths[position] = widths.get(position, 0.0) + factor * width(node, other, other_w)
-                    offsets[position] = offsets.get(position, 0.0) + factor * offset(node)
-        else:
-            if base_w <= 0 or base_h <= 0:
+        template = next((other for other, _ in others if enabled(other)), None)
+        if template is None:
+            continue
+        for key in _STROKE_ATTRIBUTES:
+            if template.attributes.get(key) is not None:
+                path.attributes[key] = template.attributes[key]
+        path.attributes['fill'] = False
+        base_w = sum(factor * stroke_width(other) for other, factor in others)
+        base_h = sum(factor * stroke_height(other) for other, factor in others)
+        if base_w <= 0 or base_h <= 0:
+            continue
+        path.attributes[STROKE_WIDTH_KEY] = base_w
+        path.attributes[STROKE_HEIGHT_KEY] = base_h
+        for position, node in enumerate(path.nodes):
+            if node.type == OFFCURVE:
                 continue
-            path.attributes[STROKE_WIDTH_KEY] = base_w
-            path.attributes[STROKE_HEIGHT_KEY] = base_h
-            for position, value in widths.items():
-                node = path.nodes[position]
-                node.userData[SCALE_KEY] = value / base_w * 100.0
-                node.userData[OFFSET_KEY] = offsets[position]
-                if WIDTH_KEY in node.userData:
-                    del node.userData[WIDTH_KEY]
-            changed = True
-    return changed
+            w = o = 0.0
+            corner, any_corner = dict.fromkeys(_CORNER_PARTS, 0.0), False
+            for other, factor in others:
+                source_node = other.nodes[position]
+                w += factor * width(source_node, other, stroke_width(other))
+                o += factor * offset(source_node)
+                spec = corner_spec(source_node)
+                any_corner = any_corner or spec is not None
+                for key in _CORNER_PARTS:
+                    corner[key] += factor * (spec or ZERO_CORNER)[key]
+            node.userData[SCALE_KEY] = w / base_w * 100.0
+            node.userData[OFFSET_KEY] = o
+            node.userData[CORNER_ON_KEY] = any_corner
+            if any_corner:
+                node.userData[CORNER_KEY] = corner['outer']
+                node.userData[CORNER_INNER_KEY] = corner['inner']
+                node.userData[CORNER_TENSION_KEY] = corner['tension']
+                node.userData[CORNER_RATIO_KEY] = corner['ratio']
+            if WIDTH_KEY in node.userData:
+                del node.userData[WIDTH_KEY]
+    return True
+
+
+interpolate_widths = interpolate_layer  # earlier name
 
 
 def reset_width_overrides(layers):
@@ -471,9 +711,63 @@ def reset_width_overrides(layers):
     return count
 
 
-def convert_layer(layer):
-    """Permanently replace enabled centerlines with Bézier outlines in the target layer."""
-    if getattr(layer, 'parent', None) is not None and not glyph_enabled(layer.parent):
+def layer_state(layer):
+    """ON/OFF for a layer's strokes, or None when unknown (then the per-path flags
+    decide). Interpolated layers carry it themselves (see interpolate_layer); a
+    glyph copy without our key, e.g. from an interpolated font, is unknown."""
+    try:
+        marked = layer.userData.get(LAYER_STATE_KEY)
+        if marked is not None:
+            return bool(marked)
+    except Exception:
+        pass
+    try:
+        glyph = layer.parent
+        if glyph is not None and glyph.userData is not None and \
+                glyph.userData.get(GLYPH_KEY) is not None:
+            return glyph_enabled(glyph)
+    except Exception:
+        pass
+    return None
+
+
+def _unmark(layer):
+    for path in layer.paths:
+        if is_outline(path):
+            del path.attributes[OUTLINE_KEY]
+
+
+def convert_layer(layer, keep_marks=True):
+    """Replace enabled centerlines with Bézier outlines in the target layer.
+
+    Export copies keep the outline marks so no later step expands them again;
+    a conversion the user asks for (keep_marks=False) leaves plain paths.
+    """
+    state = layer_state(layer)
+    if state is False:
         return 0
     cleanup_legacy_layer(layer)
-    return expand_layer(layer, glyph_on=True if getattr(layer, 'parent', None) is not None else None)
+    count = expand_layer(layer, glyph_on=state)
+    if not keep_marks:
+        _unmark(layer)
+        layer.userData[LAYER_STATE_KEY] = False
+    return count
+
+
+def convert_glyph(glyph, keep_marks=True):
+    """Convert every layer of a glyph. All outlines are computed before any layer
+    changes, because each layer looks at the others to keep corners compatible."""
+    if not glyph_enabled(glyph):
+        return 0
+    layers = list(glyph.layers)
+    for layer in layers:
+        cleanup_legacy_layer(layer)
+    plans = [(layer, _expansion_plan(layer, True)) for layer in layers]
+    count = sum(_apply_plan(layer, plan) for layer, plan in plans)
+    if not keep_marks:
+        for layer in layers:
+            _unmark(layer)
+        set_glyph_enabled(glyph, False)
+        for layer in layers:
+            layer.userData[LAYER_STATE_KEY] = False
+    return count

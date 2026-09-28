@@ -32,6 +32,9 @@ class Path:
 class Layer:
     def __init__(self, paths):
         self.shapes = list(paths)
+        self.userData = {}
+        for path in self.shapes:
+            path.parent = self
 
     @property
     def paths(self):
@@ -139,9 +142,11 @@ class BridgeTests(unittest.TestCase):
                 node.userData = {bridge.SCALE_KEY: value}
             path.attributes[bridge.STROKE_WIDTH_KEY] = base
             return Layer([path])
-        glyph = types.SimpleNamespace(layers={'a': master(40, (100, 50)), 'b': master(100, (100, 100))})
+        glyph = types.SimpleNamespace(layers={'a': master(40, (100, 50)), 'b': master(100, (100, 100))},
+                                      userData={bridge.GLYPH_KEY: True})
         target = master(40, (100, 50))
         self.assertTrue(bridge.interpolate_widths(target, glyph, {'a': 0.5, 'b': 0.5}))
+        self.assertTrue(target.userData[bridge.LAYER_STATE_KEY])
         segs = bridge.segments_for_path(target.paths[0])
         self.assertAlmostEqual(segs[0][2][0], 70.0)  # (40 + 100) / 2
         self.assertAlmostEqual(segs[0][3][0], 60.0)  # (20 + 100) / 2
@@ -208,8 +213,136 @@ class BridgeTests(unittest.TestCase):
         self.assertEqual(segs[0][2], (80.0, 20.0, 0.0))
         self.assertEqual(segs[0][3], (40.0, 10.0, -1.0))
         self.assertEqual(bridge.layer_defaults(layer).italic_angle, 10.0)
-        path.attributes[bridge.STROKE_WIDTH_KEY] = 160  # keeps the master's 4:1
+        path.attributes[bridge.STROKE_WIDTH_KEY] = 160
+        self.assertEqual(bridge.stroke_height(path), 20.0)
+        self.assertEqual(bridge.segments_for_path(path)[0][2][:2], (160.0, 20.0))
+
+    def test_width_does_not_change_unspecified_height(self):
+        path = Path([Node(0, 0), Node(100, 0)])
+        for node in path.nodes:
+            node.userData = {}
+        path.attributes[bridge.STROKE_WIDTH_KEY] = 80
         self.assertEqual(bridge.stroke_height(path), 40.0)
+        path.attributes[bridge.STROKE_WIDTH_KEY] = 160
+        self.assertEqual(bridge.stroke_height(path), 40.0)
+
+    def test_corner_radius_rounds_only_marked_nodes(self):
+        path = Path([Node(0, 0), Node(0, 300), Node(300, 300)])
+        for node in path.nodes:
+            node.userData = {}
+        sharp = [len(c) for c in bridge.curves_for_path(path, 60)]
+        path.nodes[1].userData[bridge.CORNER_KEY] = 20
+        rounded = bridge.curves_for_path(path, 60)
+        self.assertEqual([len(c) for c in rounded], [sharp[0] + 2])  # outer + inner arc
+        path.nodes[1].userData[bridge.CORNER_KEY] = 0  # still compatible
+        self.assertEqual([len(c) for c in bridge.curves_for_path(path, 60)], [sharp[0] + 2])
+        path.nodes[1].userData[bridge.CORNER_ON_KEY] = False  # switched off, values kept
+        self.assertEqual([len(c) for c in bridge.curves_for_path(path, 60)], sharp)
+        path.nodes[1].userData.update({bridge.CORNER_ON_KEY: True, bridge.CORNER_KEY: 30,
+                                       bridge.CORNER_INNER_KEY: 5})
+        widgets = bridge.corner_widgets(path, 60)
+        self.assertEqual(sorted(w['which'] for w in widgets), ['inner', 'outer'])
+        self.assertTrue(all(w['node'] is path.nodes[1] for w in widgets))
+        outer = next(w for w in widgets if w['which'] == 'outer')
+        # 90 degree turn, circular: the arc starts one radius before the corner.
+        self.assertAlmostEqual(outer['first'], 30.0, places=3)
+        self.assertAlmostEqual(outer['second'], 30.0, places=3)
+
+    def test_corner_on_in_one_master_keeps_masters_compatible(self):
+        def master():
+            path = Path([Node(0, 0), Node(0, 300), Node(300, 300)])
+            for node in path.nodes:
+                node.userData = {}
+            return Layer([path])
+        bold, light = master(), master()
+        glyph = types.SimpleNamespace(layers=[bold, light], userData={bridge.GLYPH_KEY: True})
+        bold.parent = light.parent = glyph
+        bold.paths[0].nodes[1].userData[bridge.CORNER_ON_KEY] = True
+        bold.paths[0].nodes[1].userData[bridge.CORNER_KEY] = 30
+        # Not yet known to use corners: other masters are not consulted...
+        self.assertIsNone(bridge.corner_specs(light.paths[0])[1])
+        # ...until an edit of the layer (normalize) notices the corner.
+        bridge.normalize_layer(bold, True)
+        self.assertTrue(glyph.userData[bridge.GLYPH_CORNERS_KEY])
+        counts = [[len(c) for c in bridge.curves_for_path(layer.paths[0], 60)]
+                  for layer in (bold, light)]
+        self.assertEqual(counts[0], counts[1])
+        self.assertEqual(bridge.corner_specs(light.paths[0])[1], bridge.ZERO_CORNER)
+        self.assertIsNone(bridge.corner_specs(light.paths[0])[0])
+
+    def test_interpolated_layer_gets_strokes_and_blended_corner(self):
+        def master(radius):
+            path = Path([Node(0, 0), Node(0, 300), Node(300, 300)])
+            path.attributes[bridge.CAP_END_KEY] = 'round'
+            for node in path.nodes:
+                node.userData = {}
+            if radius is not None:
+                path.nodes[1].userData.update({bridge.CORNER_ON_KEY: True,
+                                               bridge.CORNER_KEY: radius})
+            return Layer([path])
+        glyph = types.SimpleNamespace(layers={'a': master(40), 'b': master(None)},
+                                      userData={bridge.GLYPH_KEY: True})
+        target = master(None)
+        target.paths[0].attributes.clear()  # Glyphs' interpolated copy lacks our attributes
+        bridge.interpolate_layer(target, glyph, {'a': 0.5, 'b': 0.5})
+        self.assertTrue(bridge.enabled(target.paths[0]))
+        self.assertEqual(target.paths[0].attributes[bridge.CAP_END_KEY], 'round')
+        self.assertEqual(bridge.corner_spec(target.paths[0].nodes[1])['outer'], 20.0)
+        off = types.SimpleNamespace(layers=glyph.layers, userData={})
+        other = master(None)
+        bridge.interpolate_layer(other, off, {'a': 1.0})
+        self.assertFalse(other.userData[bridge.LAYER_STATE_KEY])
+
+    def test_generated_outlines_are_never_expanded_again(self):
+        stroke = Path([Node(0, 0), Node(0, 300), Node(300, 300)])
+        layer = Layer([stroke])
+        bridge.expand_layer(layer, glyph_on=True)
+        once = [len(path.nodes) for path in layer.paths]
+        self.assertTrue(all(bridge.is_outline(path) for path in layer.paths))
+        self.assertEqual(bridge.expand_layer(layer, glyph_on=True), 0)  # prepared twice
+        self.assertEqual([len(path.nodes) for path in layer.paths], once)
+        self.assertFalse(bridge.normalize_layer(layer, True))  # not flagged as strokes
+
+    def test_user_conversion_leaves_plain_paths(self):
+        layer = Layer([Path([Node(0, 0), Node(100, 0)])])
+        bridge.convert_layer(layer, keep_marks=False)
+        self.assertFalse(any(bridge.is_outline(path) for path in layer.paths))
+        self.assertFalse(bridge.layer_state(layer))
+
+    def test_glyph_conversion_turns_variable_stroke_off(self):
+        layers = [Layer([Path([Node(0, 0), Node(100, 0)])]) for _ in range(2)]
+        glyph = types.SimpleNamespace(layers=layers, userData={bridge.GLYPH_KEY: True})
+        for layer in layers:
+            layer.parent = glyph
+        self.assertEqual(bridge.convert_glyph(glyph, keep_marks=False), 2)
+        self.assertFalse(bridge.glyph_enabled(glyph))
+        self.assertTrue(all(bridge.layer_state(layer) is False for layer in layers))
+        self.assertTrue(all(not bridge.enabled(path) and not bridge.is_outline(path)
+                            for layer in layers for path in layer.paths))
+        self.assertEqual(sum(bridge.expand_layer(layer) for layer in layers), 0)
+
+    def test_export_conversion_keeps_editable_glyph_state(self):
+        layer = Layer([Path([Node(0, 0), Node(100, 0)])])
+        glyph = types.SimpleNamespace(layers=[layer], userData={bridge.GLYPH_KEY: True})
+        layer.parent = glyph
+        self.assertEqual(bridge.convert_glyph(glyph), 1)
+        self.assertTrue(bridge.glyph_enabled(glyph))
+        self.assertTrue(bridge.is_outline(layer.paths[0]))
+
+    def test_quick_structure_check_matches_segments(self):
+        import itertools
+        kinds = ['line', 'curve', 'offcurve']
+        for count in range(1, 6):
+            for combo in itertools.product(kinds, repeat=count):
+                for closed in (False, True):
+                    path = Path([Node(i*10, i*5, kind) for i, kind in enumerate(combo)], closed)
+                    try:
+                        bridge.segments_for_path(path, 40)
+                        expected = any(kind != 'offcurve' for kind in combo)
+                    except ValueError:
+                        expected = False
+                    with self.subTest(combo=combo, closed=closed):
+                        self.assertEqual(bridge._valid_structure(path), expected)
 
 
 if __name__ == '__main__':

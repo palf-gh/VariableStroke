@@ -81,11 +81,13 @@ class SelectorTests(unittest.TestCase):
         self.assertEqual(methods['stepped_'], 1)
         self.assertIn('setNextKeyView_', source)
         self.assertIn('disableUndoRegistration', source)
+        # Passing through a field (focus only) must not apply anything.
+        self.assertIn("if commit and str(text) == self._shown.get(name):", source)
 
     def test_panel_has_distinct_on_off_controls(self):
         source = PLUGIN.read_text()
         self.assertIn('InspectorGroup(', source)
-        self.assertIn('PANEL_SIZE = (442, 52)', source)
+        self.assertIn('PANEL_SIZE = (442, 78)', source)
         self.assertIn('setTranslatesAutoresizingMaskIntoConstraints_(False)', source)
         self.assertIn("{'title': 'ON'}, {'title': 'OFF'}", source)
         self.assertIn('group.startCap = SegmentedButton(', source)
