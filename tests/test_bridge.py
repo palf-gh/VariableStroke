@@ -151,6 +151,17 @@ class BridgeTests(unittest.TestCase):
         self.assertAlmostEqual(segs[0][2][0], 70.0)  # (40 + 100) / 2
         self.assertAlmostEqual(segs[0][3][0], 60.0)  # (20 + 100) / 2
 
+    def test_interpolated_layer_blends_section_rotation(self):
+        def master(angle):
+            path = Path([Node(0, 0), Node(100, 0)])
+            path.nodes[1].userData = {bridge.ROTATION_KEY: angle}
+            return Layer([path])
+        glyph = types.SimpleNamespace(layers={'a': master(-30), 'b': master(30)},
+                                      userData={bridge.GLYPH_KEY: True})
+        target = master(0)
+        self.assertTrue(bridge.interpolate_layer(target, glyph, {'a': 0.25, 'b': 0.75}))
+        self.assertAlmostEqual(bridge.segments_for_path(target.paths[0])[0][3][3], 15)
+
     def test_outline_node_count_is_stable_across_designs(self):
         from variable_stroke_core import outline_curves
         def count(width, bend):
@@ -210,8 +221,8 @@ class BridgeTests(unittest.TestCase):
         layer.master = master
         path.parent = layer
         segs = bridge.segments_for_path(path)
-        self.assertEqual(segs[0][2], (80.0, 20.0, 0.0))
-        self.assertEqual(segs[0][3], (40.0, 10.0, -1.0))
+        self.assertEqual(segs[0][2], (80.0, 20.0, 0.0, 0.0))
+        self.assertEqual(segs[0][3], (40.0, 10.0, -1.0, 0.0))
         self.assertEqual(bridge.layer_defaults(layer).italic_angle, 10.0)
         path.attributes[bridge.STROKE_WIDTH_KEY] = 160
         self.assertEqual(bridge.stroke_height(path), 20.0)

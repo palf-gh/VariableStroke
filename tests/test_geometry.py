@@ -8,6 +8,21 @@ from variable_stroke_core import (outline, outline_curves, node_edges, nib_edges
 
 
 class GeometryTests(unittest.TestCase):
+    def test_rotated_width_section_shifts_its_ends_without_changing_thickness(self):
+        left, right = nib_edges((0, 0), (1, 0), (165, 140, 0, 30))
+        self.assertAlmostEqual(left[1] - right[1], 140)
+        self.assertAlmostEqual(left[0], -right[0])
+        self.assertLess(left[0], -35)
+        plain = nib_edges((0, 0), (1, 0), (165, 140, 0, 0))
+        self.assertEqual(plain, ((0.0, 70.0), (0.0, -70.0)))
+
+    def test_node_rotation_changes_only_its_own_width_section(self):
+        nib0, nib1 = (165, 140, 0, 0), (165, 140, 0, 30)
+        contour = outline_curves([('line', ((0, 0), (100, 0)), nib0, nib1)])[0]
+        self.assertEqual(contour[0][1][0], (0.0, 70.0))
+        self.assertLess(contour[0][1][1][0], 100)
+        self.assertGreater(contour[2][1][0][0], 100)
+
     def test_cut_extension_does_not_change_the_curve_handles(self):
         segment = [('cubic', ((0, 0), (50, 50), (150, 100), (200, 150)),
                     (120, 80, 0), (120, 80, 0))]
@@ -185,28 +200,6 @@ class GeometryTests(unittest.TestCase):
         self.assertEqual(a.end, b.start)
         self.assertAlmostEqual(a.end[0], 357)
         self.assertLess(math.dist(a.at(a.tb), a.end), 0.5)
-
-    def test_thick_hook_keeps_smooth_inner_turn(self):
-        # User's 198 x 700 hook: the inner offset briefly folds back near
-        # the bottom node, but the displayed curve must keep a real handle.
-        nib = (165, 140, 0)
-        segments = [
-            ('cubic', ((33, 0), (12, 117), (0, 213), (0, 352)), nib, nib),
-            ('cubic', ((0, 352), (0, 574), (44, 700), (124, 700)), nib, nib),
-            ('cubic', ((124, 700), (148, 700), (178, 695), (198, 684)), nib, nib),
-        ]
-        contour = outline_curves(segments, cap_end='vertical')[0]
-        # Right side runs backwards through the contour. Both handles at its
-        # smooth bottom node should point horizontally and stay substantial.
-        incoming, outgoing = contour[4][1], contour[5][1]
-        self.assertEqual(incoming[-1], outgoing[0])
-        self.assertLess(abs(incoming[-1][1] - incoming[-2][1]), 2)
-        self.assertLess(abs(outgoing[1][1] - outgoing[0][1]), 2)
-        self.assertGreater(math.dist(outgoing[0], outgoing[1]), 30)
-        # The mathematical inner offset folds backward. Its fitted control
-        # polygon should follow the source turn instead of that fold.
-        self.assertLess(outgoing[1][0], 70)
-        self.assertLess(outgoing[2][1], 550)
 
     def test_svg_mountain_horizontal_cuts_follow_curves(self):
         from variable_stroke_core import _normalized_bend

@@ -11,6 +11,7 @@ STROKE_WIDTH_KEY = 'com.codex.VariableStroke.strokeWidth'  # per path, font unit
 SCALE_KEY = 'com.codex.VariableStroke.scale'  # per node, percent of the path width
 STROKE_HEIGHT_KEY = 'com.codex.VariableStroke.strokeHeight'  # per path, font units
 OFFSET_KEY = 'com.codex.VariableStroke.offset'  # per node, -100 (right) .. 100 (left)
+ROTATION_KEY = 'com.codex.VariableStroke.rotation'  # per node, section degrees
 # Live corners, per node. The radius key alone (older files) also means ON.
 CORNER_ON_KEY = 'com.codex.VariableStroke.corner'  # bool
 CORNER_KEY = 'com.codex.VariableStroke.cornerRadius'  # outer radius, font units
@@ -191,6 +192,14 @@ def offset(node):
     return max(-100.0, min(100.0, value))
 
 
+def rotation(node):
+    """Angle of this node's width section relative to its path normal."""
+    try:
+        return max(-75.0, min(75.0, float(node.userData.get(ROTATION_KEY, 0.0))))
+    except (TypeError, ValueError):
+        return 0.0
+
+
 def corner_on(node):
     data = node.userData
     return bool(data.get(CORNER_ON_KEY, CORNER_KEY in data))
@@ -231,9 +240,10 @@ def width(node, path=None, base=None):
 
 
 def node_nib(node, path, base_width, base_height):
-    """(width, height, offset fraction) of the stroke at an on-curve node."""
+    """(width, height, offset fraction, rotation) at an on-curve node."""
     w = width(node, path, base_width)
-    return (w, max(1.0, w * base_height / base_width), offset(node) / 100.0)
+    return (w, max(1.0, w * base_height / base_width),
+            offset(node) / 100.0, rotation(node))
 
 
 def migrate_path(path):
@@ -671,18 +681,20 @@ def interpolate_layer(layer, glyph, interpolation):
         for position, node in enumerate(path.nodes):
             if node.type == OFFCURVE:
                 continue
-            w = o = 0.0
+            w = o = a = 0.0
             corner, any_corner = dict.fromkeys(_CORNER_PARTS, 0.0), False
             for other, factor in others:
                 source_node = other.nodes[position]
                 w += factor * width(source_node, other, stroke_width(other))
                 o += factor * offset(source_node)
+                a += factor * rotation(source_node)
                 spec = corner_spec(source_node)
                 any_corner = any_corner or spec is not None
                 for key in _CORNER_PARTS:
                     corner[key] += factor * (spec or ZERO_CORNER)[key]
             node.userData[SCALE_KEY] = w / base_w * 100.0
             node.userData[OFFSET_KEY] = o
+            node.userData[ROTATION_KEY] = a
             node.userData[CORNER_ON_KEY] = any_corner
             if any_corner:
                 node.userData[CORNER_KEY] = corner['outer']

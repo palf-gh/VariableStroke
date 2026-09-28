@@ -175,10 +175,10 @@ def _fit_side(points, tolerance=0.35):
     return fit(0, last)
 
 
-def _round_cap(center, radius, tangent, start):
+def _round_cap(center, radius, tangent, start, section=None):
     """Two exact-quarter-circle cubic approximations, in contour order."""
     outward = mul(tangent, -1 if start else 1)
-    n = normal(tangent)
+    n = unit(section) if section is not None else normal(tangent)
     left = add(center, mul(n, radius))
     right = sub(center, mul(n, radius))
     tip = add(center, mul(outward, radius))
@@ -195,11 +195,10 @@ def _cap_segments(center, width, tangent, style, at_end, left, right, nib=None, 
     if style == 'round':
         if nib is None:
             return _round_cap(center, width/2, tangent, not at_end)
-        # A plain half circle spanning the stroke, perpendicular to its direction.
-        w, h, o = nib
-        n = normal(tangent)
-        half = _half_thickness(n, w, h, slant)
-        return _round_cap(add(center, mul(n, half*o)), half, tangent, not at_end)
+        # Use the actual rotated section endpoints, including its offset.
+        middle = mul(add(left, right), 0.5)
+        section = mul(sub(left, right), 0.5)
+        return _round_cap(middle, length(section), tangent, not at_end, section)
     return [('line', (left, right))] if at_end else [('line', (right, left))]
 
 
@@ -209,22 +208,35 @@ NEAR_STRAIGHT = math.sin(math.radians(10))  # below this kink a corner fades to 
 
 
 def _nib(value):
-    """Normalize a node's stroke to (width, height, offset).
+    """Normalize a node's stroke to (width, height, offset, rotation).
 
     `value` is a width, or (width, height[, offset]). Height None means round
     (height = width). Offset is -1..1: 0 keeps the centerline in the middle,
     1 puts the whole stroke on the left of the path direction, -1 on the right.
+    Rotation turns the width section around the centerline node, in degrees.
     """
     if isinstance(value, (tuple, list)):
         w = float(value[0])
         h = float(value[1]) if len(value) > 1 and value[1] is not None else w
         o = float(value[2]) if len(value) > 2 and value[2] is not None else 0.0
+        rotation = float(value[3]) if len(value) > 3 and value[3] is not None else 0.0
     else:
         w = h = float(value)
         o = 0.0
+        rotation = 0.0
     if w <= 0 or h <= 0:
         raise ValueError('Width must be positive')
-    return (w, h, max(-1.0, min(1.0, o)))
+    return (w, h, max(-1.0, min(1.0, o)), max(-75.0, min(75.0, rotation)))
+
+
+def _section_normal(tangent, rotation):
+    n = normal(unit(tangent))
+    angle = math.radians(rotation)
+    c, s = math.cos(angle), math.sin(angle)
+    # Keep the nominal thickness measured across the path while tilting the
+    # section. Thus rotation changes where its two ends sit along the path.
+    c = max(c, 1e-3)
+    return ((n[0]*c-n[1]*s)/c, (n[0]*s+n[1]*c)/c)
 
 
 def _half_thickness(n, w, h, slant):
@@ -239,9 +251,10 @@ def _half_thickness(n, w, h, slant):
 
 def nib_edges(point, tangent, nib, italic_angle=0.0):
     """Left and right outline points of the stroke at a centerline point."""
-    w, h, o = _nib(nib)
+    w, h, o, rotation = _nib(nib)
     n = normal(unit(tangent))
     half = _half_thickness(n, w, h, math.tan(math.radians(italic_angle or 0.0)))
+    n = _section_normal(tangent, rotation)
     return add(point, mul(n, half*(1+o))), sub(point, mul(n, half*(1-o)))
 
 
@@ -324,15 +337,16 @@ class _Side(object):
         return tuple(x*(1-t) + y*t for x, y in zip(self.n0, self.n1))
 
     def extent(self, t):
-        w, h, _ = self.nib(t)
+        w, h, _, _ = self.nib(t)
         return max(w, h)
 
     def at(self, t):
         pts = self.pts
         p = add(mul(pts[0], 1-t), mul(pts[1], t)) if self.kind == 'line' else cubic(*pts, t)
-        w, h, o = self.nib(t)
+        w, h, o, rotation = self.nib(t)
         n = normal(self.tangent(t))
         half = _half_thickness(n, w, h, self.slant)
+        n = _section_normal(self.tangent(t), rotation)
         # Edges sit on the normal; o slides the stroke sideways across the centerline.
         return add(p, mul(n, half*(1+o))) if self.sign > 0 else sub(p, mul(n, half*(1-o)))
 
@@ -415,46 +429,6 @@ class _Side(object):
                 break  # already far below what anyone can see
             us = [min(max(i/64.0, 1e-3), 1-1e-3) for i in nearest]
         controls = best[1]
-        # A normal offset ceases to be a usable outline when its local radius
-        # drops below the stroke's half-width: it briefly runs backwards. Fit
-        # the visible inner edge from the source's end directions instead of
-        # chasing that folded sample. This keeps the turn broad and editable
-        # with the source handles, while preserving the exact edge endpoints.
-        alignment = min(
-            sum(a*b for a, b in zip(self.edge_tangent(t), self.tangent(t)))
-            for t in [ta+(tb-ta)*i/8.0 for i in range(1, 8)] +
-                     [ta+(tb-ta)*15/16.0])
-        fold_weight = min(1.0, max(0.0, (0.4-alignment)/0.6))
-        fold_weight = fold_weight*fold_weight*(3-2*fold_weight)
-        if fold_weight > 0 and length(sub(p0, self.at(ta))) < 0.05 and \
-                length(sub(p3, self.at(tb))) < 0.05:
-            source_start = length(sub(self.pts[1], self.pts[0]))
-            source_end = length(sub(self.pts[-1], self.pts[-2]))
-            optical_start = add(p0, mul(center0, min(0.75*source_start, 0.6*chord)))
-            optical_end = sub(p3, mul(center1, min(0.8*source_end, 0.6*chord)))
-            controls = (p0,
-                        add(mul(controls[1], 1-fold_weight),
-                            mul(optical_start, fold_weight)),
-                        add(mul(controls[2], 1-fold_weight),
-                            mul(optical_end, fold_weight)), p3)
-        # A tight inner offset can fold back near a smooth node. Least squares
-        # then collapses its end handle to zero, turning the joined outline
-        # into a flat spot followed by a kink. Preserve the source tangent at
-        # that node and give it enough length to form a visible smooth bend.
-        if not gentle and chord > EPS:
-            p0, p1, p2, p3 = controls
-            for at_end, edge, center in ((False, d0, center0), (True, d1, center1)):
-                handle = length(sub(p3, p2) if at_end else sub(p1, p0))
-                source_handle = length(sub(self.pts[-1], self.pts[-2]) if at_end
-                                       else sub(self.pts[1], self.pts[0]))
-                alignment = edge[0]*center[0] + edge[1]*center[1]
-                if handle < 0.03*chord and source_handle > 0.1*source_chord and alignment > 0.8:
-                    size = min(0.16*chord, 0.6*source_handle)
-                    if at_end:
-                        p2 = sub(p3, mul(center, size))
-                    else:
-                        p1 = add(p0, mul(center, size))
-            controls = (p0, p1, p2, p3)
         # A true normal offset can cancel a gentle centerline's bend entirely.
         # For display outlines, retain some of that bend rather than producing
         # an almost straight edge beside a visibly curved centerline.
@@ -918,7 +892,7 @@ def _cap_on_curve(side, at_end, center, tangent, style, nib, slant, angle=0.0):
     if side.kind == 'line':
         p = side.end if at_end else side.start
         if style == 'square':
-            w, h, _ = nib
+            w, h, _, _ = nib
             point = add(p, mul(tangent, outward *
                                _half_thickness(normal(tangent), w, h, slant)))
         else:
@@ -941,7 +915,7 @@ def _cap_on_curve(side, at_end, center, tangent, style, nib, slant, angle=0.0):
 
     def keep_cut():
         if style == 'square':
-            w, h, _ = nib
+            w, h, _, _ = nib
             target = add(edge_point, mul(fallback_direction,
                              _half_thickness(normal(tangent), w, h, slant)))
         else:
@@ -968,7 +942,7 @@ def _cap_on_curve(side, at_end, center, tangent, style, nib, slant, angle=0.0):
     if max_travel < EPS:
         return keep_cut()
     if style == 'square':
-        w, h, _ = nib
+        w, h, _, _ = nib
         target = _half_thickness(normal(tangent), w, h, slant)
         max_travel = max(max_travel, target*1.05)
         search = outward

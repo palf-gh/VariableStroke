@@ -6,6 +6,7 @@ import objc
 from AppKit import (NSBezierPath, NSColor, NSEvent, NSImage, NSMenu, NSMenuItem, NSObject,
                     NSThread,
                     NSEventModifierFlagOption, NSEventModifierFlagShift,
+                    NSEventModifierFlagCommand,
                     NSRoundLineCapStyle, NSRoundLineJoinStyle)
 from GlyphsApp import (Glyphs, GSCallbackHandler, GSCustomParameter, OFFCURVE, DOCUMENTOPENED,
                        UPDATEINTERFACE, DRAWBACKGROUND, CONTEXTMENUCALLBACK, WINDOW_MENU)
@@ -23,8 +24,8 @@ from glyphs_bridge import (CAP_START_KEY, CAP_END_KEY, CAP_START_ANGLE_KEY, CAP_
                            cleanup_legacy_layer, glyph_enabled, GLYPH_KEY, set_glyph_enabled,
                            normalize_layer, MASTER_WIDTH_KEY, master_default_width,
                            has_width_override, reset_width_overrides, STROKE_HEIGHT_KEY,
-                           OFFSET_KEY, MASTER_HEIGHT_KEY, master_default_height, master_defaults,
-                           layer_defaults, stroke_height, has_height_override, offset,
+                           OFFSET_KEY, ROTATION_KEY, MASTER_HEIGHT_KEY, master_default_height, master_defaults,
+                           layer_defaults, stroke_height, has_height_override, offset, rotation,
                            edges_for_path)
 from variable_stroke_core import unit, sub, add, length, outline_curves
 
@@ -37,7 +38,7 @@ CAP_VALUES = [item[0] for item in CAP_NAMES]
 # outline preparation hooks.
 INSPECTOR_CALLBACK = 'GSInspectorViewControllersCallback'
 PREPARE_LAYER_CALLBACK = 'GSPrepareLayerCallback'
-PANEL_SIZE = (442, 78)
+PANEL_SIZE = (530, 78)
 
 
 def _loc(english, japanese):
@@ -154,13 +155,13 @@ def _normalize_quietly(layer):
 
 _PATH_KEYS = (STROKE_WIDTH_KEY, STROKE_HEIGHT_KEY, CAP_START_KEY, CAP_END_KEY,
               CAP_START_ANGLE_KEY, CAP_END_ANGLE_KEY)
-_NODE_KEYS = (SCALE_KEY, OFFSET_KEY, WIDTH_KEY, CORNER_ON_KEY, CORNER_KEY, CORNER_INNER_KEY,
+_NODE_KEYS = (SCALE_KEY, OFFSET_KEY, ROTATION_KEY, WIDTH_KEY, CORNER_ON_KEY, CORNER_KEY, CORNER_INNER_KEY,
               CORNER_TENSION_KEY, CORNER_RATIO_KEY)
 _MISSING = object()
 # Node fields of the live corner and the userData key each one writes.
 CORNER_FIELDS = {'radius': CORNER_KEY, 'innerRadius': CORNER_INNER_KEY,
                  'tension': CORNER_TENSION_KEY, 'ratio': CORNER_RATIO_KEY}
-NODE_FIELDS = ('scale', 'offset') + tuple(CORNER_FIELDS)
+NODE_FIELDS = ('scale', 'offset', 'rotation') + tuple(CORNER_FIELDS)
 
 
 def _corner_color(which):
@@ -177,6 +178,8 @@ def _parse_field(name, text):
         return None
     if name == 'offset':
         return max(-100.0, min(100.0, value))
+    if name == 'rotation':
+        return max(-75.0, min(75.0, value))
     if name in ('startAngle', 'endAngle'):
         return value % 360.0
     if name in ('radius', 'innerRadius'):
@@ -203,6 +206,9 @@ def _apply_field(name, value, paths, nodes):
     elif name == 'offset':
         for node in nodes:
             node.userData[OFFSET_KEY] = value
+    elif name == 'rotation':
+        for node in nodes:
+            node.userData[ROTATION_KEY] = value
     elif name in CORNER_FIELDS:
         for node in nodes:
             node.userData[CORNER_FIELDS[name]] = value
@@ -225,8 +231,9 @@ def _field_is(name, value, paths, nodes):
     if name in CORNER_FIELDS:
         return all(corner_on(node) and node.userData.get(CORNER_FIELDS[name]) == value
                    for node in nodes)
-    if name in ('scale', 'offset'):
-        key = SCALE_KEY if name == 'scale' else OFFSET_KEY
+    if name in ('scale', 'offset', 'rotation'):
+        key = {'scale': SCALE_KEY, 'offset': OFFSET_KEY,
+               'rotation': ROTATION_KEY}[name]
         return all(node.userData.get(key) == value for node in nodes)
     key, angle_key = ((CAP_START_KEY, CAP_START_ANGLE_KEY) if name == 'startAngle'
                       else (CAP_END_KEY, CAP_END_ANGLE_KEY))
@@ -606,7 +613,10 @@ class VariableStrokeTool(SelectTool):
         group.offsetLabel = TextBox((336, 7, 27, 14), _loc('Pos', '位置'), sizeStyle='small')
         group.offsetField = SteppingEditText((363, 4, 40, 19), sizeStyle='small')
         group.offsetUnit = TextBox((405, 7, 12, 14), '%', sizeStyle='small')
-        group.settings = ImageButton((420, 5, 17, 17), imageNamed='NSActionTemplate',
+        group.rotationLabel = TextBox((420, 7, 34, 14), _loc('Tilt', '回転'), sizeStyle='small')
+        group.rotationField = SteppingEditText((454, 4, 40, 19), sizeStyle='small')
+        group.rotationUnit = TextBox((496, 7, 10, 14), '°', sizeStyle='small')
+        group.settings = ImageButton((509, 5, 17, 17), imageNamed='NSActionTemplate',
                                      bordered=False, callback=self.showSettingsFromInspector_)
         group.widthReset.getNSButton().setToolTip_(
             _loc('Follow the master default width and height', 'マスターの既定の幅・高さに戻す'))
@@ -623,6 +633,11 @@ class VariableStrokeTool(SelectTool):
                  'Option-drag a handle to move one side only.',
                  '選択ノードでの中心線の位置：0 で中央、100 で線幅がパスの進行方向の左側、'
                  '−100 で右側。ハンドルを Option ドラッグすると片側だけ動かせます。'))
+        group.rotationField.getNSTextField().setToolTip_(
+            _loc('Rotate the width section around the selected centerline nodes. '
+                 'Command-drag a width handle to rotate it on the canvas.',
+                 '選択ノードの線幅断面を中心線の周りに回転します。'
+                 'キャンバスでは幅ハンドルを Command ドラッグして回転できます。'))
         caps = [{'imageObject': _cap_icon(value), 'width': 21} for value in CAP_VALUES]
         group.startLabel = TextBox((6, 33, 30, 14), _loc('Start', '始点'), sizeStyle='small')
         group.startCap = SegmentedButton((36, 29, 128, 20), caps,
@@ -682,6 +697,7 @@ class VariableStrokeTool(SelectTool):
         self._shown = {}  # text each field showed after the last refresh
         fields = [('width', group.widthField), ('height', group.heightField),
                   ('scale', group.scaleField), ('offset', group.offsetField),
+                  ('rotation', group.rotationField),
 
                   ('startAngle', group.startAngle), ('endAngle', group.endAngle),
                   ('radius', group.outerField), ('innerRadius', group.innerField),
@@ -933,6 +949,7 @@ class VariableStrokeTool(SelectTool):
         height_overridden = [has_height_override(path) for path in paths] if editable else []
         scales = [scale(node) if SCALE_KEY in node.userData else None for node in nodes]
         offsets = [offset(node) for node in nodes]
+        rotations = [rotation(node) for node in nodes]
         corner_states = [corner_on(node) for node in nodes]
         corner_values = [corner_spec(node) or {} for node in nodes]
         layer_paths = list(layer.paths) if layer is not None else []
@@ -947,7 +964,7 @@ class VariableStrokeTool(SelectTool):
                    path.attributes.get(CAP_START_ANGLE_KEY), path.attributes.get(CAP_END_ANGLE_KEY))
                   for path in paths),
             tuple(bases), tuple(heights), tuple(overridden), tuple(height_overridden),
-            tuple(scales), tuple(offsets), tuple(corner_states),
+            tuple(scales), tuple(offsets), tuple(rotations), tuple(corner_states),
             tuple(tuple(sorted(v.items())) for v in corner_values),
             glyph_enabled(layer.parent) if layer else False,
         )
@@ -964,7 +981,7 @@ class VariableStrokeTool(SelectTool):
             group.enableStroke.enable(layer is not None)
             group.enableStroke.set(0 if active else 1)
             for field in (group.widthField, group.heightField, group.scaleField,
-                          group.offsetField, group.outerField, group.innerField,
+                          group.offsetField, group.rotationField, group.outerField, group.innerField,
                           group.tensionField, group.ratioField):
                 field.enable(editable)
             group.cornerToggle.enable(editable and bool(nodes))
@@ -994,6 +1011,7 @@ class VariableStrokeTool(SelectTool):
                 field.getNSTextField().setTextColor_(
                     NSColor.labelColor() if any(flags) else NSColor.secondaryLabelColor())
             group.offsetField.set(('%g' % offsets[0]) if same(offsets) else '')
+            group.rotationField.set(('%g' % rotations[0]) if same(rotations) else '')
 
             scales = [value if value is not None else 100.0 for value in scales]
             group.scaleField.set(('%g' % scales[0]) if same(scales) else '')
@@ -1381,7 +1399,8 @@ class VariableStrokeTool(SelectTool):
                     self._drag = {'layer': layer, 'path': path, 'node': node, 'sign': sign,
                                   'center': center, 'direction': direction,
                                   'near': near, 'far': far,
-                                  'offset': offset(node) / 100.0, 'scale': scale(node)}
+                                  'offset': offset(node) / 100.0, 'scale': scale(node),
+                                  'rotation': rotation(node)}
                     self._last_ui_state = None
                     self._refresh_ui()
                     return
@@ -1452,6 +1471,17 @@ class VariableStrokeTool(SelectTool):
             self._redraw()
             return
         delta = sub((loc.x, loc.y), drag['center'])
+        if NSEvent.modifierFlags() & NSEventModifierFlagCommand:
+            direction = drag['direction']
+            if length(delta) > 1e-6:
+                change = math.degrees(math.atan2(
+                    direction[0]*delta[1]-direction[1]*delta[0],
+                    direction[0]*delta[0]+direction[1]*delta[1]))
+                drag['node'].userData[ROTATION_KEY] = round(max(-75.0, min(75.0,
+                    drag['rotation'] + change)), 1)
+                _invalidate(drag['layer'], [drag['path']])
+                self._redraw()
+            return
         # The handle slides on the line from the node through its outline point
         # (across the stroke, or towards the corner at corners).
         reach = max(0.0, delta[0]*drag['direction'][0] + delta[1]*drag['direction'][1])
