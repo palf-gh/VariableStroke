@@ -42,11 +42,14 @@ class SelectorTests(unittest.TestCase):
         source = PLUGIN.read_text()
         self.assertIn('contextMenuCallback_forSelectedLayers_event_', source)
         self.assertIn('parent.setSubmenu_(submenu)', source)
+        self.assertIn('getattr(self, action)', source)
+        self.assertIn('submenu.setAutoenablesItems_(False)', source)
         self.assertIn('GSCallbackHandler.addCallback_forOperation_', source)
 
     def test_panel_has_distinct_on_off_controls(self):
         source = PLUGIN.read_text()
         self.assertIn('InspectorGroup(', source)
+        self.assertIn('width_px, height_px = 590, 58', source)
         self.assertIn("{'title': 'ON'}, {'title': 'OFF'}", source)
         self.assertIn('group.startCap = PopUpButton(', source)
         self.assertIn('group.endCap = PopUpButton(', source)

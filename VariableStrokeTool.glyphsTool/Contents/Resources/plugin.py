@@ -48,11 +48,16 @@ class VariableStrokeContextMenu(NSObject):
             glyphs = list(font.selection) if font else []
             if not glyphs and font:
                 glyphs = [layer.parent for layer in font.selectedLayers]
+            if not glyphs and font and font.currentTab:
+                active_layer = font.currentTab.graphicView().activeLayer()
+                if active_layer is not None:
+                    glyphs = [active_layer.parent]
         submenu = NSMenu.alloc().initWithTitle_(_loc('Variable Stroke', '可変ストローク'))
+        submenu.setAutoenablesItems_(False)
         for title, action in ((_loc('Turn ON', 'オン'), 'turnOn_'),
                               (_loc('Turn OFF', 'オフ'), 'turnOff_'),
                               (_loc('Convert to Outlines', 'アウトライン化'), 'convert_')):
-            item = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(title, action, '')
+            item = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(title, getattr(self, action), '')
             item.setTarget_(self)
             item.setRepresentedObject_(glyphs)
             item.setEnabled_(bool(glyphs))
@@ -109,30 +114,32 @@ class VariableStrokeTool(SelectTool):
 
     @objc.python_method
     def _build_inspector(self):
-        width, height = 290, 182
-        self.infoBoxWindow = Window((width, height))
-        group = self.infoBoxWindow.group = InspectorGroup((0, 0, width, height))
-        group.targetLabel = TextBox((12, 7, 270, 18), _loc('Select a path', 'パスを選択してください'))
-        group.strokeLabel = TextBox((12, 31, 70, 20), _loc('Stroke', 'ストローク'))
-        group.enableStroke = SegmentedButton((88, 28, 185, 25),
+        # Glyphs gives tools a shallow strip next to the standard bottom info box.
+        width_px, height_px = 590, 58
+        self.infoBoxWindow = Window((width_px, height_px))
+        group = self.infoBoxWindow.group = InspectorGroup((0, 0, width_px, height_px))
+        group.targetLabel = TextBox((8, 5, 200, 18), _loc('Variable Stroke', '可変ストローク'))
+        group.strokeLabel = TextBox((8, 32, 75, 18), _loc('Stroke', 'ストローク'))
+        group.enableStroke = SegmentedButton((76, 28, 112, 24),
                                               [{'title': 'ON'}, {'title': 'OFF'}],
                                               callback=self.toggleFromInspector_)
-        group.widthLabel = TextBox((12, 59, 70, 20), _loc('Width', '線幅'))
-        group.widthField = EditText((88, 55, 185, 24), callback=self.widthFromInspector_,
+        group.widthLabel = TextBox((204, 32, 38, 18), _loc('Width', '線幅'))
+        group.widthField = EditText((242, 28, 55, 22), callback=self.widthFromInspector_,
                                     continuous=False)
-        group.startLabel = TextBox((12, 89, 70, 20), _loc('Start cap', '始点の線端'))
-        group.startCap = PopUpButton((88, 85, 185, 25),
-                                  [_loc(english, japanese) for english, japanese in
-                                   [('Flat', 'フラット'), ('Round', '丸'), ('Square', '四角'),
-                                    ('Horizontal cut', '水平カット'), ('Vertical cut', '垂直カット')]],
-                                  callback=self.startCapFromInspector_)
-        group.endLabel = TextBox((12, 119, 70, 20), _loc('End cap', '終点の線端'))
-        group.endCap = PopUpButton((88, 115, 185, 25),
-                                [_loc(english, japanese) for english, japanese in
-                                 [('Flat', 'フラット'), ('Round', '丸'), ('Square', '四角'),
-                                  ('Horizontal cut', '水平カット'), ('Vertical cut', '垂直カット')]],
-                                callback=self.endCapFromInspector_)
-        group.convert = Button((88, 147, 185, 24), _loc('Convert to Outlines', 'アウトライン化'),
+        group.startLabel = TextBox((308, 5, 55, 18), _loc('Start', '始点'))
+        group.startCap = PopUpButton((355, 2, 105, 24),
+                                     [_loc(en, ja) for en, ja in
+                                      [('Flat', 'フラット'), ('Round', '丸'), ('Square', '四角'),
+                                       ('Horizontal', '水平カット'), ('Vertical', '垂直カット')]],
+                                     callback=self.startCapFromInspector_)
+        group.endLabel = TextBox((308, 32, 55, 18), _loc('End', '終点'))
+        group.endCap = PopUpButton((355, 29, 105, 24),
+                                   [_loc(en, ja) for en, ja in
+                                    [('Flat', 'フラット'), ('Round', '丸'), ('Square', '四角'),
+                                     ('Horizontal', '水平カット'), ('Vertical', '垂直カット')]],
+                                   callback=self.endCapFromInspector_)
+        group.convert = Button((468, 16, 114, 24),
+                               _loc('Convert', 'アウトライン化'),
                                callback=self.convertSelectedLayer_)
         group.enableStroke.set(1)
         self.infoBoxView = group.getNSView()
