@@ -10,6 +10,7 @@ EXPORT_FILTER = 'VariableStrokeExport'
 DEFAULT_WIDTH = 40.0
 GLYPH_KEY = 'com.codex.VariableStroke.glyphEnabled'
 GENERATED_KEY = 'com.codex.VariableStroke.generated'
+ORIGINAL_FILL_KEY = 'com.codex.VariableStroke.originalFill'
 
 
 def enabled(path):
@@ -111,6 +112,30 @@ def active(path):
     except AttributeError:
         glyph = None
     return enabled(path) and (glyph is None or glyph_enabled(glyph))
+
+
+def set_glyph_enabled(glyph, state):
+    """Toggle one glyph and prepare its centerlines across all layers."""
+    glyph.userData[GLYPH_KEY] = bool(state)
+    if not state:
+        return
+    for layer in glyph.layers:
+        for path in layer.paths:
+            if generated(path) or not path.nodes:
+                continue
+            try:
+                segments_for_path(path)
+            except ValueError:
+                continue
+            if ORIGINAL_FILL_KEY not in path.attributes:
+                path.attributes[ORIGINAL_FILL_KEY] = bool(path.attributes.get('fill', True))
+            path.attributes[PATH_KEY] = True
+            path.attributes[CAP_START_KEY] = path.attributes.get(CAP_START_KEY, 'flat')
+            path.attributes[CAP_END_KEY] = path.attributes.get(CAP_END_KEY, 'flat')
+            path.attributes['fill'] = False
+            for node in path.nodes:
+                if node.type != OFFCURVE and WIDTH_KEY not in node.userData:
+                    node.userData[WIDTH_KEY] = DEFAULT_WIDTH
 
 
 def convert_layer(layer):

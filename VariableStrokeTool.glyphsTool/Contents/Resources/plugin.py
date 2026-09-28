@@ -8,7 +8,7 @@ from vanilla import Window, Group, SegmentedButton, TextBox, EditText, PopUpButt
 from glyphs_bridge import (PATH_KEY, WIDTH_KEY, CAP_START_KEY, CAP_END_KEY,
                            EXPORT_FILTER, DEFAULT_WIDTH, enabled, width,
                            segments_for_path, curves_for_path, convert_layer, generated,
-                           glyph_enabled, GLYPH_KEY)
+                           glyph_enabled, GLYPH_KEY, set_glyph_enabled)
 from variable_stroke_core import normal, unit, sub, add, mul, length
 
 CAP_NAMES = [('flat', 'フラット'), ('round', '丸'), ('square', '四角'),
@@ -45,7 +45,9 @@ class VariableStrokeContextMenu(NSObject):
                 glyphs.append(glyph)
         if not glyphs:
             font = Glyphs.font
-            glyphs = list(dict.fromkeys(layer.parent for layer in font.selectedLayers)) if font else []
+            glyphs = list(font.selection) if font else []
+            if not glyphs and font:
+                glyphs = [layer.parent for layer in font.selectedLayers]
         submenu = NSMenu.alloc().initWithTitle_(_loc('Variable Stroke', '可変ストローク'))
         for title, action in ((_loc('Turn ON', 'オン'), 'turnOn_'),
                               (_loc('Turn OFF', 'オフ'), 'turnOff_'),
@@ -54,6 +56,10 @@ class VariableStrokeContextMenu(NSObject):
             item.setTarget_(self)
             item.setRepresentedObject_(glyphs)
             item.setEnabled_(bool(glyphs))
+            if action == 'turnOn_':
+                item.setState_(1 if glyphs and all(glyph_enabled(g) for g in glyphs) else 0)
+            elif action == 'turnOff_':
+                item.setState_(1 if glyphs and all(not glyph_enabled(g) for g in glyphs) else 0)
             submenu.addItem_(item)
         parent = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(_loc('Variable Stroke', '可変ストローク'), None, '')
         parent.setSubmenu_(submenu)
@@ -79,18 +85,7 @@ class VariableStrokeContextMenu(NSObject):
     @objc.python_method
     def _set_glyphs(self, glyphs, state):
         for glyph in glyphs:
-            glyph.userData[GLYPH_KEY] = state
-            if state:
-                for layer in glyph.layers:
-                    for path in layer.paths:
-                        if generated(path) or (not path.nodes):
-                            continue
-                        if not path.attributes.get(PATH_KEY):
-                            path.attributes[PATH_KEY] = True
-                            path.attributes['fill'] = False
-                            for node in path.nodes:
-                                if node.type != OFFCURVE and WIDTH_KEY not in node.userData:
-                                    node.userData[WIDTH_KEY] = DEFAULT_WIDTH
+            set_glyph_enabled(glyph, state)
         if state and glyphs:
             _ensure_export_filter(glyphs[0].parent)
         Glyphs.redraw()
@@ -266,7 +261,7 @@ class VariableStrokeTool(SelectTool):
             return
         layer = self._layer()
         paths = self._target_paths(layer) if layer is not None else []
-        active = bool(paths) and glyph_enabled(layer.parent) and all(enabled(path) for path in paths)
+        active = bool(layer) and glyph_enabled(layer.parent)
         editable = bool(paths) and active
         nodes = self._target_nodes(layer, paths) if editable else []
         widths = [width(node) for node in nodes]
@@ -289,7 +284,7 @@ class VariableStrokeTool(SelectTool):
         self._updating_ui = True
         try:
             if not paths:
-                group.targetLabel.set(_loc('Select a path', 'パスを選択してください'))
+                group.targetLabel.set(_loc('This glyph has no paths', 'このグリフにパスはありません'))
             elif len(paths) == 1 and layer is not None and len(layer_paths) == 1:
                 group.targetLabel.set(_loc('One path in this layer', 'このレイヤーのパスを編集中'))
             elif layer is not None and self._selected_paths(layer):
@@ -298,7 +293,7 @@ class VariableStrokeTool(SelectTool):
             else:
                 group.targetLabel.set(_loc('%d active strokes' % len(paths),
                                            '編集中のストローク：%d本' % len(paths)))
-            group.enableStroke.enable(bool(paths))
+            group.enableStroke.enable(layer is not None)
             group.enableStroke.set(0 if active else 1)
             group.widthField.enable(editable)
             group.startCap.enable(editable and any(not path.closed for path in paths))
@@ -333,41 +328,21 @@ class VariableStrokeTool(SelectTool):
 
     @objc.python_method
     def _set_enabled(self, paths, state):
-        if not paths:
-            return
-        if state:
-            try:
-                for path in paths:
-                    segments_for_path(path)
-            except ValueError:
-                Message(_loc('Only line and cubic paths are supported.',
-                             '直線と3次ベジェのパスのみ対応しています。'),
-                        title=self.name)
-                self._refresh_ui()
-                return
         layer = self._layer()
         if layer is None:
             return
+        # The switch applies to the whole glyph. Path selection only controls
+        # which widths and caps are edited after the glyph is enabled.
         layer.beginChanges()
         try:
-            layer.parent.userData[GLYPH_KEY] = state
-            if state:
-                for path in paths:
-                    if ORIGINAL_FILL_KEY not in path.attributes:
-                        path.attributes[ORIGINAL_FILL_KEY] = bool(path.attributes.get('fill', True))
-                    path.attributes[PATH_KEY] = True
-                    path.attributes[CAP_START_KEY] = path.attributes.get(CAP_START_KEY, 'flat')
-                    path.attributes[CAP_END_KEY] = path.attributes.get(CAP_END_KEY, 'flat')
-                    path.attributes['fill'] = False
-                    for node in path.nodes:
-                        if node.type != OFFCURVE and WIDTH_KEY not in node.userData:
-                            node.userData[WIDTH_KEY] = DEFAULT_WIDTH
+            set_glyph_enabled(layer.parent, state)
         finally:
             layer.endChanges()
+        if state:
+            _ensure_export_filter(layer.parent.parent)
         self._instance_counts.clear()
-        self._sync_export()
         self._refresh_ui()
-        self._redraw()
+        Glyphs.redraw()
 
     @objc.python_method
     def _set_cap(self, side, style):

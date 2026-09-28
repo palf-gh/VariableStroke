@@ -58,6 +58,22 @@ class BridgeTests(unittest.TestCase):
         self.assertEqual(len(bridge.segments_for_path(path)), 4)
         self.assertEqual(len(bridge.polygons_for_path(path)), 2)
 
+    def test_glyph_switch_works_without_selected_path(self):
+        first = Path([Node(0, 0), Node(100, 0)])
+        second = Path([Node(0, 0), Node(0, 100)])
+        first.attributes.clear()
+        second.attributes.clear()
+        glyph = types.SimpleNamespace(userData={}, layers=[Layer([first]), Layer([second])])
+        bridge.set_glyph_enabled(glyph, True)
+        self.assertTrue(bridge.glyph_enabled(glyph))
+        self.assertTrue(bridge.enabled(first))
+        self.assertTrue(bridge.enabled(second))
+        bridge.set_glyph_enabled(glyph, False)
+        self.assertFalse(bridge.glyph_enabled(glyph))
+        empty = types.SimpleNamespace(userData={}, layers=[Layer([])])
+        bridge.set_glyph_enabled(empty, True)
+        self.assertTrue(bridge.glyph_enabled(empty))
+
     def test_conversion_creates_bezier_without_cached_paths(self):
         source = Path([Node(0, 0), Node(0, 50, 'offcurve'),
                        Node(100, 50, 'offcurve'), Node(100, 0, 'curve', 40)])
