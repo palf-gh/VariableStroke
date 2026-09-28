@@ -4,6 +4,7 @@ from GlyphsApp import Glyphs
 from GlyphsApp.plugins import FilterWithoutDialog
 from glyphs_bridge import convert_layer, convert_glyph
 from outline_union import union_layer_outlines
+from export_settings import remove_overlap_enabled
 
 
 class VariableStrokeExport(FilterWithoutDialog):
@@ -23,7 +24,7 @@ class VariableStrokeExport(FilterWithoutDialog):
             convert_glyph(layer.parent, keep_marks=False)
         else:
             convert_layer(layer, keep_marks=not inEditView)
-            if not inEditView:
+            if not inEditView and remove_overlap_enabled():
                 union_layer_outlines(layer)
 
     @objc.signature(b'v@:@@')
@@ -35,7 +36,7 @@ class VariableStrokeExport(FilterWithoutDialog):
         # Remove Overlap step. For multiple masters, keep contour topology
         # compatible until the interpolated layer reaches filter().
         layers = list(glyph.layers)
-        if len(layers) == 1:
+        if len(layers) == 1 and remove_overlap_enabled():
             union_layer_outlines(layers[0])
 
     @objc.python_method

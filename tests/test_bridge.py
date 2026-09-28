@@ -48,6 +48,21 @@ bridge = importlib.import_module('glyphs_bridge')
 
 
 class BridgeTests(unittest.TestCase):
+    def test_export_union_follows_glyphs_overlap_checkbox(self):
+        from export_settings import remove_overlap_enabled
+        class Defaults:
+            def __init__(self, value):
+                self.value = value
+
+            def objectForKey_(self, key):
+                self.key = key
+                return self.value
+
+        for value, expected in ((None, True), (True, True), (False, False)):
+            defaults = Defaults(value)
+            self.assertEqual(remove_overlap_enabled(defaults), expected)
+            self.assertEqual(defaults.key, 'OTFExportRemoveOverlap')
+
     def test_export_unions_overlapping_stroke_outlines(self):
         from outline_union import _pathops, union_layer_outlines
         try:

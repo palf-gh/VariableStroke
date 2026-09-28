@@ -103,7 +103,7 @@
 - **角丸**：どこかのマスターで ON のノードは、他のマスターでも半径0の角丸として同じ構成になります。補間では OFF のマスターを半径0として混ぜるので、尖った角から丸い角へ滑らかに変わります。
 - **補間で作られるレイヤー**（プレビュー欄のインスタンスや、他のプラグインによるマスター間の補間表示）では、ON / OFF と線端の設定を引き継ぎます。幅・高さ・ノード％・位置・回転・角丸・イタリック角度は、マスター間で補間してから展開します。
 - **書き出し**：ストロークを使うと、インスタンスに `PreInterpolationFilter` と `Filter` のカスタムパラメータ（`VariableStrokeExport`）が自動で追加されます。補間の前に各マスターをアウトライン化するので、可変フォントでもそのまま書き出せます。`Filter` は補間後の合体と、未変換パスの予備の変換を行います。
-- **重なり合体**：出力用の輪郭は、Glyphs 本体の「重なったパスを削除」に渡す前に Skia PathOps でも合体します。単一マスターではアウトライン化直後、複数マスターでは補間後の `Filter` で合体し、補間前のノード構成を保ちます。出力プラグインには macOS 用 Skia PathOps を同梱しています（BSD-3-Clause、ライセンスは `VariableStrokeExport.glyphsFilter/Contents/Resources/vendor/pathops/LICENSE`）。
+- **重なり合体**：Glyphs の OTF 出力画面にある「重なったパスを合体」がオンの場合だけ、出力用の輪郭を Glyphs 本体の合体処理に渡す前に Skia PathOps でも合体します。オフの場合は生成した輪郭の重なりを保持します。単一マスターではアウトライン化直後、複数マスターでは補間後の `Filter` で合体し、補間前のノード構成を保ちます。出力プラグインには macOS 用 Skia PathOps を同梱しています（BSD-3-Clause、ライセンスは `VariableStrokeExport.glyphsFilter/Contents/Resources/vendor/pathops/LICENSE`）。
 
 ## アウトライン化
 
