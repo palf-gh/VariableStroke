@@ -415,6 +415,28 @@ class _Side(object):
                 break  # already far below what anyone can see
             us = [min(max(i/64.0, 1e-3), 1-1e-3) for i in nearest]
         controls = best[1]
+        # A normal offset ceases to be a usable outline when its local radius
+        # drops below the stroke's half-width: it briefly runs backwards. Fit
+        # the visible inner edge from the source's end directions instead of
+        # chasing that folded sample. This keeps the turn broad and editable
+        # with the source handles, while preserving the exact edge endpoints.
+        alignment = min(
+            sum(a*b for a, b in zip(self.edge_tangent(t), self.tangent(t)))
+            for t in [ta+(tb-ta)*i/8.0 for i in range(1, 8)] +
+                     [ta+(tb-ta)*15/16.0])
+        fold_weight = min(1.0, max(0.0, (0.4-alignment)/0.6))
+        fold_weight = fold_weight*fold_weight*(3-2*fold_weight)
+        if fold_weight > 0 and length(sub(p0, self.at(ta))) < 0.05 and \
+                length(sub(p3, self.at(tb))) < 0.05:
+            source_start = length(sub(self.pts[1], self.pts[0]))
+            source_end = length(sub(self.pts[-1], self.pts[-2]))
+            optical_start = add(p0, mul(center0, min(0.75*source_start, 0.6*chord)))
+            optical_end = sub(p3, mul(center1, min(0.8*source_end, 0.6*chord)))
+            controls = (p0,
+                        add(mul(controls[1], 1-fold_weight),
+                            mul(optical_start, fold_weight)),
+                        add(mul(controls[2], 1-fold_weight),
+                            mul(optical_end, fold_weight)), p3)
         # A tight inner offset can fold back near a smooth node. Least squares
         # then collapses its end handle to zero, turning the joined outline
         # into a flat spot followed by a kink. Preserve the source tangent at

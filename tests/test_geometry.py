@@ -203,6 +203,10 @@ class GeometryTests(unittest.TestCase):
         self.assertLess(abs(incoming[-1][1] - incoming[-2][1]), 2)
         self.assertLess(abs(outgoing[1][1] - outgoing[0][1]), 2)
         self.assertGreater(math.dist(outgoing[0], outgoing[1]), 30)
+        # The mathematical inner offset folds backward. Its fitted control
+        # polygon should follow the source turn instead of that fold.
+        self.assertLess(outgoing[1][0], 70)
+        self.assertLess(outgoing[2][1], 550)
 
     def test_svg_mountain_horizontal_cuts_follow_curves(self):
         from variable_stroke_core import _normalized_bend
