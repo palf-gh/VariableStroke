@@ -25,25 +25,20 @@ class SelectorTests(unittest.TestCase):
         plugin = next(node for node in module.body if isinstance(node, ast.ClassDef)
                       and node.name == 'VariableStrokeTool')
         methods = {method.name for method in plugin.body if isinstance(method, ast.FunctionDef)}
-        for name in ('activate', 'deactivate', 'toggleFromInspector_', 'widthFromInspector_',
+        for name in ('activate', 'view', 'toggleFromInspector_', 'widthFromInspector_',
                      'startCapFromInspector_', 'endCapFromInspector_',
                      'convertSelectedLayer_'):
             self.assertIn(name, methods)
 
-    def test_context_menu_is_compact(self):
-        module = ast.parse(PLUGIN.read_text())
-        plugin = next(node for node in module.body if isinstance(node, ast.ClassDef)
-                      and node.name == 'VariableStrokeTool')
-        settings = next(node for node in plugin.body if isinstance(node, ast.FunctionDef)
-                        and node.name == 'settings')
-        assignment = next(node for node in settings.body if isinstance(node, ast.Assign)
-                          and any(isinstance(target, ast.Attribute) and
-                                  target.attr == 'generalContextMenus' for target in node.targets))
-        self.assertEqual(len(assignment.value.elts), 2)
+    def test_context_menu_is_global_submenu(self):
+        source = PLUGIN.read_text()
+        self.assertIn('contextMenuCallback_forSelectedLayers_event_', source)
+        self.assertIn('parent.setSubmenu_(submenu)', source)
+        self.assertIn('GSCallbackHandler.addCallback_forOperation_', source)
 
     def test_panel_has_distinct_on_off_controls(self):
         source = PLUGIN.read_text()
-        self.assertIn('FloatingWindow(', source)
+        self.assertIn('InspectorGroup(', source)
         self.assertIn("{'title': 'ON'}, {'title': 'OFF'}", source)
         self.assertIn('group.startCap = PopUpButton(', source)
         self.assertIn('group.endCap = PopUpButton(', source)

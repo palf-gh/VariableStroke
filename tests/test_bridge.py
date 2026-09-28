@@ -58,29 +58,15 @@ class BridgeTests(unittest.TestCase):
         self.assertEqual(len(bridge.segments_for_path(path)), 4)
         self.assertEqual(len(bridge.polygons_for_path(path)), 2)
 
-    def test_native_render_cache_updates_and_turns_off(self):
-        source = Path([Node(0, 0), Node(100, 0)])
+    def test_conversion_creates_bezier_without_cached_paths(self):
+        source = Path([Node(0, 0), Node(0, 50, 'offcurve'),
+                       Node(100, 50, 'offcurve'), Node(100, 0, 'curve', 40)])
         layer = Layer([source])
-        self.assertTrue(bridge.sync_layer(layer))
-        self.assertEqual(len(layer.paths), 2)
-        rendered = next(path for path in layer.paths if bridge.generated(path))
-        self.assertTrue(rendered.locked)
-        self.assertFalse(bridge.sync_layer(layer))
-        source.nodes[0].userData[bridge.WIDTH_KEY] = 40
-        self.assertTrue(bridge.sync_layer(layer))
-        self.assertEqual(len(layer.paths), 2)
-        source.attributes[bridge.PATH_KEY] = False
-        self.assertTrue(bridge.sync_layer(layer))
-        self.assertEqual(layer.paths, [source])
-
-    def test_conversion_keeps_native_outline(self):
-        source = Path([Node(0, 0), Node(100, 0)])
-        layer = Layer([source])
-        bridge.sync_layer(layer)
+        self.assertEqual(len(layer.paths), 1)
         self.assertEqual(bridge.convert_layer(layer), 1)
         self.assertEqual(len(layer.paths), 1)
-        self.assertFalse(bridge.generated(layer.paths[0]))
-        self.assertFalse(layer.paths[0].locked)
+        self.assertIn('offcurve', [node.type for node in layer.paths[0].nodes])
+        self.assertFalse(bridge.enabled(layer.paths[0]))
 
 
 if __name__ == '__main__':

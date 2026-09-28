@@ -1,14 +1,14 @@
 # encoding: utf-8
 """Variable Stroke editing tool for Glyphs 3."""
 import objc
-from AppKit import NSBezierPath, NSColor
-from GlyphsApp import Glyphs, GSCustomParameter, OFFCURVE, DOCUMENTOPENED, UPDATEINTERFACE, Message
+from AppKit import NSBezierPath, NSColor, NSMenu, NSMenuItem, NSObject, NSEvenOddWindingRule
+from GlyphsApp import Glyphs, GSCallbackHandler, GSCustomParameter, OFFCURVE, DOCUMENTOPENED, UPDATEINTERFACE, DRAWBACKGROUND, DRAWINACTIVE, CONTEXTMENUCALLBACK, Message
 from GlyphsApp.plugins import SelectTool
-from vanilla import FloatingWindow, Group, SegmentedButton, TextBox, EditText, PopUpButton, Button
+from vanilla import Window, Group, SegmentedButton, TextBox, EditText, PopUpButton, Button
 from glyphs_bridge import (PATH_KEY, WIDTH_KEY, CAP_START_KEY, CAP_END_KEY,
                            EXPORT_FILTER, DEFAULT_WIDTH, enabled, width,
-                           segments_for_path, convert_layer, generated, sync_layer,
-                           layer_needs_sync)
+                           segments_for_path, curves_for_path, convert_layer, generated,
+                           glyph_enabled, GLYPH_KEY)
 from variable_stroke_core import normal, unit, sub, add, mul, length
 
 CAP_NAMES = [('flat', 'フラット'), ('round', '丸'), ('square', '四角'),
@@ -20,6 +20,84 @@ def _loc(english, japanese):
     return Glyphs.localize({'en': english, 'jp': japanese, 'ja': japanese})
 
 
+
+def _ensure_export_filter(font):
+    if font is None:
+        return
+    for instance in font.instances:
+        if any(parameter.name == 'Filter' and str(parameter.value).split(';')[0] == EXPORT_FILTER
+               for parameter in instance.customParameters):
+            continue
+        instance.customParameters.append(GSCustomParameter('Filter', EXPORT_FILTER + ';'))
+
+
+GSInspectorView = objc.lookUpClass('GSInspectorView')
+class InspectorGroup(Group):
+    nsViewClass = GSInspectorView
+
+
+class VariableStrokeContextMenu(NSObject):
+    def contextMenuCallback_forSelectedLayers_event_(self, menu, layers, event):
+        glyphs = []
+        for layer in layers or []:
+            glyph = getattr(layer, 'parent', None)
+            if glyph is not None and glyph not in glyphs:
+                glyphs.append(glyph)
+        if not glyphs:
+            font = Glyphs.font
+            glyphs = list(dict.fromkeys(layer.parent for layer in font.selectedLayers)) if font else []
+        submenu = NSMenu.alloc().initWithTitle_(_loc('Variable Stroke', '可変ストローク'))
+        for title, action in ((_loc('Turn ON', 'オン'), 'turnOn_'),
+                              (_loc('Turn OFF', 'オフ'), 'turnOff_'),
+                              (_loc('Convert to Outlines', 'アウトライン化'), 'convert_')):
+            item = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(title, action, '')
+            item.setTarget_(self)
+            item.setRepresentedObject_(glyphs)
+            item.setEnabled_(bool(glyphs))
+            submenu.addItem_(item)
+        parent = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(_loc('Variable Stroke', '可変ストローク'), None, '')
+        parent.setSubmenu_(submenu)
+        menu.addItem_(NSMenuItem.separatorItem())
+        menu.addItem_(parent)
+
+    def turnOn_(self, sender):
+        self._set_glyphs(sender.representedObject(), True)
+
+    def turnOff_(self, sender):
+        self._set_glyphs(sender.representedObject(), False)
+
+    def convert_(self, sender):
+        for glyph in sender.representedObject():
+            for layer in glyph.layers:
+                layer.beginChanges()
+                try:
+                    convert_layer(layer)
+                finally:
+                    layer.endChanges()
+        Glyphs.redraw()
+
+    @objc.python_method
+    def _set_glyphs(self, glyphs, state):
+        for glyph in glyphs:
+            glyph.userData[GLYPH_KEY] = state
+            if state:
+                for layer in glyph.layers:
+                    for path in layer.paths:
+                        if generated(path) or (not path.nodes):
+                            continue
+                        if not path.attributes.get(PATH_KEY):
+                            path.attributes[PATH_KEY] = True
+                            path.attributes['fill'] = False
+                            for node in path.nodes:
+                                if node.type != OFFCURVE and WIDTH_KEY not in node.userData:
+                                    node.userData[WIDTH_KEY] = DEFAULT_WIDTH
+        if state and glyphs:
+            _ensure_export_filter(glyphs[0].parent)
+        Glyphs.redraw()
+
+    def callOrder(self):
+        return 1000000
+
 class VariableStrokeTool(SelectTool):
     @objc.python_method
     def settings(self):
@@ -27,25 +105,18 @@ class VariableStrokeTool(SelectTool):
         self.toolbarPosition = 105
         self._icon = 'toolbarIconTemplate.pdf'
         self._drag = None
-        self._rendering = False
-        self._panel_opened = False
         self._instance_counts = {}
         self._updating_ui = False
         self._last_ui_state = None
-        self.generalContextMenus = [
-            {'name': _loc('Variable Stroke: Toggle', '可変ストローク：オン／オフ'), 'action': self.toggleStroke_},
-            {'name': _loc('Variable Stroke: Convert to Outlines', '可変ストローク：アウトライン化'),
-             'action': self.convertSelectedLayer_},
-        ]
+        self.generalContextMenus = []
+        self._menu_callback = VariableStrokeContextMenu.new()
         self._build_inspector()
 
     @objc.python_method
     def _build_inspector(self):
         width, height = 290, 182
-        self.infoBoxWindow = FloatingWindow((width, height), self.name,
-                                             closable=False, initiallyVisible=False,
-                                             autosaveName='VariableStrokePanel')
-        group = self.infoBoxWindow.group = Group((0, 0, width, height))
+        self.infoBoxWindow = Window((width, height))
+        group = self.infoBoxWindow.group = InspectorGroup((0, 0, width, height))
         group.targetLabel = TextBox((12, 7, 270, 18), _loc('Select a path', 'パスを選択してください'))
         group.strokeLabel = TextBox((12, 31, 70, 20), _loc('Stroke', 'ストローク'))
         group.enableStroke = SegmentedButton((88, 28, 185, 25),
@@ -69,67 +140,79 @@ class VariableStrokeTool(SelectTool):
         group.convert = Button((88, 147, 185, 24), _loc('Convert to Outlines', 'アウトライン化'),
                                callback=self.convertSelectedLayer_)
         group.enableStroke.set(1)
+        self.infoBoxView = group.getNSView()
+        self.inspectorDialogView = True
+
+    def view(self):
+        return self.infoBoxView
 
     @objc.python_method
     def start(self):
         Glyphs.addCallback(self._sync_export, DOCUMENTOPENED)
-        Glyphs.addCallback(self._sync_export, UPDATEINTERFACE)
-        Glyphs.addCallback(self._sync_render, DOCUMENTOPENED)
-        Glyphs.addCallback(self._sync_render, UPDATEINTERFACE)
+        Glyphs.addCallback(self._refresh_ui, UPDATEINTERFACE)
+        Glyphs.addCallback(self._draw_outline, DRAWBACKGROUND)
+        Glyphs.addCallback(self._draw_outline, DRAWINACTIVE)
+        GSCallbackHandler.addCallback_forOperation_(self._menu_callback, CONTEXTMENUCALLBACK)
+        self._cleanup_legacy()
         self._sync_export()
-        self._sync_render()
+
+    @objc.python_method
+    def _cleanup_legacy(self):
+        for font in Glyphs.fonts:
+            for glyph in font.glyphs:
+                for layer in glyph.layers:
+                    stale = [path for path in layer.paths if generated(path)]
+                    if stale:
+                        layer.beginChanges()
+                        try:
+                            for path in stale:
+                                layer.shapes.remove(path)
+                        finally:
+                            layer.endChanges()
 
     @objc.python_method
     def activate(self):
-        if not self._panel_opened:
-            self.infoBoxWindow.open()
-            self._panel_opened = True
-        self.infoBoxWindow.show()
         self._sync_export()
-        self._sync_render()
         self._refresh_ui()
 
     @objc.python_method
-    def deactivate(self):
-        self.infoBoxWindow.hide()
-
-    @objc.python_method
-    def _sync_render(self, notification=None):
-        if self._rendering:
+    def _draw_outline(self, layer, options=None):
+        if layer is None or not glyph_enabled(getattr(layer, 'parent', None)):
             return
-        font = Glyphs.font
-        layer = font.selectedLayers[0] if font is not None and font.selectedLayers else self._layer()
-        if layer is None or not layer_needs_sync(layer):
-            return
-        self._rendering = True
-        try:
-            layer.beginChanges()
+        NSColor.blackColor().set()
+        for source in layer.paths:
+            if not enabled(source):
+                continue
             try:
-                sync_layer(layer)
-            finally:
-                layer.endChanges()
-            self._redraw()
-        finally:
-            self._rendering = False
+                contours = curves_for_path(source)
+            except ValueError:
+                continue
+            path = NSBezierPath.bezierPath()
+            path.setWindingRule_(NSEvenOddWindingRule)
+            for contour in contours:
+                if not contour:
+                    continue
+                path.moveToPoint_(contour[0][1][0])
+                for kind, points in contour:
+                    if kind == 'cubic':
+                        path.curveToPoint_controlPoint1_controlPoint2_(points[3], points[1], points[2])
+                    else:
+                        path.lineToPoint_(points[1])
+                path.closePath()
+            path.fill()
 
     @objc.python_method
     def _sync_export(self, notification=None):
         # The Filter custom parameter is evaluated on the export copy of each instance.
         for font in list(Glyphs.fonts):
-            marker = id(font)
-            count = len(font.instances)
-            if self._instance_counts.get(marker) == count:
-                continue
-            self._instance_counts[marker] = count
-            has_strokes = any(enabled(path) for glyph in font.glyphs
+            has_strokes = any(glyph_enabled(glyph) and enabled(path) for glyph in font.glyphs
                               for layer in glyph.layers for path in layer.paths)
-            if not has_strokes:
+            state = (len(font.instances), has_strokes)
+            if self._instance_counts.get(id(font)) == state:
                 continue
-            for instance in font.instances:
-                if any(p.name == 'Filter' and str(p.value).split(';')[0] == EXPORT_FILTER
-                       for p in instance.customParameters):
-                    continue
-                instance.customParameters.append(GSCustomParameter('Filter', EXPORT_FILTER + ';'))
+            self._instance_counts[id(font)] = state
+            if has_strokes:
+                _ensure_export_filter(font)
         self._refresh_ui()
 
     @objc.python_method
@@ -178,12 +261,12 @@ class VariableStrokeTool(SelectTool):
                                    if node.type != OFFCURVE]
 
     @objc.python_method
-    def _refresh_ui(self):
+    def _refresh_ui(self, notification=None):
         if self._updating_ui or not hasattr(self, 'infoBoxWindow'):
             return
         layer = self._layer()
         paths = self._target_paths(layer) if layer is not None else []
-        active = bool(paths) and all(enabled(path) for path in paths)
+        active = bool(paths) and glyph_enabled(layer.parent) and all(enabled(path) for path in paths)
         editable = bool(paths) and active
         nodes = self._target_nodes(layer, paths) if editable else []
         widths = [width(node) for node in nodes]
@@ -197,7 +280,7 @@ class VariableStrokeTool(SelectTool):
             tuple((layer_paths.index(path), enabled(path), bool(path.closed),
                    path.attributes.get(CAP_START_KEY, 'flat'),
                    path.attributes.get(CAP_END_KEY, 'flat')) for path in paths),
-            tuple(widths), can_convert,
+            tuple(widths), can_convert, glyph_enabled(layer.parent) if layer else False,
         )
         if ui_state == self._last_ui_state:
             return
@@ -239,7 +322,7 @@ class VariableStrokeTool(SelectTool):
         if layer is None:
             return
         paths = self._target_paths(layer)
-        self._set_enabled(paths, not all(enabled(path) for path in paths))
+        self._set_enabled(paths, not glyph_enabled(layer.parent))
 
     def toggleFromInspector_(self, sender):
         if self._updating_ui:
@@ -267,8 +350,9 @@ class VariableStrokeTool(SelectTool):
             return
         layer.beginChanges()
         try:
-            for path in paths:
-                if state:
+            layer.parent.userData[GLYPH_KEY] = state
+            if state:
+                for path in paths:
                     if ORIGINAL_FILL_KEY not in path.attributes:
                         path.attributes[ORIGINAL_FILL_KEY] = bool(path.attributes.get('fill', True))
                     path.attributes[PATH_KEY] = True
@@ -278,10 +362,6 @@ class VariableStrokeTool(SelectTool):
                     for node in path.nodes:
                         if node.type != OFFCURVE and WIDTH_KEY not in node.userData:
                             node.userData[WIDTH_KEY] = DEFAULT_WIDTH
-                else:
-                    path.attributes[PATH_KEY] = False
-                    path.attributes['fill'] = bool(path.attributes.get(ORIGINAL_FILL_KEY, True))
-            sync_layer(layer)
         finally:
             layer.endChanges()
         self._instance_counts.clear()
@@ -298,9 +378,8 @@ class VariableStrokeTool(SelectTool):
         layer.beginChanges()
         try:
             for path in self._target_paths(layer):
-                if enabled(path) and not path.closed:
+                if enabled(path) and glyph_enabled(layer.parent) and not path.closed:
                     path.attributes[key] = style
-            sync_layer(layer)
         finally:
             layer.endChanges()
         self._refresh_ui()
@@ -326,7 +405,7 @@ class VariableStrokeTool(SelectTool):
         layer = self._layer()
         if layer is None:
             return
-        paths = [path for path in self._target_paths(layer) if enabled(path)]
+        paths = [path for path in self._target_paths(layer) if enabled(path) and glyph_enabled(layer.parent)]
         nodes = self._target_nodes(layer, paths)
         if not nodes:
             return
@@ -334,7 +413,6 @@ class VariableStrokeTool(SelectTool):
         try:
             for node in nodes:
                 node.userData[WIDTH_KEY] = value
-            sync_layer(layer)
         finally:
             layer.endChanges()
         self._redraw()
@@ -354,7 +432,7 @@ class VariableStrokeTool(SelectTool):
     @objc.python_method
     def _handles(self, layer):
         for path in layer.paths:
-            if not enabled(path):
+            if not enabled(path) or not glyph_enabled(layer.parent):
                 continue
             nodes = [node for node in path.nodes if node.type != OFFCURVE]
             for i, node in enumerate(nodes):
@@ -396,7 +474,6 @@ class VariableStrokeTool(SelectTool):
     def mouseDragged_(self, event):
         if self._drag is None:
             objc.super(VariableStrokeTool, self).mouseDragged_(event)
-            self._sync_render()
             self._redraw()
             return
         layer, node, _, n = self._drag
@@ -404,7 +481,6 @@ class VariableStrokeTool(SelectTool):
         center = (node.position.x, node.position.y)
         delta = sub((loc.x, loc.y), center)
         node.userData[WIDTH_KEY] = max(1.0, 2.0 * abs(delta[0]*n[0] + delta[1]*n[1]))
-        sync_layer(layer)
         self._redraw()
 
     def mouseUp_(self, event):
@@ -416,7 +492,6 @@ class VariableStrokeTool(SelectTool):
             self._redraw()
             return
         objc.super(VariableStrokeTool, self).mouseUp_(event)
-        self._sync_render()
         self._refresh_ui()
         self._redraw()
 

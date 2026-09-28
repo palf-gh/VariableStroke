@@ -2,7 +2,7 @@ import sys
 import unittest
 from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from variable_stroke_core import outline
+from variable_stroke_core import outline, outline_curves
 
 
 class GeometryTests(unittest.TestCase):
@@ -42,6 +42,15 @@ class GeometryTests(unittest.TestCase):
             ('line', ((0, 100), (0, 0)), 20, 20),
         ]
         self.assertEqual(len(outline(square, closed=True)), 2)
+
+    def test_bezier_fit_and_caps(self):
+        seg = [('cubic', ((0, 0), (0, 80), (100, 80), (100, 0)), 20, 40)]
+        contour = outline_curves(seg, cap_start='round', cap_end='horizontal')[0]
+        self.assertTrue(any(kind == 'cubic' for kind, _ in contour))
+        self.assertTrue(any(kind == 'line' for kind, _ in contour))
+        horizontal = [points for kind, points in contour if kind == 'line'
+                      and abs(points[0][1]) < 0.001 and abs(points[-1][1]) < 0.001]
+        self.assertTrue(horizontal)
 
     def test_bad_width(self):
         with self.assertRaises(ValueError):
