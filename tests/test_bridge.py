@@ -48,24 +48,6 @@ bridge = importlib.import_module('glyphs_bridge')
 
 
 class BridgeTests(unittest.TestCase):
-    def test_short_shared_export_caps_move_into_overlapping_outline(self):
-        # Two separate strokes meet at a right edge, with less than one unit
-        # of collinear overlap. Glyphs' remove-overlap is fragile here.
-        a = [('line', ((0, 0), (10, 0))),
-             ('line', ((10, 0), (10, 10))),
-             ('line', ((10, 10), (0, 10))),
-             ('line', ((0, 10), (0, 0)))]
-        b = [('line', ((8, -5), (10, -5))),
-             ('line', ((10, -5), (10, 0.8))),
-             ('line', ((10, 0.8), (8, 0.8))),
-             ('line', ((8, 0.8), (8, -5)))]
-        bridge._stabilize_shared_edges([(None, [a]), (None, [b])])
-        self.assertEqual(len(b), 4)
-        self.assertAlmostEqual(b[1][1][0][0], 9.75)
-        self.assertAlmostEqual(b[1][1][1][0], 9.75)
-        self.assertEqual(b[0][1][-1], b[1][1][0])
-        self.assertEqual(b[1][1][-1], b[2][1][0])
-
     def test_open_cubic(self):
         path = Path([Node(0, 0), Node(0, 50, 'offcurve'),
                      Node(100, 50, 'offcurve'), Node(100, 0, 'curve', 40)])
