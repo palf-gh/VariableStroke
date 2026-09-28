@@ -1,4 +1,5 @@
 """Glyphs 3 adapters shared by the editing tool and the export filter."""
+import hashlib
 from GlyphsApp import GSPath, GSNode, LINE, CURVE, OFFCURVE
 from variable_stroke_core import outline
 
@@ -8,10 +9,17 @@ CAP_START_KEY = 'com.codex.VariableStroke.capStart'
 CAP_END_KEY = 'com.codex.VariableStroke.capEnd'
 EXPORT_FILTER = 'VariableStrokeExport'
 DEFAULT_WIDTH = 40.0
+GENERATED_KEY = 'com.codex.VariableStroke.generated'
+GENERATED_SIGNATURE_KEY = 'com.codex.VariableStroke.signature'
+GENERATED_COUNT_KEY = 'com.codex.VariableStroke.generatedCount'
 
 
 def enabled(path):
     return bool(path.attributes.get(PATH_KEY))
+
+
+def generated(path):
+    return bool(path.attributes.get(GENERATED_KEY))
 
 
 def width(node):
@@ -77,16 +85,65 @@ def generated_paths(path):
     return result
 
 
+def _signature(layer):
+    data = []
+    for path in layer.paths:
+        if not enabled(path):
+            continue
+        data.append((bool(path.closed), path.attributes.get(CAP_START_KEY, 'flat'),
+                     path.attributes.get(CAP_END_KEY, 'flat'),
+                     tuple((node.type, xy(node), width(node) if node.type != OFFCURVE else None)
+                           for node in path.nodes)))
+    return hashlib.sha1(repr(data).encode('utf-8')).hexdigest()
+
+
+def layer_needs_sync(layer):
+    sources = [path for path in layer.paths if enabled(path)]
+    cached = [path for path in layer.paths if generated(path)]
+    if not sources:
+        return bool(cached)
+    signature = _signature(layer)
+    if not cached:
+        return any(segments_for_path(path) for path in sources)
+    return (any(path.attributes.get(GENERATED_SIGNATURE_KEY) != signature for path in cached)
+            or any(int(path.attributes.get(GENERATED_COUNT_KEY, -1)) != len(cached)
+                   for path in cached))
+
+
+def sync_layer(layer):
+    """Materialize outlines as locked, filled Glyphs paths for native rendering."""
+    if not layer_needs_sync(layer):
+        return False
+    sources = [path for path in layer.paths if enabled(path)]
+    cached = [path for path in layer.paths if generated(path)]
+    replacements = []
+    for path in sources:
+        replacements.extend(generated_paths(path))
+    signature = _signature(layer)
+    for path in replacements:
+        path.attributes[GENERATED_KEY] = True
+        path.attributes[GENERATED_SIGNATURE_KEY] = signature
+        path.attributes[GENERATED_COUNT_KEY] = len(replacements)
+        path.attributes['fill'] = True
+        path.locked = True
+    for path in cached:
+        layer.shapes.remove(path)
+    for path in replacements:
+        layer.shapes.append(path)
+    return True
+
+
 def convert_layer(layer):
     """Replace only marked skeletons. Other outlines and components survive."""
     originals = [shape for shape in list(layer.shapes) if isinstance(shape, GSPath) and enabled(shape)]
     if not originals:
         return 0
-    replacement = []
-    for path in originals:
-        replacement.extend(generated_paths(path))
+    sync_layer(layer)
+    cached = [shape for shape in list(layer.shapes) if isinstance(shape, GSPath) and generated(shape)]
     for path in originals:
         layer.shapes.remove(path)
-    for path in replacement:
-        layer.shapes.append(path)
+    for path in cached:
+        path.locked = False
+        for key in (GENERATED_KEY, GENERATED_SIGNATURE_KEY, GENERATED_COUNT_KEY):
+            path.attributes[key] = None
     return len(originals)

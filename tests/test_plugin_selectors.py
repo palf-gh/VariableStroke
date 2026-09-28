@@ -25,7 +25,7 @@ class SelectorTests(unittest.TestCase):
         plugin = next(node for node in module.body if isinstance(node, ast.ClassDef)
                       and node.name == 'VariableStrokeTool')
         methods = {method.name for method in plugin.body if isinstance(method, ast.FunctionDef)}
-        for name in ('view', 'toggleFromInspector_', 'widthFromInspector_',
+        for name in ('activate', 'deactivate', 'toggleFromInspector_', 'widthFromInspector_',
                      'startCapFromInspector_', 'endCapFromInspector_',
                      'convertSelectedLayer_'):
             self.assertIn(name, methods)
@@ -40,6 +40,13 @@ class SelectorTests(unittest.TestCase):
                           and any(isinstance(target, ast.Attribute) and
                                   target.attr == 'generalContextMenus' for target in node.targets))
         self.assertEqual(len(assignment.value.elts), 2)
+
+    def test_panel_has_distinct_on_off_controls(self):
+        source = PLUGIN.read_text()
+        self.assertIn('FloatingWindow(', source)
+        self.assertIn("{'title': 'ON'}, {'title': 'OFF'}", source)
+        self.assertIn('group.startCap = PopUpButton(', source)
+        self.assertIn('group.endCap = PopUpButton(', source)
 
 
 if __name__ == '__main__':

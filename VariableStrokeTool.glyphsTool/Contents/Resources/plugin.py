@@ -1,13 +1,14 @@
 # encoding: utf-8
 """Variable Stroke editing tool for Glyphs 3."""
 import objc
-from AppKit import NSBezierPath, NSColor, NSPoint, NSEvenOddWindingRule
+from AppKit import NSBezierPath, NSColor
 from GlyphsApp import Glyphs, GSCustomParameter, OFFCURVE, DOCUMENTOPENED, UPDATEINTERFACE, Message
 from GlyphsApp.plugins import SelectTool
-from vanilla import Window, Group, CheckBox, TextBox, EditText, PopUpButton, Button
+from vanilla import FloatingWindow, Group, SegmentedButton, TextBox, EditText, PopUpButton, Button
 from glyphs_bridge import (PATH_KEY, WIDTH_KEY, CAP_START_KEY, CAP_END_KEY,
-                           EXPORT_FILTER, DEFAULT_WIDTH, enabled, width, polygons_for_path,
-                           segments_for_path, convert_layer)
+                           EXPORT_FILTER, DEFAULT_WIDTH, enabled, width,
+                           segments_for_path, convert_layer, generated, sync_layer,
+                           layer_needs_sync)
 from variable_stroke_core import normal, unit, sub, add, mul, length
 
 CAP_NAMES = [('flat', 'フラット'), ('round', '丸'), ('square', '四角'),
@@ -19,13 +20,6 @@ def _loc(english, japanese):
     return Glyphs.localize({'en': english, 'jp': japanese, 'ja': japanese})
 
 
-GSInspectorView = objc.lookUpClass('GSInspectorView')
-
-
-class InspectorGroup(Group):
-    nsViewClass = GSInspectorView
-
-
 class VariableStrokeTool(SelectTool):
     @objc.python_method
     def settings(self):
@@ -33,6 +27,8 @@ class VariableStrokeTool(SelectTool):
         self.toolbarPosition = 105
         self._icon = 'toolbarIconTemplate.pdf'
         self._drag = None
+        self._rendering = False
+        self._panel_opened = False
         self._instance_counts = {}
         self._updating_ui = False
         self._last_ui_state = None
@@ -46,11 +42,15 @@ class VariableStrokeTool(SelectTool):
     @objc.python_method
     def _build_inspector(self):
         width, height = 290, 182
-        self.infoBoxWindow = Window((width, height))
-        group = self.infoBoxWindow.group = InspectorGroup((0, 0, width, height))
+        self.infoBoxWindow = FloatingWindow((width, height), self.name,
+                                             closable=False, initiallyVisible=False,
+                                             autosaveName='VariableStrokePanel')
+        group = self.infoBoxWindow.group = Group((0, 0, width, height))
         group.targetLabel = TextBox((12, 7, 270, 18), _loc('Select a path', 'パスを選択してください'))
-        group.enableStroke = CheckBox((10, 28, 270, 22), _loc('Stroke ON', 'ストロークを有効にする'),
-                                callback=self.toggleFromInspector_)
+        group.strokeLabel = TextBox((12, 31, 70, 20), _loc('Stroke', 'ストローク'))
+        group.enableStroke = SegmentedButton((88, 28, 185, 25),
+                                              [{'title': 'ON'}, {'title': 'OFF'}],
+                                              callback=self.toggleFromInspector_)
         group.widthLabel = TextBox((12, 59, 70, 20), _loc('Width', '線幅'))
         group.widthField = EditText((88, 55, 185, 24), callback=self.widthFromInspector_,
                                     continuous=False)
@@ -68,23 +68,49 @@ class VariableStrokeTool(SelectTool):
                                 callback=self.endCapFromInspector_)
         group.convert = Button((88, 147, 185, 24), _loc('Convert to Outlines', 'アウトライン化'),
                                callback=self.convertSelectedLayer_)
-        self.infoBoxView = group.getNSView()
-        self.inspectorDialogView = True
-
-    def view(self):
-        self._refresh_ui()
-        return self.infoBoxView
+        group.enableStroke.set(1)
 
     @objc.python_method
     def start(self):
         Glyphs.addCallback(self._sync_export, DOCUMENTOPENED)
         Glyphs.addCallback(self._sync_export, UPDATEINTERFACE)
+        Glyphs.addCallback(self._sync_render, DOCUMENTOPENED)
+        Glyphs.addCallback(self._sync_render, UPDATEINTERFACE)
         self._sync_export()
+        self._sync_render()
 
     @objc.python_method
     def activate(self):
+        if not self._panel_opened:
+            self.infoBoxWindow.open()
+            self._panel_opened = True
+        self.infoBoxWindow.show()
         self._sync_export()
+        self._sync_render()
         self._refresh_ui()
+
+    @objc.python_method
+    def deactivate(self):
+        self.infoBoxWindow.hide()
+
+    @objc.python_method
+    def _sync_render(self, notification=None):
+        if self._rendering:
+            return
+        font = Glyphs.font
+        layer = font.selectedLayers[0] if font is not None and font.selectedLayers else self._layer()
+        if layer is None or not layer_needs_sync(layer):
+            return
+        self._rendering = True
+        try:
+            layer.beginChanges()
+            try:
+                sync_layer(layer)
+            finally:
+                layer.endChanges()
+            self._redraw()
+        finally:
+            self._rendering = False
 
     @objc.python_method
     def _sync_export(self, notification=None):
@@ -130,14 +156,18 @@ class VariableStrokeTool(SelectTool):
     @objc.python_method
     def _selected_paths(self, layer):
         selected = list(layer.selection)
-        return [path for path in layer.paths if any(node in selected for node in path.nodes)]
+        return [path for path in layer.paths if not generated(path) and
+                any(node in selected for node in path.nodes)]
 
     @objc.python_method
     def _target_paths(self, layer):
         paths = self._selected_paths(layer)
         if paths:
             return paths
-        return list(layer.paths) if len(layer.paths) == 1 else []
+        editable_paths = [path for path in layer.paths if not generated(path)]
+        if len(editable_paths) == 1:
+            return editable_paths
+        return [path for path in editable_paths if enabled(path)]
 
     @objc.python_method
     def _target_nodes(self, layer, paths):
@@ -179,14 +209,17 @@ class VariableStrokeTool(SelectTool):
                 group.targetLabel.set(_loc('Select a path', 'パスを選択してください'))
             elif len(paths) == 1 and layer is not None and len(layer_paths) == 1:
                 group.targetLabel.set(_loc('One path in this layer', 'このレイヤーのパスを編集中'))
-            else:
+            elif layer is not None and self._selected_paths(layer):
                 group.targetLabel.set(_loc('%d selected paths' % len(paths),
                                            '選択中のパス：%d本' % len(paths)))
+            else:
+                group.targetLabel.set(_loc('%d active strokes' % len(paths),
+                                           '編集中のストローク：%d本' % len(paths)))
             group.enableStroke.enable(bool(paths))
-            group.enableStroke.set(active)
+            group.enableStroke.set(0 if active else 1)
             group.widthField.enable(editable)
-            group.startCap.enable(editable and all(not path.closed for path in paths))
-            group.endCap.enable(editable and all(not path.closed for path in paths))
+            group.startCap.enable(editable and any(not path.closed for path in paths))
+            group.endCap.enable(editable and any(not path.closed for path in paths))
             group.convert.enable(can_convert)
             group.widthField.set(('%g' % widths[0]) if widths and
                                  all(abs(value-widths[0]) < 0.001 for value in widths) else '')
@@ -213,7 +246,7 @@ class VariableStrokeTool(SelectTool):
             return
         layer = self._layer()
         if layer is not None:
-            self._set_enabled(self._target_paths(layer), bool(sender.get()))
+            self._set_enabled(self._target_paths(layer), sender.get() == 0)
 
     @objc.python_method
     def _set_enabled(self, paths, state):
@@ -248,6 +281,7 @@ class VariableStrokeTool(SelectTool):
                 else:
                     path.attributes[PATH_KEY] = False
                     path.attributes['fill'] = bool(path.attributes.get(ORIGINAL_FILL_KEY, True))
+            sync_layer(layer)
         finally:
             layer.endChanges()
         self._instance_counts.clear()
@@ -266,6 +300,7 @@ class VariableStrokeTool(SelectTool):
             for path in self._target_paths(layer):
                 if enabled(path) and not path.closed:
                     path.attributes[key] = style
+            sync_layer(layer)
         finally:
             layer.endChanges()
         self._refresh_ui()
@@ -299,6 +334,7 @@ class VariableStrokeTool(SelectTool):
         try:
             for node in nodes:
                 node.userData[WIDTH_KEY] = value
+            sync_layer(layer)
         finally:
             layer.endChanges()
         self._redraw()
@@ -337,25 +373,6 @@ class VariableStrokeTool(SelectTool):
     def foreground(self, layer):
         if layer is None:
             return
-        for path in layer.paths:
-            if not enabled(path):
-                continue
-            try:
-                polygons = polygons_for_path(path)
-            except ValueError as error:
-                print('Variable Stroke:', error)
-                continue
-            NSColor.colorWithCalibratedRed_green_blue_alpha_(0.12, 0.46, 0.94, 0.28).set()
-            shape = NSBezierPath.bezierPath()
-            shape.setWindingRule_(NSEvenOddWindingRule)
-            for polygon in polygons:
-                if len(polygon) < 3:
-                    continue
-                shape.moveToPoint_(NSPoint(*polygon[0]))
-                for point in polygon[1:]:
-                    shape.lineToPoint_(NSPoint(*point))
-                shape.closePath()
-            shape.fill()
         radius = 4.0 / self._scale()
         NSColor.colorWithCalibratedRed_green_blue_alpha_(0.02, 0.36, 0.81, 1.0).set()
         for _, _, _, _, handle in self._handles(layer):
@@ -379,6 +396,7 @@ class VariableStrokeTool(SelectTool):
     def mouseDragged_(self, event):
         if self._drag is None:
             objc.super(VariableStrokeTool, self).mouseDragged_(event)
+            self._sync_render()
             self._redraw()
             return
         layer, node, _, n = self._drag
@@ -386,6 +404,7 @@ class VariableStrokeTool(SelectTool):
         center = (node.position.x, node.position.y)
         delta = sub((loc.x, loc.y), center)
         node.userData[WIDTH_KEY] = max(1.0, 2.0 * abs(delta[0]*n[0] + delta[1]*n[1]))
+        sync_layer(layer)
         self._redraw()
 
     def mouseUp_(self, event):
@@ -397,6 +416,7 @@ class VariableStrokeTool(SelectTool):
             self._redraw()
             return
         objc.super(VariableStrokeTool, self).mouseUp_(event)
+        self._sync_render()
         self._refresh_ui()
         self._redraw()
 
