@@ -20,6 +20,14 @@ class SelectorTests(unittest.TestCase):
             with self.subTest(method=method.name):
                 self.assertEqual(method.name.count('_'), len(method.args.args) - 1)
 
+    def test_context_callback_selector_signature(self):
+        module = ast.parse(PLUGIN.read_text())
+        context = next(node for node in module.body if isinstance(node, ast.ClassDef)
+                       and node.name == 'VariableStrokeContextMenu')
+        callback = next(node for node in context.body if isinstance(node, ast.FunctionDef)
+                        and node.name == 'contextMenuCallback_forSelectedLayers_event_')
+        self.assertEqual(len(callback.args.args) - 1, 3)
+
     def test_inspector_actions_exist(self):
         module = ast.parse(PLUGIN.read_text())
         plugin = next(node for node in module.body if isinstance(node, ast.ClassDef)
