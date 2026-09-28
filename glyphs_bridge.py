@@ -2,7 +2,7 @@
 import collections
 import threading
 from GlyphsApp import GSPath, GSNode, LINE, CURVE, OFFCURVE
-from variable_stroke_core import outline_curves, node_edges
+from variable_stroke_core import outline_curves, node_edges, add, sub, mul, length, normal, unit
 
 PATH_KEY = 'com.codex.VariableStroke.enabled'
 # Legacy absolute node width; converted to STROKE_WIDTH_KEY x SCALE_KEY on edit.
@@ -448,9 +448,9 @@ def curves_for_path(path, defaults=None, report=None):
     return contours
 
 
-def generated_paths(path, defaults=None):
+def generated_paths(path, defaults=None, contours=None):
     result = []
-    for contour in curves_for_path(path, defaults):
+    for contour in (curves_for_path(path, defaults) if contours is None else contours):
         if not contour:
             continue
         new_path = GSPath()
@@ -472,6 +472,74 @@ def generated_paths(path, defaults=None):
             new_path.nodes.pop()
         result.append(new_path)
     return result
+
+
+def _short_shared_edge(a, b):
+    """Length of a tiny collinear overlap between two straight outline edges."""
+    p, q = a
+    r, s = b
+    direction = sub(q, p)
+    span = length(direction)
+    if span < 1e-6 or length(sub(s, r)) < 1e-6:
+        return 0.0
+    direction = unit(direction)
+    perpendicular = normal(direction)
+    if max(abs(sum(x*y for x, y in zip(sub(point, p), perpendicular)))
+           for point in (r, s)) > 1e-4:
+        return 0.0
+    start, end = sorted(sum(x*y for x, y in zip(sub(point, p), direction))
+                        for point in (r, s))
+    return min(span, end) - max(0.0, start)
+
+
+def _move_contour_edge(contour, index, delta):
+    """Shift a line and its neighbours' endpoints without adding outline nodes."""
+    count = len(contour)
+    kind, (p, q) = contour[index]
+    contour[index] = (kind, (add(p, delta), add(q, delta)))
+    before = (index-1) % count
+    after = (index+1) % count
+    kind, points = contour[before]
+    points = list(points)
+    points[-1] = add(points[-1], delta)
+    if kind == 'cubic':
+        points[-2] = add(points[-2], delta)
+    contour[before] = (kind, tuple(points))
+    kind, points = contour[after]
+    points = list(points)
+    points[0] = add(points[0], delta)
+    if kind == 'cubic':
+        points[1] = add(points[1], delta)
+    contour[after] = (kind, tuple(points))
+
+
+def _stabilize_shared_edges(plan):
+    """Avoid sub-unit cap overlaps that can make Glyphs' union fail on export.
+
+    Nudge the later edge a quarter unit into the earlier contour. Broad shared
+    edges stay intact; only accidental overlaps shorter than two units move.
+    """
+    contours = []
+    for _, groups in plan:
+        contours.extend(groups)
+    for i, a in enumerate(contours):
+        points = [piece[1][0] for piece in a]
+        area = sum(p[0]*q[1]-q[0]*p[1]
+                   for p, q in zip(points, points[1:]+points[:1]))
+        if abs(area) < 1e-6:
+            continue
+        for b in contours[i+1:]:
+            for kind_a, edge_a in a:
+                if kind_a != 'line':
+                    continue
+                direction = unit(sub(edge_a[1], edge_a[0]))
+                inward = mul(normal(direction), 0.25 if area > 0 else -0.25)
+                for j, (kind_b, edge_b) in enumerate(b):
+                    if kind_b != 'line':
+                        continue
+                    overlap = _short_shared_edge(edge_a, edge_b)
+                    if 1e-5 < overlap < 2.0:
+                        _move_contour_edge(b, j, inward)
 
 
 def glyph_enabled(glyph):
@@ -604,10 +672,14 @@ def _expansion_plan(layer, glyph_on=None, defaults=None):
         if not (_is_centerline(path) and (glyph_on or enabled(path))):
             continue
         try:
-            plan.append((path, generated_paths(path, defaults)))
+            # Copy cached contours before adjusting interactions between paths.
+            contours = [[(kind, tuple(points)) for kind, points in contour]
+                        for contour in curves_for_path(path, defaults)]
+            plan.append((path, contours))
         except ValueError:
             continue
-    return plan
+    _stabilize_shared_edges(plan)
+    return [(path, generated_paths(path, defaults, contours)) for path, contours in plan]
 
 
 def _apply_plan(layer, plan):
