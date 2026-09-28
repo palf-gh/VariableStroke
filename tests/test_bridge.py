@@ -48,6 +48,23 @@ bridge = importlib.import_module('glyphs_bridge')
 
 
 class BridgeTests(unittest.TestCase):
+    def test_export_unions_overlapping_stroke_outlines(self):
+        from outline_union import _pathops, union_layer_outlines
+        try:
+            _pathops()
+        except ImportError:
+            self.skipTest('Skia PathOps binary is unavailable on this platform')
+        def rectangle(x0, y0, x1, y1):
+            points = ((x0, y0), (x1, y0), (x1, y1), (x0, y1))
+            return [('line', (points[i], points[(i+1) % 4])) for i in range(4)]
+        source = Path()
+        outlines = bridge.generated_paths(source, contours=[rectangle(0, 0, 100, 100)])
+        outlines += bridge.generated_paths(source, contours=[rectangle(50, 50, 150, 150)])
+        layer = Layer(outlines)
+        self.assertEqual(union_layer_outlines(layer), 1)
+        self.assertEqual(len(layer.paths), 1)
+        self.assertTrue(layer.paths[0].attributes.get(bridge.OUTLINE_KEY))
+
     def test_open_cubic(self):
         path = Path([Node(0, 0), Node(0, 50, 'offcurve'),
                      Node(100, 50, 'offcurve'), Node(100, 0, 'curve', 40)])

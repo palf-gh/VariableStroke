@@ -448,9 +448,9 @@ def curves_for_path(path, defaults=None, report=None):
     return contours
 
 
-def generated_paths(path, defaults=None):
+def generated_paths(path, defaults=None, contours=None):
     result = []
-    for contour in curves_for_path(path, defaults):
+    for contour in (curves_for_path(path, defaults) if contours is None else contours):
         if not contour:
             continue
         new_path = GSPath()
