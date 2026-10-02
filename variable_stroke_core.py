@@ -249,6 +249,13 @@ def _ellipse_cap(center, nib, tangent, start, left, right):
 
 FIT_TOLERANCE = 1.0
 MITER_LIMIT = 4.0
+# Bend fillets (see _fillet_edge): handle length as a share of the distance to
+# the tangent crossing when the centerline gives none, how much an edge may turn
+# back (degrees) before it is replaced, and the sharpest centerline turn
+# (degrees) that gets one.
+FILLET_HANDLE = 0.6
+FILLET_REVERSE = 3.0
+FILLET_MAX_TURN = 135.0
 NEAR_STRAIGHT = math.sin(math.radians(10))  # below this kink a corner fades to smooth
 
 
@@ -587,6 +594,120 @@ class _Side(object):
             handle = min(max(length(sub(p3, p2)), 0.05*chord), 0.75*chord)
             p2 = sub(p3, mul(center1, handle))
         return ('cubic', (p0, p1, p2, p3))
+
+
+def _turns(points):
+    """Signed turning angle at each interior point of a polyline."""
+    result = []
+    for a, b, c in zip(points, points[1:], points[2:]):
+        u, v = sub(b, a), sub(c, b)
+        if length(u) > EPS and length(v) > EPS:
+            result.append(math.atan2(u[0]*v[1] - u[1]*v[0], u[0]*v[0] + u[1]*v[1]))
+    return result
+
+
+def _fillet_side(side):
+    """Apply _fillet_edge to a joined side whose ends still sit on its true
+    offset (smooth joins and free ends). Corner joins and cuts have moved the
+    ends, and their own extension keeps the edge in shape there."""
+    if side.kind != 'cubic' or side.join_extension_ratio > 0.05:
+        return
+    controls = (side.override_piece or side.piece())[1]
+    if length(sub(controls[0], side.at(side.ta))) > 1.0 or \
+            length(sub(controls[-1], side.at(side.tb))) > 1.0:
+        return
+    samples = [side.at(side.ta + (side.tb-side.ta)*i/16.0) for i in range(1, 16)]
+    filleted = _fillet_edge(side, controls, samples, side.tangent(side.ta),
+                            side.tangent(side.tb))
+    if filleted is not controls:
+        side.override_piece = ('cubic', filleted)
+
+
+def _crossing(p0, d0, p3, d1):
+    """Distances (s0, s1) with p0 + d0*s0 == p3 - d1*s1, or None if parallel."""
+    cross = d0[0]*d1[1] - d0[1]*d1[0]
+    if abs(cross) < 1e-9:
+        return None
+    q = sub(p3, p0)
+    return ((q[0]*d1[1] - q[1]*d1[0]) / cross, (d0[0]*q[1] - d0[1]*q[0]) / cross)
+
+
+def _handle_shares(points):
+    """How far each handle of a cubic reaches towards its tangent crossing (0..1)."""
+    p0, p1, p2, p3 = points
+    a, b = length(sub(p1, p0)), length(sub(p3, p2))
+    if a < EPS or b < EPS:
+        return None
+    crossing = _crossing(p0, unit(sub(p1, p0)), p3, unit(sub(p3, p2)))
+    if crossing is None or crossing[0] <= EPS or crossing[1] <= EPS:
+        return None
+    return (min(max(a / crossing[0], 0.15), 1.0), min(max(b / crossing[1], 0.15), 1.0))
+
+
+def _fillet_edge(side, controls, samples, d0, d1):
+    """Turn an edge that bends back on itself into one fillet between its tangents.
+
+    Where the thickness changes faster than the stroke turns (a wide, flat nib
+    going from a stem into a thin diagonal), the true offset (`samples`) or its
+    fitted cubic bends the wrong way: the inner edge dips back past the stem
+    before it turns, the outer edge flattens and swings out again. When the
+    centerline turns one way only and the edge turns back by more than
+    FILLET_REVERSE degrees, the edge becomes a fillet from the start tangent d0
+    into the end tangent d1. Each handle reaches the same share of the way to
+    the tangent crossing as the centerline's own handle does, so a tighter
+    centerline bend gives a tighter outline bend. Outside the bend the fillet is
+    drawn in until it keeps no further from the centerline than the thicker
+    end, so the bend does not swell beyond the stroke width, and it is used
+    only where it reaches further out than the fit.
+    """
+    p0, p1, p2, p3 = controls
+    source = side.pts if side.ta < EPS and side.tb > 1-EPS else \
+        _cubic_interval(side.pts, side.ta, side.tb)
+    bends = _turns(list(source))
+    if any(x > 1e-6 for x in bends) and any(x < -1e-6 for x in bends):
+        return controls  # an S-shaped centerline
+    turn = math.atan2(d0[0]*d1[1] - d0[1]*d1[0], d0[0]*d1[0] + d0[1]*d1[1])
+    if not math.radians(5.0) < abs(turn) <= math.radians(FILLET_MAX_TURN):
+        return controls
+    fitted = [cubic(*controls, i/32.0) for i in range(33)]
+    reverse = max(sum(abs(x) for x in _turns(points) if x*turn < 0)
+                  for points in ([p0] + list(samples) + [p3], fitted))
+    if math.degrees(reverse) < FILLET_REVERSE:
+        return controls
+    chord = length(sub(p3, p0))
+    crossing = _crossing(p0, d0, p3, d1)
+    if crossing is None:
+        return controls
+    s0, s1 = crossing
+    if not (EPS < s0 <= 2*chord and EPS < s1 <= 2*chord):
+        return controls
+    k0, k1 = _handle_shares(source) or (FILLET_HANDLE, FILLET_HANDLE)
+
+    def fillet(scale):
+        return (p0, add(p0, mul(d0, scale*k0*s0)), sub(p3, mul(d1, scale*k1*s1)), p3)
+    scale = 1.0
+    if turn*side.sign < 0:  # outside of the bend
+        center = [cubic(*source, i/48.0) for i in range(49)]
+        limit = max(length(sub(p0, center[0])), length(sub(p3, center[-1])))
+
+        def fits(value):  # the fillet's middle, kept within the limit
+            return all(min(length(sub(cubic(*fillet(value), t), c)) for c in center) <= limit
+                       for t in (0.25, 0.5, 0.75))
+        if not fits(scale):
+            lo, hi = 0.0, scale
+            for _ in range(20):
+                mid = (lo + hi) / 2.0
+                lo, hi = (mid, hi) if fits(mid) else (lo, mid)
+            scale = lo
+        middle = mul(add(p0, p3), 0.5)
+        outward = unit(sub(add(p0, mul(d0, s0)), middle))  # towards the tangent crossing
+
+        def depth(points):
+            v = sub(cubic(*points, 0.5), middle)
+            return v[0]*outward[0] + v[1]*outward[1]
+        if min(k0*s0, k1*s1)*scale < 0.2*chord or depth(fillet(scale)) <= depth(controls):
+            return controls  # the fit already bends at least as far out
+    return fillet(scale)
 
 
 def _side_pair(kind, pts, e0, e1, slant=0.0):
@@ -1422,6 +1543,7 @@ def outline_curves(segments, closed=False, cap_start='flat', cap_end='flat',
         if edges is not None:
             edges.update(_edge_map(lefts, rights, indices, True))
         for side in lefts + rights:
+            _fillet_side(side)
             _optical_outer_curve(side)
         outer = _side_contour(lefts, widths, True, joined=True)
         inner = _reverse(_side_contour(rights, widths, True, joined=True))
@@ -1462,6 +1584,7 @@ def outline_curves(segments, closed=False, cap_start='flat', cap_end='flat',
         _place_ellipse_cap(lefts[-1], rights[-1], end_center, end_tangent,
                            last.n1, True)
     for side in lefts + rights:
+        _fillet_side(side)
         _optical_outer_curve(side)
     left = _side_contour(lefts, widths, False, joined=True)
     right = _side_contour(rights, widths, False, joined=True)

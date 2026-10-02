@@ -4,7 +4,7 @@ import unittest
 from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from variable_stroke_core import (outline, outline_curves, node_edges, nib_edges,
-                                  _Side, _join, sub, unit, length)
+                                  _Side, _join, sub, unit, length, cubic)
 
 
 class GeometryTests(unittest.TestCase):
@@ -377,6 +377,42 @@ class GeometryTests(unittest.TestCase):
                     continue  # parallel to the stroke: falls back to flat
                 with self.subTest(style=style, node=node):
                     self.assertEqual(len(on_cut), 2)
+
+    def test_flat_nib_bend_edges_turn_one_way(self):
+        # A wide, flat nib from a stem into a thin diagonal: the true offsets bend
+        # back (inner notch, outer flattening). Both edges turn as one fillet.
+        nib = (90, 20, 0, 0)
+        segments = [('line', ((0, 227), (0, 144)), nib, nib),
+                    ('cubic', ((0, 144), (0, 67), (78, 89), (113, 102)), nib, nib),
+                    ('line', ((113, 102), (162, 121)), nib, nib)]
+        contour = outline_curves(segments)[0]
+        for start in ((45.0, 144.0), (-45.0, 144.0)):
+            edge = next(points for kind, points in contour
+                        if kind == 'cubic' and start in (points[0], points[3]))
+            samples = [cubic(*edge, i/32.0) for i in range(33)]
+            turns = [math.atan2(a[0]*b[1]-a[1]*b[0], a[0]*b[0]+a[1]*b[1])
+                     for a, b in ((sub(q, p), sub(r, q)) for p, q, r
+                                  in zip(samples, samples[1:], samples[2:]))]
+            with self.subTest(start=start):
+                self.assertTrue(all(t >= -1e-9 for t in turns) or
+                                all(t <= 1e-9 for t in turns))
+                if start[0] > 0:  # inner edge stays off the stem's outside
+                    self.assertGreaterEqual(min(x for x, _ in samples), 45.0 - 1e-6)
+                else:  # outer edge no further out than the stem's half width
+                    self.assertGreaterEqual(min(x for x, _ in samples), -45.0 - 1e-6)
+
+    def test_round_nib_bends_keep_their_fit(self):
+        segments = [('line', ((0, 227), (0, 144)), 60, 60),
+                    ('cubic', ((0, 144), (0, 67), (78, 89), (113, 102)), 60, 60),
+                    ('line', ((113, 102), (162, 121)), 60, 60)]
+        import variable_stroke_core as core
+        saved = core.FILLET_REVERSE
+        try:
+            core.FILLET_REVERSE = float('inf')
+            plain = outline_curves(segments)
+        finally:
+            core.FILLET_REVERSE = saved
+        self.assertEqual(outline_curves(segments), plain)
 
     def test_square_and_round_extend(self):
         seg = [('line', ((0, 0), (100, 0)), 20, 20)]
