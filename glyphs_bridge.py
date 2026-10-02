@@ -1094,3 +1094,56 @@ def convert_glyph(glyph, keep_marks=True):
         for layer in layers:
             layer.userData[LAYER_STATE_KEY] = False
     return count
+
+
+def node_contour(path):
+    """A path's own nodes as ('line'|'cubic', points) segments, starting on a
+    node that is on the curve. Other off-curve runs (quadratics) become lines."""
+    nodes = [(xy(node), node.type) for node in path.nodes]
+    first = next((i for i, (_, kind) in enumerate(nodes) if kind != OFFCURVE), None)
+    if first is None:
+        return []
+    sequence = nodes[first:] + nodes[:first] + [nodes[first]] if path.closed else nodes[first:]
+    segments, start, controls = [], sequence[0][0], []
+    for point, kind in sequence[1:]:
+        if kind == OFFCURVE:
+            controls.append(point)
+            continue
+        if len(controls) == 2:
+            segments.append(('cubic', (start, controls[0], controls[1], point)))
+        else:
+            segments.append(('line', (start, point)))
+        start, controls = point, []
+    return segments
+
+
+def copied_contours(layer, selected):
+    """What a copy of `selected` (the layer's selection) should look like outside
+    Glyphs: each live stroke the selection touches becomes its outline, and fully
+    selected plain paths stay as they are. Returns [(closed, segments)], or None
+    when the selection holds no live stroke, so the copy needs no change."""
+    state = layer_state(layer)
+    if state is False or not selected:
+        return None
+    defaults = layer_defaults(layer)
+    result, found = [], False
+    for path in layer.paths:
+        picked = [node in selected for node in path.nodes]
+        if not any(picked):
+            continue
+        if not generated(path) and not is_outline(path) and (state or enabled(path)):
+            items = path_nodes(path)
+            if items and _valid_structure(path, [item[1] for item in items]):
+                try:
+                    contours = curves_for_path(path, defaults, items=items)
+                except ValueError:
+                    contours = None
+                if contours is not None:
+                    found = True
+                    result.extend((True, contour) for contour in contours if contour)
+                    continue
+        if all(picked):
+            segments = node_contour(path)
+            if segments:
+                result.append((bool(path.closed), segments))
+    return result if found else None

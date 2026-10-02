@@ -650,5 +650,37 @@ class BridgeTests(unittest.TestCase):
                         self.assertEqual(bridge._valid_structure(path), expected)
 
 
+    def test_copy_outlines_touched_strokes_and_keeps_selected_plain_paths(self):
+        stroke = Path([Node(0, 0), Node(100, 0)])
+        plain = Path([Node(0, 200), Node(50, 250), Node(100, 200)], True)
+        plain.attributes = {}
+        untouched = Path([Node(0, 400), Node(100, 400)])
+        layer = Layer([stroke, plain, untouched])
+        contours = bridge.copied_contours(layer, {stroke.nodes[0]} | set(plain.nodes))
+        self.assertEqual(len(contours), 2)
+        outline, kept = contours
+        self.assertTrue(outline[0])
+        self.assertEqual(outline[1], bridge.curves_for_path(stroke, None)[0])
+        self.assertEqual(kept, (True, [('line', ((0.0, 200.0), (50.0, 250.0))),
+                                       ('line', ((50.0, 250.0), (100.0, 200.0))),
+                                       ('line', ((100.0, 200.0), (0.0, 200.0)))]))
+
+    def test_copy_without_live_strokes_is_left_to_glyphs(self):
+        stroke = Path([Node(0, 0), Node(100, 0)])
+        plain = Path([Node(0, 200), Node(100, 200)])
+        plain.attributes = {}
+        layer = Layer([stroke, plain])
+        self.assertIsNone(bridge.copied_contours(layer, set(plain.nodes)))
+        self.assertIsNone(bridge.copied_contours(layer, set()))
+        layer.userData[bridge.LAYER_STATE_KEY] = False
+        self.assertIsNone(bridge.copied_contours(layer, set(stroke.nodes)))
+
+    def test_node_contour_starts_on_curve_and_closes_through_handles(self):
+        path = Path([Node(0, 50, 'offcurve'), Node(0, 0, 'curve'), Node(100, 0),
+                     Node(100, 50, 'offcurve')], True)
+        self.assertEqual(bridge.node_contour(path), [
+            ('line', ((0.0, 0.0), (100.0, 0.0))),
+            ('cubic', ((100.0, 0.0), (100.0, 50.0), (0.0, 50.0), (0.0, 0.0)))])
+
 if __name__ == '__main__':
     unittest.main()

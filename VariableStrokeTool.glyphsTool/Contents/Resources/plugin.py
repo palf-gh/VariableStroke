@@ -6,12 +6,12 @@ import time
 import traceback
 import objc
 from AppKit import (NSBezierPath, NSColor, NSEvent, NSImage, NSMenu, NSMenuItem, NSObject,
-                    NSThread,
+                    NSThread, NSPasteboard, NSPasteboardTypePDF, NSData,
                     NSEventModifierFlagOption, NSEventModifierFlagShift,
                     NSEventModifierFlagCommand,
                     NSRoundLineCapStyle, NSRoundLineJoinStyle)
-from GlyphsApp import (Glyphs, GSCallbackHandler, GSCustomParameter, OFFCURVE, DOCUMENTOPENED,
-                       UPDATEINTERFACE, DRAWBACKGROUND, CONTEXTMENUCALLBACK, WINDOW_MENU)
+from GlyphsApp import (Glyphs, GSCallbackHandler, GSCustomParameter, GSComponent, OFFCURVE,
+                       DOCUMENTOPENED, UPDATEINTERFACE, DRAWBACKGROUND, CONTEXTMENUCALLBACK, WINDOW_MENU)
 from GlyphsApp.plugins import SelectTool
 from vanilla import (Window, FloatingWindow, Group, SegmentedButton, TextBox, EditText,
                      ImageButton, Button, List, HorizontalLine)
@@ -35,7 +35,8 @@ from glyphs_bridge import (CAP_START_KEY, CAP_END_KEY, CAP_START_ANGLE_KEY, CAP_
                            edges_for_path, selected_nib_nodes, ellipse_cap_nodes,
                            set_node_nib_size, path_nodes, PROFILE, LAYER_STATE_KEY, has_live_corners, nib_of,
                            scale_of, height_scale_of, offset_of, rotation_of,
-                           corner_on_of, corner_spec_of)
+                           corner_on_of, corner_spec_of, copied_contours)
+from clipboard_export import svg_document, pdf_document
 from variable_stroke_core import (unit, sub, add, length, outline_curves,
                                   nib_edges, ellipse_nib_edges)
 
@@ -105,6 +106,124 @@ def _ensure_export_filter(font):
                    for parameter in instance.customParameters):
                 continue
             instance.customParameters.append(GSCustomParameter(name, EXPORT_FILTER + ';'))
+
+
+# Copy and cut in the edit view belong to GlyphsPathPlugin, the base of the select
+# and drawing tools. Glyphs keeps its own pasteboard type (pasting back into Glyphs
+# brings the centerlines and their stroke data); the representations other apps
+# read are replaced by the outline when the selection holds a live stroke.
+_PATH_TOOL_CLASS = 'GlyphsPathPlugin'
+_SVG_TYPE = 'public.svg-image'
+_DRAWING_TYPES = {NSPasteboardTypePDF, 'Apple PDF pasteboard type', _SVG_TYPE,
+                  'com.adobe.svg', 'com.adobe.illustrator.svg', 'com.adobe.illustrator.svgm',
+                  'com.adobe.illustrator.aicb', 'com.adobe.encapsulated-postscript',
+                  'public.tiff', 'NeXT TIFF v4.0 pasteboard type', 'public.png',
+                  'com.apple.pict', 'Apple PICT pasteboard type'}
+_TEXT_TYPE = 'public.utf8-plain-text'
+_hooked_copy = []
+
+
+def _bezier_contours(bezier):
+    """[(closed, segments)] of an NSBezierPath (a selected component)."""
+    contours, segments, start, current = [], [], None, None
+    for index in range(bezier.elementCount()):
+        kind, points = bezier.elementAtIndex_associatedPoints_(index)
+        points = [(float(point.x), float(point.y)) for point in points]
+        if kind == 0:  # move
+            if segments:
+                contours.append((False, segments))
+            segments, start, current = [], points[0], points[0]
+        elif kind == 1:  # line
+            segments.append(('line', (current, points[0])))
+            current = points[0]
+        elif kind == 2:  # curve
+            segments.append(('cubic', (current, points[0], points[1], points[2])))
+            current = points[2]
+        elif kind == 3:  # close
+            if current != start:
+                segments.append(('line', (current, start)))
+            if segments:
+                contours.append((True, segments))
+            segments, current = [], start
+    if segments:
+        contours.append((False, segments))
+    return contours
+
+
+def _copied_outline(tool):
+    """Outline contours of what the tool is about to copy, or None to leave the copy alone."""
+    try:
+        layer = tool.editViewController().graphicView().activeLayer()
+    except Exception:
+        font = Glyphs.font
+        layer = font.selectedLayers[0] if font and font.selectedLayers else None
+    if layer is None:
+        return None
+    selection = list(layer.selection or [])
+    contours = copied_contours(layer, set(selection))
+    if contours is None:
+        return None
+    for item in selection:
+        if isinstance(item, GSComponent):
+            try:
+                contours.extend(_bezier_contours(item.bezierPath))
+            except Exception:
+                pass
+    return contours
+
+
+def _put_outline_on_pasteboard(contours):
+    svg = svg_document(contours)
+    pdf = pdf_document(contours)
+    if svg is None or pdf is None:
+        return
+    svg_data = NSData.dataWithBytes_length_(svg.encode('utf-8'), len(svg.encode('utf-8')))
+    board = NSPasteboard.generalPasteboard()
+    kept = []
+    for kind in list(board.types() or []):
+        if kind in _DRAWING_TYPES:
+            continue
+        data = board.dataForType_(kind)
+        if data is None:
+            continue
+        if kind == _TEXT_TYPE:
+            text = (board.stringForType_(kind) or '').lstrip()
+            if text.startswith(('<svg', '<?xml', '%!')):  # a drawing as text: the outline
+                data = svg_data
+        kept.append((kind, data))
+    board.clearContents()
+    board.declareTypes_owner_([kind for kind, _ in kept] + [NSPasteboardTypePDF, _SVG_TYPE],
+                              None)
+    for kind, data in kept:
+        board.setData_forType_(data, kind)
+    board.setData_forType_(pdf, NSPasteboardTypePDF)
+    board.setData_forType_(svg_data, _SVG_TYPE)
+
+
+def _hook_copy():
+    """Wrap -copy: and -cut: of every path tool, once per launch."""
+    if _hooked_copy:
+        return
+    cls = objc.lookUpClass(_PATH_TOOL_CLASS)
+    for name in (b'copy:', b'cut:'):
+        original = cls.instanceMethodForSelector_(name)
+
+        def wrapper(self, sender, original=original):
+            contours = None
+            try:  # before the original runs: cut removes the selection
+                contours = _copied_outline(self)
+            except Exception:
+                print(traceback.format_exc())
+            original(self, sender)
+            if contours:
+                try:
+                    _put_outline_on_pasteboard(contours)
+                except Exception:
+                    print(traceback.format_exc())
+
+        objc.classAddMethod(cls, name, objc.selector(wrapper, selector=name,
+                                                     signature=original.signature))
+    _hooked_copy.append(True)
 
 
 def _invalidate(layer, paths=None):
@@ -916,6 +1035,10 @@ class VariableStrokeTool(SelectTool):
             GSCallbackHandler.addCallback_forOperation_(self._inspector_provider,
                                                         INSPECTOR_CALLBACK)
         GSCallbackHandler.addCallback_forOperation_(self._layer_processor, PREPARE_LAYER_CALLBACK)
+        try:
+            _hook_copy()
+        except Exception:
+            print(traceback.format_exc())
         item = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
             _loc('Variable Stroke Settings…', '可変ストローク設定…'), 'showSettings:', '')
         item.setTarget_(self._inspector_provider)
