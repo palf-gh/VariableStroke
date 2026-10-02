@@ -45,7 +45,7 @@ CAP_VALUES = [item[0] for item in CAP_NAMES]
 # outline preparation hooks.
 INSPECTOR_CALLBACK = 'GSInspectorViewControllersCallback'
 PREPARE_LAYER_CALLBACK = 'GSPrepareLayerCallback'
-PANEL_SIZE = (530, 105)
+PANEL_SIZE = (530, 130)
 
 
 def _loc(english, japanese):
@@ -107,6 +107,45 @@ def _cap_icon(style):
         return True
     image = NSImage.imageWithSize_flipped_drawingHandler_((18, 14), False, draw)
     image.setTemplate_(True)
+    return image
+
+
+_LINK_ICONS = {}
+
+
+def _link_icon(linked):
+    """A small chain control, with a slash when its two values are independent."""
+    if linked in _LINK_ICONS:
+        return _LINK_ICONS[linked]
+    symbol = 'link' if linked else 'link.slash'
+    if hasattr(NSImage, 'imageWithSystemSymbolName_accessibilityDescription_'):
+        image = NSImage.imageWithSystemSymbolName_accessibilityDescription_(symbol, symbol)
+        if image is not None:
+            _LINK_ICONS[linked] = image
+            return image
+
+    def draw(rect):
+        NSColor.labelColor().set()
+        chain = NSBezierPath.bezierPath()
+        chain.setLineWidth_(1.4)
+        chain.appendBezierPathWithRoundedRect_xRadius_yRadius_(((2, 5), (9, 6)), 3, 3)
+        chain.appendBezierPathWithRoundedRect_xRadius_yRadius_(((7, 5), (9, 6)), 3, 3)
+        chain.stroke()
+        if not linked:
+            NSColor.windowBackgroundColor().set()
+            gap = NSBezierPath.bezierPath()
+            gap.moveToPoint_((12, 3))
+            gap.lineToPoint_((6, 13))
+            gap.setLineWidth_(3)
+            gap.stroke()
+            NSColor.labelColor().set()
+            gap.setLineWidth_(1.3)
+            gap.stroke()
+        return True
+
+    image = NSImage.imageWithSize_flipped_drawingHandler_((18, 16), False, draw)
+    image.setTemplate_(True)
+    _LINK_ICONS[linked] = image
     return image
 
 
@@ -621,11 +660,7 @@ class VariableStrokeTool(SelectTool):
 
     @objc.python_method
     def _build_inspector(self):
-        # Compact strip beside Glyphs' own info box:
-        #   [ON|OFF] Width [40] Height [40] ↺  W% [100] H% [ ] Pos [0]% Tilt [0]°
-        #   Start [cap icons][angle]°  End [cap icons][angle]°
-        #   Corner [ON|OFF] Outer [ ] Inner [ ] [Link]
-        #   Strength A [ ] B [ ] [Link]  Ratio A [ ] B [ ] [Link]
+        # Four sections in five rows: stroke, node, caps, corner headings, values.
         width_px, height_px = PANEL_SIZE
         self.infoBoxWindow = Window((width_px, height_px))
         group = self.infoBoxWindow.group = InspectorGroup((0, 0, width_px, height_px))
@@ -637,20 +672,21 @@ class VariableStrokeTool(SelectTool):
         group.heightField = SteppingEditText((174, 4, 42, 19), sizeStyle='small')
         group.widthReset = ImageButton((218, 5, 17, 17), imageNamed='NSRefreshTemplate',
                                        bordered=False, callback=self.resetWidthFromInspector_)
-        group.scaleLabel = TextBox((241, 7, 21, 14), _loc('W', '幅'), sizeStyle='small')
-        group.scaleField = SteppingEditText((262, 4, 35, 19), sizeStyle='small')
-        group.scaleUnit = TextBox((299, 7, 12, 14), '%', sizeStyle='small')
-        group.heightScaleLabel = TextBox((312, 7, 21, 14), _loc('H', '高'), sizeStyle='small')
-        group.heightScaleField = SteppingEditText((333, 4, 35, 19), sizeStyle='small')
-        group.heightScaleUnit = TextBox((370, 7, 12, 14), '%', sizeStyle='small')
-        group.offsetLabel = TextBox((383, 7, 27, 14), _loc('Pos', '位置'), sizeStyle='small')
-        group.offsetField = SteppingEditText((410, 4, 35, 19), sizeStyle='small')
-        group.offsetUnit = TextBox((447, 7, 12, 14), '%', sizeStyle='small')
-        group.rotationLabel = TextBox((460, 7, 27, 14), _loc('Ang', '角度'), sizeStyle='small')
-        group.rotationField = SteppingEditText((487, 4, 35, 19), sizeStyle='small')
-        group.rotationUnit = TextBox((523, 7, 7, 14), '°', sizeStyle='small')
-        group.settings = ImageButton((509, 56, 17, 17), imageNamed='NSActionTemplate',
+        group.settings = ImageButton((508, 5, 17, 17), imageNamed='NSActionTemplate',
                                      bordered=False, callback=self.showSettingsFromInspector_)
+        group.nodeLabel = TextBox((6, 34, 39, 14), _loc('Node', 'ノード'), sizeStyle='small')
+        group.scaleLabel = TextBox((52, 34, 24, 14), _loc('W', '幅'), sizeStyle='small')
+        group.scaleField = SteppingEditText((77, 30, 43, 19), sizeStyle='small')
+        group.scaleUnit = TextBox((122, 34, 12, 14), '%', sizeStyle='small')
+        group.heightScaleLabel = TextBox((147, 34, 24, 14), _loc('H', '高'), sizeStyle='small')
+        group.heightScaleField = SteppingEditText((172, 30, 43, 19), sizeStyle='small')
+        group.heightScaleUnit = TextBox((217, 34, 12, 14), '%', sizeStyle='small')
+        group.offsetLabel = TextBox((246, 34, 30, 14), _loc('Pos', '位置'), sizeStyle='small')
+        group.offsetField = SteppingEditText((277, 30, 43, 19), sizeStyle='small')
+        group.offsetUnit = TextBox((322, 34, 12, 14), '%', sizeStyle='small')
+        group.rotationLabel = TextBox((352, 34, 33, 14), _loc('Ang', '角度'), sizeStyle='small')
+        group.rotationField = SteppingEditText((387, 30, 43, 19), sizeStyle='small')
+        group.rotationUnit = TextBox((432, 34, 7, 14), '°', sizeStyle='small')
         group.widthReset.getNSButton().setToolTip_(
             _loc('Follow the master default width and height', 'マスターの既定の幅・高さに戻す'))
         group.settings.getNSButton().setToolTip_(
@@ -672,40 +708,41 @@ class VariableStrokeTool(SelectTool):
                  '幅と高さの軸のページ上の角度。グレー表示はマスターの既定値。'
                  'キャンバスの紫ハンドルでも回転できます。'))
         caps = [{'imageObject': _cap_icon(value), 'width': 21} for value in CAP_VALUES]
-        group.startLabel = TextBox((6, 33, 30, 14), _loc('Start', '始点'), sizeStyle='small')
-        group.startCap = SegmentedButton((36, 29, 147, 20), caps,
+        group.startLabel = TextBox((6, 59, 30, 14), _loc('Start', '始点'), sizeStyle='small')
+        group.startCap = SegmentedButton((36, 55, 147, 20), caps,
                                          callback=self.startCapFromInspector_, sizeStyle='small')
-        group.startAngle = SteppingEditText((187, 29, 36, 19), sizeStyle='small')
-        group.startAngleUnit = TextBox((225, 32, 10, 14), '°', sizeStyle='small')
-        group.endLabel = TextBox((230, 33, 30, 14), _loc('End', '終点'), sizeStyle='small')
-        group.endCap = SegmentedButton((260, 29, 147, 20), caps,
+        group.startAngle = SteppingEditText((187, 55, 36, 19), sizeStyle='small')
+        group.startAngleUnit = TextBox((225, 59, 10, 14), '°', sizeStyle='small')
+        group.endLabel = TextBox((254, 59, 30, 14), _loc('End', '終点'), sizeStyle='small')
+        group.endCap = SegmentedButton((284, 55, 147, 20), caps,
                                        callback=self.endCapFromInspector_, sizeStyle='small')
-        group.endAngle = SteppingEditText((411, 29, 36, 19), sizeStyle='small')
-        group.endAngleUnit = TextBox((449, 32, 10, 14), '°', sizeStyle='small')
-        group.cornerLabel = TextBox((6, 59, 30, 14), _loc('Corner', '角丸'), sizeStyle='small')
-        group.cornerToggle = SegmentedButton((36, 55, 64, 20), [{'title': 'ON'}, {'title': 'OFF'}],
+        group.endAngle = SteppingEditText((435, 55, 36, 19), sizeStyle='small')
+        group.endAngleUnit = TextBox((473, 59, 10, 14), '°', sizeStyle='small')
+        group.cornerLabel = TextBox((6, 87, 30, 14), _loc('Corner', '角丸'), sizeStyle='small')
+        group.cornerToggle = SegmentedButton((36, 83, 64, 20), [{'title': 'ON'}, {'title': 'OFF'}],
                                              callback=self.cornerToggleFromInspector_,
                                              sizeStyle='small')
-        group.outerLabel = TextBox((108, 59, 18, 14), _loc('Out', '外'), sizeStyle='small')
-        group.outerField = SteppingEditText((126, 55, 40, 19), sizeStyle='small')
-        group.innerLabel = TextBox((172, 59, 18, 14), _loc('In', '内'), sizeStyle='small')
-        group.innerField = SteppingEditText((190, 55, 40, 19), sizeStyle='small')
-        group.radiusLink = Button((236, 55, 40, 19), _loc('Link', '連動'),
-                                  callback=self.radiusLinkFromInspector_, sizeStyle='small')
-        group.tensionLabel = TextBox((6, 84, 38, 14), _loc('Curve', '強さ'), sizeStyle='small')
-        group.tensionOuterLabel = TextBox((45, 84, 16, 14), _loc('Out', '外'), sizeStyle='small')
-        group.tensionField = SteppingEditText((63, 80, 42, 19), sizeStyle='small')
-        group.tensionInnerLabel = TextBox((109, 84, 16, 14), _loc('In', '内'), sizeStyle='small')
-        group.innerTensionField = SteppingEditText((127, 80, 42, 19), sizeStyle='small')
-        group.tensionLink = Button((175, 80, 40, 19), _loc('Link', '連動'),
-                                   callback=self.tensionLinkFromInspector_, sizeStyle='small')
-        group.ratioLabel = TextBox((225, 84, 40, 14), _loc('Ratio', '縦横比'), sizeStyle='small')
-        group.ratioOuterLabel = TextBox((267, 84, 16, 14), _loc('Out', '外'), sizeStyle='small')
-        group.ratioField = SteppingEditText((285, 80, 42, 19), sizeStyle='small')
-        group.ratioInnerLabel = TextBox((331, 84, 16, 14), _loc('In', '内'), sizeStyle='small')
-        group.innerRatioField = SteppingEditText((349, 80, 42, 19), sizeStyle='small')
-        group.ratioLink = Button((397, 80, 40, 19), _loc('Link', '連動'),
-                                 callback=self.ratioLinkFromInspector_, sizeStyle='small')
+        group.radiusLabel = TextBox((105, 86, 130, 14), _loc('Radius', '半径'), sizeStyle='small')
+        group.tensionLabel = TextBox((246, 86, 130, 14), _loc('Strength', '強さ'), sizeStyle='small')
+        group.ratioLabel = TextBox((387, 86, 130, 14), _loc('Ratio', '縦横比'), sizeStyle='small')
+        group.outerLabel = TextBox((105, 111, 17, 14), _loc('Out', '外'), sizeStyle='small')
+        group.outerField = SteppingEditText((123, 107, 38, 19), sizeStyle='small')
+        group.innerLabel = TextBox((164, 111, 17, 14), _loc('In', '内'), sizeStyle='small')
+        group.innerField = SteppingEditText((182, 107, 38, 19), sizeStyle='small')
+        group.radiusLink = ImageButton((222, 107, 20, 19), imageObject=_link_icon(True),
+                                       bordered=False, callback=self.radiusLinkFromInspector_)
+        group.tensionOuterLabel = TextBox((246, 111, 17, 14), _loc('Out', '外'), sizeStyle='small')
+        group.tensionField = SteppingEditText((264, 107, 38, 19), sizeStyle='small')
+        group.tensionInnerLabel = TextBox((305, 111, 17, 14), _loc('In', '内'), sizeStyle='small')
+        group.innerTensionField = SteppingEditText((323, 107, 38, 19), sizeStyle='small')
+        group.tensionLink = ImageButton((363, 107, 20, 19), imageObject=_link_icon(True),
+                                        bordered=False, callback=self.tensionLinkFromInspector_)
+        group.ratioOuterLabel = TextBox((387, 111, 17, 14), _loc('Out', '外'), sizeStyle='small')
+        group.ratioField = SteppingEditText((405, 107, 38, 19), sizeStyle='small')
+        group.ratioInnerLabel = TextBox((446, 111, 17, 14), _loc('In', '内'), sizeStyle='small')
+        group.innerRatioField = SteppingEditText((464, 107, 38, 19), sizeStyle='small')
+        group.ratioLink = ImageButton((504, 107, 20, 19), imageObject=_link_icon(True),
+                                      bordered=False, callback=self.ratioLinkFromInspector_)
         for button, english, japanese in (
                 (group.radiusLink, 'Link or separate the two corner radii', '両側の半径の連動を切り替え'),
                 (group.tensionLink, 'Link or separate the two curve strengths', '両側の強さの連動を切り替え'),
@@ -1095,8 +1132,10 @@ class VariableStrokeTool(SelectTool):
                                          (2, group.ratioLink, group.innerRatioField)):
                 linked = bool(corner_links) and all(state[index] for state in corner_links)
                 button.enable(editable and bool(nodes))
-                button.getNSButton().setTitle_(
-                    _loc('Link', '連動') if linked else _loc('Free', '独立'))
+                button.getNSButton().setImage_(_link_icon(linked))
+                button.getNSButton().setToolTip_(
+                    _loc('Linked; click to separate values', '連動中。クリックで独立') if linked else
+                    _loc('Independent; click to link values', '独立中。クリックで連動'))
                 field.enable(editable and not linked)
             group.startCap.enable(open_paths)
             group.endCap.enable(open_paths)
@@ -1432,9 +1471,8 @@ class VariableStrokeTool(SelectTool):
             parts.append(('radius', path, widget, widget['middle']))
             if widget['node'] not in selection:
                 continue
-            if not widget['cap']:
-                parts.append(('ratio1', path, widget, widget['p1']))
-                parts.append(('ratio2', path, widget, widget['p2']))
+            parts.append(('ratio1', path, widget, widget['p1']))
+            parts.append(('ratio2', path, widget, widget['p2']))
             chord_middle = ((widget['p1'][0] + widget['p2'][0]) / 2,
                             (widget['p1'][1] + widget['p2'][1]) / 2)
             diagonal = unit(sub(widget['corner'], chord_middle))
