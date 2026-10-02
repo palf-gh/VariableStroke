@@ -87,6 +87,78 @@ class BridgeTests(unittest.TestCase):
             self.assertAlmostEqual(point[0], target[0])
             self.assertAlmostEqual(point[1], target[1])
 
+    def test_outline_reads_each_node_once_through_the_glyphs_proxy(self):
+        reads = []
+
+        class Methods:
+            def __init__(self, node):
+                self.node = node
+
+            def userData(self):
+                reads.append(self.node)
+                return dict(self.node.userData)
+
+        class CountedNode(Node):
+            @property
+            def pyobjc_instanceMethods(self):
+                return Methods(self)
+
+        nodes = [CountedNode(0, 0), CountedNode(30, 60, 'offcurve'),
+                 CountedNode(70, 60, 'offcurve'), CountedNode(100, 0, 'curve'),
+                 CountedNode(200, 0)]
+        for node in nodes:
+            node.userData = {bridge.SCALE_KEY: 120.0, bridge.CORNER_ON_KEY: True}
+        path = Path(nodes)
+        Layer([path])
+        bridge.curves_for_path(path, 40.0)
+        self.assertEqual(sorted(map(id, reads)),
+                         sorted(id(node) for node in nodes if node.type != 'offcurve'))
+
+    def test_preview_builds_each_unchanged_outline_once(self):
+        built = []
+
+        class CopyablePath(Path):
+            def __init__(self, *args, **kwargs):
+                super().__init__(*args, **kwargs)
+                built.append(self)
+
+            def copy(self):
+                twin = Path(list(self.nodes), self.closed)
+                twin.attributes = dict(self.attributes)
+                return twin
+
+        original = bridge.GSPath
+        bridge.GSPath = CopyablePath
+        try:
+            def layer():  # coordinates no other test uses, so nothing is cached yet
+                nodes = [Node(17, 0), Node(17, 311), Node(219, 311)]
+                return Layer([CopyablePath(nodes)])
+            first, second = layer(), layer()
+            del built[:]
+            bridge.expand_layer(first, True, 40.0)
+            count = len(built)
+            bridge.expand_layer(second, True, 40.0)
+        finally:
+            bridge.GSPath = original
+        self.assertGreater(count, 0)
+        self.assertEqual(len(built), count)  # the second layer got copies
+        self.assertTrue(all(bridge.is_outline(path) for path in second.paths))
+        self.assertEqual([len(path.nodes) for path in first.paths],
+                         [len(path.nodes) for path in second.paths])
+
+    def test_width_handles_come_from_the_outline_joins(self):
+        from variable_stroke_core import node_edges
+        nodes = [Node(0, 0), Node(0, 300), Node(300, 300), Node(300, 0)]
+        for node in nodes:
+            node.userData.clear()
+        nodes[1].userData[bridge.CORNER_ON_KEY] = True
+        path = Path(nodes, closed=True)
+        Layer([path])
+        expected = node_edges(bridge.segments_for_path(path, 40.0), True)
+        actual = bridge.edges_for_path(path, 40.0)
+        self.assertEqual([node for node, _ in actual], nodes)
+        self.assertEqual([pair for _, pair in actual], [expected[i] for i in range(4)])
+
     def test_ellipse_cap_preview_targets_only_configured_open_ends(self):
         start, middle, end = Node(0, 0), Node(50, 50), Node(100, 0)
         path = Path([start, middle, end])

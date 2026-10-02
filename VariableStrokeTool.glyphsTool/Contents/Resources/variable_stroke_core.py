@@ -17,16 +17,20 @@ def unit(a):
 def normal(a): return (-a[1], a[0])
 
 
+# The two hottest functions of live editing, written out (same arithmetic as
+# add/mul, so results are unchanged).
 def cubic(p0, p1, p2, p3, t):
     s = 1 - t
-    return add(add(mul(p0, s*s*s), mul(p1, 3*s*s*t)),
-               add(mul(p2, 3*s*t*t), mul(p3, t*t*t)))
+    a, b, c, d = s*s*s, 3*s*s*t, 3*s*t*t, t*t*t
+    return ((p0[0]*a + p1[0]*b) + (p2[0]*c + p3[0]*d),
+            (p0[1]*a + p1[1]*b) + (p2[1]*c + p3[1]*d))
 
 
 def cubic_derivative(p0, p1, p2, p3, t):
     s = 1 - t
-    return add(add(mul(sub(p1, p0), 3*s*s), mul(sub(p2, p1), 6*s*t)),
-               mul(sub(p3, p2), 3*t*t))
+    a, b, c = 3*s*s, 6*s*t, 3*t*t
+    return (((p1[0]-p0[0])*a + (p2[0]-p1[0])*b) + (p3[0]-p2[0])*c,
+            ((p1[1]-p0[1])*a + (p2[1]-p1[1])*b) + (p3[1]-p2[1])*c)
 
 
 def sample_segments(segments, closed=False):
@@ -358,8 +362,9 @@ def node_edges(segments, closed=False, italic_angle=0.0):
     for index, (kind, pts, e0, e1) in enumerate(segments):
         if all(length(sub(p, pts[0])) < EPS for p in pts):
             continue
-        lefts.append(_Side(kind, pts, e0, e1, 1, slant))
-        rights.append(_Side(kind, pts, e0, e1, -1, slant))
+        left, right = _side_pair(kind, pts, e0, e1, slant)
+        lefts.append(left)
+        rights.append(right)
         widths.append(lefts[-1].extent(1.0))
         indices.append(index)
     if not lefts:
@@ -368,6 +373,11 @@ def node_edges(segments, closed=False, italic_angle=0.0):
     for sides in (lefts, rights):
         for k in range(count if closed else count-1):
             _join(sides[k], sides[(k+1) % count], widths[k])
+    return _edge_map(lefts, rights, indices, closed)
+
+
+def _edge_map(lefts, rights, indices, closed):
+    """{on-curve index: (left, right)} of joined sides (see node_edges)."""
     result = {index: (lefts[k].start, rights[k].start) for k, index in enumerate(indices)}
     if not closed:
         result[indices[-1] + 1] = (lefts[-1].end, rights[-1].end)
@@ -402,19 +412,22 @@ def _derivative(kind, pts, t):
 
 
 def _point_segment_distance(p, a, b):
-    ab = sub(b, a)
-    denominator = ab[0]*ab[0] + ab[1]*ab[1]
-    t = 0.0 if denominator < EPS else max(0.0, min(1.0, ((p[0]-a[0])*ab[0] + (p[1]-a[1])*ab[1]) / denominator))
-    return length(sub(p, add(a, mul(ab, t))))
+    abx, aby = b[0]-a[0], b[1]-a[1]
+    denominator = abx*abx + aby*aby
+    t = 0.0 if denominator < EPS else max(0.0, min(1.0, ((p[0]-a[0])*abx + (p[1]-a[1])*aby) / denominator))
+    return math.hypot(p[0] - (a[0] + abx*t), p[1] - (a[1] + aby*t))
 
 
 class _Side(object):
     """One side (sign +1 left, -1 right) of one centerline segment, trimmable by t."""
 
-    def __init__(self, kind, pts, e0, e1, sign, slant=0.0):
+    def __init__(self, kind, pts, e0, e1, sign, slant=0.0, shared=None):
         if kind not in ('line', 'cubic'):
             raise ValueError('Unsupported segment: ' + str(kind))
         self.kind, self.pts, self.sign, self.slant = kind, pts, sign, slant
+        # {t: (left, right)}: both sides of a segment sample the same centerline
+        # points, so the pair shares one table (see _side_pair).
+        self._edges = {} if shared is None else shared
         self.n0, self.n1 = _nib(e0), _nib(e1)
         self.w0, self.w1 = self.n0[0], self.n1[0]
         self.ta, self.tb = 0.0, 1.0
@@ -436,10 +449,12 @@ class _Side(object):
         return max(w, h)
 
     def at(self, t):
-        pts = self.pts
-        p = add(mul(pts[0], 1-t), mul(pts[1], t)) if self.kind == 'line' else cubic(*pts, t)
-        left, right = nib_edges(p, self.tangent(t), self.nib(t))
-        return left if self.sign > 0 else right
+        edges = self._edges.get(t)
+        if edges is None:
+            pts = self.pts
+            p = add(mul(pts[0], 1-t), mul(pts[1], t)) if self.kind == 'line' else cubic(*pts, t)
+            edges = self._edges[t] = nib_edges(p, self.tangent(t), self.nib(t))
+        return edges[0] if self.sign > 0 else edges[1]
 
     def tangent(self, t):
         # The centerline's own direction: both sides and both neighbours of a smooth
@@ -572,6 +587,13 @@ class _Side(object):
             handle = min(max(length(sub(p3, p2)), 0.05*chord), 0.75*chord)
             p2 = sub(p3, mul(center1, handle))
         return ('cubic', (p0, p1, p2, p3))
+
+
+def _side_pair(kind, pts, e0, e1, slant=0.0):
+    """Left and right side of one centerline segment, sharing their samples."""
+    shared = {}
+    return (_Side(kind, pts, e0, e1, 1, slant, shared),
+            _Side(kind, pts, e0, e1, -1, slant, shared))
 
 
 def _nearest_along(samples, curve, window=24):
@@ -1345,7 +1367,7 @@ def _open_vertices(lefts, indices, cap_pieces_end, cap_pieces_start,
 
 def outline_curves(segments, closed=False, cap_start='flat', cap_end='flat',
                    tolerance=FIT_TOLERANCE, italic_angle=0.0, start_angle=0.0, end_angle=0.0,
-                   corner_radii=None, report=None):
+                   corner_radii=None, report=None, edges=None):
     """Return closed contours of ('line'|'cubic', control points) segments.
 
     Each segment is (kind, points, start, end) where start/end is a width or a
@@ -1356,6 +1378,8 @@ def outline_curves(segments, closed=False, cap_start='flat', cap_end='flat',
     radius or a dict (see _corner_spec). `report`, if a list, collects a dict per
     rounded corner: node, which ('outer'|'inner'), corner point, arc midpoint, the
     arc's points p1 c1 c2 p2, the turn angle, both trims and orientation flags.
+    `edges`, if a dict, receives node_edges' result from the same joins, so the
+    editor's width handles cost nothing extra.
     """
     for style in (cap_start, cap_end):
         if style not in CAPS:
@@ -1365,8 +1389,9 @@ def outline_curves(segments, closed=False, cap_start='flat', cap_end='flat',
     for index, (kind, pts, e0, e1) in enumerate(segments):
         if all(length(sub(p, pts[0])) < EPS for p in pts):
             continue  # zero-length segment
-        lefts.append(_Side(kind, pts, e0, e1, 1, slant))
-        rights.append(_Side(kind, pts, e0, e1, -1, slant))
+        left, right = _side_pair(kind, pts, e0, e1, slant)
+        lefts.append(left)
+        rights.append(right)
         widths.append(lefts[-1].extent(1.0))
         indices.append(index)
     if not lefts:
@@ -1392,6 +1417,8 @@ def outline_curves(segments, closed=False, cap_start='flat', cap_end='flat',
         for sides in (lefts, rights):
             for k in range(n):
                 _join(sides[k], sides[(k+1) % n], widths[k])
+        if edges is not None:
+            edges.update(_edge_map(lefts, rights, indices, True))
         for side in lefts + rights:
             _optical_outer_curve(side)
         outer = _side_contour(lefts, widths, True, joined=True)
@@ -1407,6 +1434,8 @@ def outline_curves(segments, closed=False, cap_start='flat', cap_end='flat',
     for sides in (lefts, rights):
         for k in range(len(sides)-1):
             _join(sides[k], sides[k+1], widths[k])
+    if edges is not None:
+        edges.update(_edge_map(lefts, rights, indices, False))
 
     def apply_cap_pair(at_end, center, tangent, style, nib, angle):
         if style not in CUTS and style != 'square':

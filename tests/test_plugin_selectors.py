@@ -55,7 +55,10 @@ class SelectorTests(unittest.TestCase):
         self.assertIn('inspectorViewControllersForLayer_',
                       {item.name for item in provider.body if isinstance(item, ast.FunctionDef)})
         self.assertIn("'GSInspectorViewControllersCallback'", source)
-        self.assertIn('addCallback_forOperation_(self._inspector_provider, INSPECTOR_CALLBACK)', source)
+        # Kept as a fallback (INSPECTOR_MODE_KEY = 'callback'); the SDK hook is the default.
+        self.assertIn('addCallback_forOperation_(self._inspector_provider,', source)
+        self.assertIn('self.inspectorDialogView = None if _inspector_via_callback() else view',
+                      source)
 
     def test_outline_is_built_in_glyphs_prepared_layer(self):
         source = PLUGIN.read_text()
@@ -87,14 +90,22 @@ class SelectorTests(unittest.TestCase):
     def test_panel_has_distinct_on_off_controls(self):
         source = PLUGIN.read_text()
         self.assertIn('InspectorGroup(', source)
-        self.assertIn('PANEL_SIZE = (530, 130)', source)
+        self.assertIn('PANEL_SIZE = (545, 56)', source)
         for control in ('radiusLink', 'tensionLink', 'ratioLink'):
-            self.assertIn('group.' + control + ' = ImageButton(', source)
+            self.assertIn('corner.' + control + ' = ImageButton(', source)
         self.assertIn('setTranslatesAutoresizingMaskIntoConstraints_(False)', source)
         self.assertIn("{'title': 'ON'}, {'title': 'OFF'}", source)
-        self.assertIn('group.startCap = SegmentedButton(', source)
-        self.assertIn('group.endCap = SegmentedButton(', source)
+        self.assertIn('cap.startCap = SegmentedButton(', source)
+        self.assertIn('cap.endCap = SegmentedButton(', source)
         self.assertIn("{'imageObject': _cap_icon(value)", source)
+
+    def test_panel_shows_one_tab_below_the_stroke_row(self):
+        source = PLUGIN.read_text()
+        self.assertIn('group.tabs = SegmentedButton(', source)
+        for tab in ('nodeTab', 'capsTab', 'cornerTab'):
+            self.assertIn('group.' + tab + ' = Group((0, TAB_TOP, -0, 24))', source)
+        self.assertIn("TABS = (('node', 'Node', 'ノード'), ('caps', 'Caps', '線端'), "
+                      "('corner', 'Corners', '角丸'))", source)
 
 
 if __name__ == '__main__':

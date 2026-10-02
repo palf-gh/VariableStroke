@@ -1,8 +1,10 @@
 """Glyphs 3 adapters shared by the editing tool and the export filter."""
 import collections
+import contextlib
 import threading
+import time
 from GlyphsApp import GSPath, GSNode, LINE, CURVE, OFFCURVE
-from variable_stroke_core import outline_curves, node_edges, ellipse_nib_edges, sub
+from variable_stroke_core import outline_curves, ellipse_nib_edges, sub
 
 PATH_KEY = 'com.codex.VariableStroke.enabled'
 # Legacy absolute node width; converted to STROKE_WIDTH_KEY x SCALE_KEY on edit.
@@ -69,17 +71,99 @@ _CACHE_SIZE = 512
 _CACHE_LOCK = threading.Lock()
 
 
+class Profile(object):
+    """Opt-in timings of the work done while editing, summed per section (the
+    tool turns it on, see PROFILE_KEY in its plugin). Thread safe: Glyphs also
+    prepares layers off the main thread."""
+
+    def __init__(self):
+        self.enabled = False
+        self._lock = threading.Lock()
+        self.reset()
+
+    def reset(self):
+        with self._lock:
+            self._stats = {}
+            self._start = time.perf_counter()
+
+    def add(self, name, seconds):
+        with self._lock:
+            count, total = self._stats.get(name, (0, 0.0))
+            self._stats[name] = (count + 1, total + seconds)
+
+    @contextlib.contextmanager
+    def section(self, name):
+        if not self.enabled:
+            yield
+            return
+        start = time.perf_counter()
+        try:
+            yield
+        finally:
+            self.add(name, time.perf_counter() - start)
+
+    def report(self):
+        with self._lock:
+            stats, elapsed = self._stats, time.perf_counter() - self._start
+        self.reset()
+        lines = ['Variable Stroke profile: %.0f ms' % (elapsed * 1000)]
+        for name, (count, total) in sorted(stats.items(), key=lambda item: -item[1][1]):
+            lines.append('  %-34s %6d x %9.1f ms  (%.2f ms each)'
+                         % (name, count, total * 1000, total * 1000 / count))
+        return '\n'.join(lines)
+
+
+PROFILE = Profile()
+
+
 def _cached(key, compute):
     with _CACHE_LOCK:
         if key in _CACHE:
             _CACHE.move_to_end(key)
             return _CACHE[key]
-    value = compute()
+    with PROFILE.section('outline geometry (cache miss)'):
+        value = compute()
     with _CACHE_LOCK:
         _CACHE[key] = value
         while len(_CACHE) > _CACHE_SIZE:
             _CACHE.popitem(last=False)
     return value
+
+
+def node_data(node):
+    """A node's userData as a plain dict, read from Glyphs in one call.
+
+    Every stroke value lives in node userData. Reading it key by key through the
+    GlyphsApp proxy costs a bridge round trip per key, and paths are read again
+    for every redraw while editing, so hot paths read each node once."""
+    try:
+        raw = node.pyobjc_instanceMethods.userData()
+    except AttributeError:
+        return node.userData  # a plain mapping already (detached data, tests)
+    return dict(raw) if raw is not None else {}
+
+
+def path_nodes(path):
+    """[(node, type, (x, y), data)] for every node of a path, read once; `data`
+    (see node_data) only for on-curve nodes, None for handles."""
+    result = []
+    for node in path.nodes:
+        kind = node.type
+        result.append((node, kind, xy(node), node_data(node) if kind != OFFCURVE else None))
+    return result
+
+
+def _on_curve(items, closed):
+    """On-curve entries of path_nodes in segment order (segment i starts at i)."""
+    first = next((i for i, item in enumerate(items) if item[1] != OFFCURVE), None)
+    if first is None:
+        return []
+    ordered = items[first:] + (items[:first] if closed else [])
+    return [item for item in ordered if item[1] != OFFCURVE]
+
+
+def has_live_corners(items):
+    return any(data is not None and corner_on_of(data) for _, _, _, data in items)
 
 
 def enabled(path):
@@ -212,16 +296,25 @@ def stroke_height(path, defaults=None):
     return defaults.height if defaults.height is not None else DEFAULT_WIDTH
 
 
+# Node values come in pairs: `name(node)` for single reads and `name_of(data)`
+# working on node_data, for code that reads whole paths.
+
+def scale_of(data):
+    return _number(data.get(SCALE_KEY, data.get(HEIGHT_SCALE_KEY)), 100.0)
+
+
+def height_scale_of(data):
+    return _number(data.get(HEIGHT_SCALE_KEY, data.get(SCALE_KEY)), 100.0)
+
+
 def scale(node):
     """Width percent; an unset width shares the height percent."""
-    return _number(node.userData.get(SCALE_KEY,
-                   node.userData.get(HEIGHT_SCALE_KEY)), 100.0)
+    return scale_of(node_data(node))
 
 
 def height_scale(node):
     """Height percent; an unset height shares the width percent."""
-    return _number(node.userData.get(HEIGHT_SCALE_KEY,
-                   node.userData.get(SCALE_KEY)), 100.0)
+    return height_scale_of(node_data(node))
 
 
 def set_node_nib_size(node, axis, size, base_width, base_height):
@@ -238,31 +331,42 @@ def set_node_nib_size(node, axis, size, base_width, base_height):
         raise ValueError('Unknown nib axis: ' + str(axis))
 
 
-def offset(node):
-    """Where the centerline sits in the stroke at this node: -100 right .. 100 left."""
+def offset_of(data):
     try:
-        value = float(node.userData.get(OFFSET_KEY, 0.0))
+        value = float(data.get(OFFSET_KEY, 0.0))
     except (TypeError, ValueError):
         return 0.0
     return max(-100.0, min(100.0, value))
 
 
-def rotation(node, default=0.0):
-    """Page angle of this node's ellipse axes, or its master's default."""
+def offset(node):
+    """Where the centerline sits in the stroke at this node: -100 right .. 100 left."""
+    return offset_of(node_data(node))
+
+
+def rotation_of(data, default=0.0):
     try:
-        return float(node.userData.get(ROTATION_KEY, default)) % 180.0
+        return float(data.get(ROTATION_KEY, default)) % 180.0
     except (TypeError, ValueError):
         return default
 
 
-def corner_on(node):
-    data = node.userData
+def rotation(node, default=0.0):
+    """Page angle of this node's ellipse axes, or its master's default."""
+    return rotation_of(node_data(node), default)
+
+
+def corner_on_of(data):
     return bool(data.get(CORNER_ON_KEY, CORNER_KEY in data))
 
 
-def _corner_value(node, key, default):
+def corner_on(node):
+    return corner_on_of(node_data(node))
+
+
+def _corner_value(data, key, default):
     try:
-        value = node.userData.get(key)
+        value = data.get(key)
         return default if value is None else float(value)
     except (TypeError, ValueError):
         return default
@@ -270,23 +374,28 @@ def _corner_value(node, key, default):
 
 def corner_radius(node):
     """Outer live-corner radius at a node, or None when its corners stay sharp."""
-    if not corner_on(node):
+    data = node_data(node)
+    if not corner_on_of(data):
         return None
-    return max(0.0, _corner_value(node, CORNER_KEY, DEFAULT_CORNER_RADIUS))
+    return max(0.0, _corner_value(data, CORNER_KEY, DEFAULT_CORNER_RADIUS))
+
+
+def corner_spec_of(data):
+    if not corner_on_of(data):
+        return None
+    outer = max(0.0, _corner_value(data, CORNER_KEY, DEFAULT_CORNER_RADIUS))
+    tension = _corner_value(data, CORNER_TENSION_KEY, 100.0)
+    ratio = _corner_value(data, CORNER_RATIO_KEY, 100.0)
+    return {'outer': outer, 'inner': max(0.0, _corner_value(data, CORNER_INNER_KEY, outer)),
+            'tension': tension,
+            'inner_tension': _corner_value(data, CORNER_INNER_TENSION_KEY, tension),
+            'ratio': ratio,
+            'inner_ratio': _corner_value(data, CORNER_INNER_RATIO_KEY, ratio)}
 
 
 def corner_spec(node):
     """The node's live corner for the outline code, or None when it is off."""
-    outer = corner_radius(node)
-    if outer is None:
-        return None
-    tension = _corner_value(node, CORNER_TENSION_KEY, 100.0)
-    ratio = _corner_value(node, CORNER_RATIO_KEY, 100.0)
-    return {'outer': outer, 'inner': max(0.0, _corner_value(node, CORNER_INNER_KEY, outer)),
-            'tension': tension,
-            'inner_tension': _corner_value(node, CORNER_INNER_TENSION_KEY, tension),
-            'ratio': ratio,
-            'inner_ratio': _corner_value(node, CORNER_INNER_RATIO_KEY, ratio)}
+    return corner_spec_of(node_data(node))
 
 
 def corner_linked(node, kind):
@@ -305,7 +414,7 @@ def set_corner_linked(node, kind, linked):
                    'tension': 100.0, 'ratio': 100.0}[kind]
         node.userData[second] = (spec or {}).get(
             {'radius': 'inner', 'tension': 'inner_tension', 'ratio': 'inner_ratio'}[kind],
-            _corner_value(node, first, default))
+            _corner_value(node_data(node), first, default))
 
 
 def corner_side_key(node, kind, which):
@@ -314,36 +423,45 @@ def corner_side_key(node, kind, which):
     return second if which == 'inner' and not corner_linked(node, kind) else first
 
 
+def _legacy_width(data):
+    return WIDTH_KEY in data and SCALE_KEY not in data and HEIGHT_SCALE_KEY not in data
+
+
+def _width_of(data, base):
+    if _legacy_width(data):
+        return max(1.0, _number(data.get(WIDTH_KEY), DEFAULT_WIDTH))
+    return max(1.0, base * scale_of(data) / 100.0)
+
+
 def width(node, path=None, base=None):
     """Effective stroke width at an on-curve node."""
-    if SCALE_KEY not in node.userData and HEIGHT_SCALE_KEY not in node.userData \
-            and WIDTH_KEY in node.userData:
-        return max(1.0, _number(node.userData.get(WIDTH_KEY), DEFAULT_WIDTH))
     if base is None:
         base = stroke_width(path) if path is not None else DEFAULT_WIDTH
-    return max(1.0, base * scale(node) / 100.0)
+    return _width_of(node_data(node), base)
+
+
+def nib_of(data, base_width, base_height, default_angle):
+    w = _width_of(data, base_width)
+    h = w * base_height / base_width if _legacy_width(data) else \
+        base_height * height_scale_of(data) / 100.0
+    return (w, max(1.0, h), offset_of(data) / 100.0, rotation_of(data, default_angle))
 
 
 def node_nib(node, path, base_width, base_height, default_angle=None):
     """(width, height, offset fraction, rotation) at an on-curve node."""
-    w = width(node, path, base_width)
-    legacy = WIDTH_KEY in node.userData and SCALE_KEY not in node.userData \
-        and HEIGHT_SCALE_KEY not in node.userData
-    h = w * base_height / base_width if legacy else base_height * height_scale(node) / 100.0
     if default_angle is None:
         default_angle = layer_defaults(getattr(path, 'parent', None)).nib_angle
-    return (w, max(1.0, h),
-            offset(node) / 100.0, rotation(node, default_angle))
+    return nib_of(node_data(node), base_width, base_height, default_angle)
 
 
 def migrate_path(path):
     """Turn legacy absolute node widths into path width + node percentages."""
-    legacy = [node for node in path.nodes if node.type != OFFCURVE
-              and WIDTH_KEY in node.userData and SCALE_KEY not in node.userData
-              and HEIGHT_SCALE_KEY not in node.userData]
+    legacy = [(node, data) for node, _, _, data in path_nodes(path)
+              if data is not None and _legacy_width(data)]
     if not legacy:
         return False
-    widths = [_number(node.userData.get(WIDTH_KEY), DEFAULT_WIDTH) for node in legacy]
+    widths = [_number(data.get(WIDTH_KEY), DEFAULT_WIDTH) for _, data in legacy]
+    legacy = [node for node, _ in legacy]
     if STROKE_WIDTH_KEY not in path.attributes:
         path.attributes[STROKE_WIDTH_KEY] = max(widths)
     base = stroke_width(path)
@@ -356,46 +474,46 @@ def migrate_path(path):
 
 
 def xy(node):
-    return (float(node.position.x), float(node.position.y))
+    position = node.position
+    return (float(position.x), float(position.y))
 
 
-def segments_for_path(path, defaults=None):
-    """Centerline segments with a (width, height, offset) nib at each end."""
-    nodes = list(path.nodes)
-    if not nodes:
-        return []
-    first = next((i for i, n in enumerate(nodes) if n.type != OFFCURVE), None)
+def segments_for_path(path, defaults=None, items=None):
+    """Centerline segments with a (width, height, offset) nib at each end.
+    `items` is the path's path_nodes, when the caller has read them already."""
+    items = path_nodes(path) if items is None else items
+    first = next((i for i, item in enumerate(items) if item[1] != OFFCURVE), None)
     if first is None:
         return []
-    if path.closed:
-        nodes = nodes[first:] + nodes[:first]
-        run = nodes[1:] + [nodes[0]]
-    else:
-        nodes = nodes[first:]
-        run = nodes[1:]
-    start = nodes[0]
-    controls = []
-    result = []
-
     defaults = _resolve(defaults, path)
     base_width = stroke_width(path, defaults)
     base_height = stroke_height(path, defaults)
-
-    def width_at(node):
-        return node_nib(node, path, base_width, base_height, defaults.nib_angle)
-
-    for node in run:
-        if node.type == OFFCURVE:
-            controls.append(node)
+    # (type, point, nib): every on-curve nib once, though it ends one segment
+    # and starts the next.
+    entries = [(kind, point, None if data is None else
+                nib_of(data, base_width, base_height, defaults.nib_angle))
+               for _, kind, point, data in items]
+    if path.closed:
+        entries = entries[first:] + entries[:first]
+        run = entries[1:] + [entries[0]]
+    else:
+        entries = entries[first:]
+        run = entries[1:]
+    start = entries[0]
+    controls = []
+    result = []
+    for entry in run:
+        if entry[0] == OFFCURVE:
+            controls.append(entry[1])
             continue
         if len(controls) == 0:
-            result.append(('line', (xy(start), xy(node)), width_at(start), width_at(node)))
-        elif len(controls) == 2 and node.type == CURVE:
-            result.append(('cubic', (xy(start), xy(controls[0]), xy(controls[1]), xy(node)),
-                           width_at(start), width_at(node)))
+            result.append(('line', (start[1], entry[1]), start[2], entry[2]))
+        elif len(controls) == 2 and entry[0] == CURVE:
+            result.append(('cubic', (start[1], controls[0], controls[1], entry[1]),
+                           start[2], entry[2]))
         else:
             raise ValueError('Only line and cubic path segments are supported')
-        start = node
+        start = entry
         controls = []
     if controls:
         raise ValueError('Path ends with loose off-curve handles')
@@ -404,23 +522,20 @@ def segments_for_path(path, defaults=None):
 
 def _on_curve_nodes(path):
     """On-curve nodes in segment order (segment i starts at node i)."""
-    nodes = list(path.nodes)
-    first = next((i for i, n in enumerate(nodes) if n.type != OFFCURVE), None)
-    if first is None:
-        return []
-    ordered = nodes[first:] + (nodes[:first] if path.closed else [])
-    return [node for node in ordered if node.type != OFFCURVE]
+    return [item[0] for item in _on_curve(path_nodes(path), bool(path.closed))]
 
 
-def selected_nib_nodes(path, selected):
+def selected_nib_nodes(path, selected, items=None):
     """On-curve nodes whose own point or attached Bézier handle is selected."""
-    nodes = list(path.nodes)
+    items = path_nodes(path) if items is None else items
+    nodes = [item[0] for item in items]
+    types = [item[1] for item in items]
     count = len(nodes)
     owners = set()
     for index, node in enumerate(nodes):
         if node not in selected:
             continue
-        if node.type != OFFCURVE:
+        if types[index] != OFFCURVE:
             owners.add(index)
             continue
         for distance in range(1, count):
@@ -431,7 +546,7 @@ def selected_nib_nodes(path, selected):
                 if not path.closed and not 0 <= candidate < count:
                     continue
                 candidate %= count
-                if nodes[candidate].type != OFFCURVE:
+                if types[candidate] != OFFCURVE:
                     owners.add(candidate)
                     break
             else:
@@ -440,37 +555,42 @@ def selected_nib_nodes(path, selected):
     return [node for index, node in enumerate(nodes) if index in owners]
 
 
-def ellipse_cap_nodes(path):
+def ellipse_cap_nodes(path, items=None):
     """Open-path end nodes whose cap is the oriented nib ellipse."""
     if path.closed:
         return []
-    on_curve = _on_curve_nodes(path)
+    start = path.attributes.get(CAP_START_KEY) == 'ellipse'
+    end = path.attributes.get(CAP_END_KEY) == 'ellipse'
+    if not (start or end):
+        return []
+    on_curve = [item[0] for item in _on_curve(path_nodes(path) if items is None else items,
+                                              False)]
     if not on_curve:
         return []
     result = []
-    if path.attributes.get(CAP_START_KEY) == 'ellipse':
+    if start:
         result.append(on_curve[0])
-    if path.attributes.get(CAP_END_KEY) == 'ellipse' and on_curve[-1] not in result:
+    if end and on_curve[-1] not in result:
         result.append(on_curve[-1])
     return result
 
 
-def edges_for_path(path, defaults=None):
+def edges_for_path(path, defaults=None, items=None):
     """[(node, (left, right))] for each on-curve node: where the outline really
-    passes on both sides of it (miter/crossing points at corners)."""
+    passes on both sides of it (miter/crossing points at corners). They come
+    from the same (cached) computation as the outline Glyphs shows."""
     defaults = _resolve(defaults, path)
-    on_curve = _on_curve_nodes(path)
+    items = path_nodes(path) if items is None else items
+    closed = bool(path.closed)
+    on_curve = [item[0] for item in _on_curve(items, closed)]
     if not on_curve:
         return []
-    segments = tuple(segments_for_path(path, defaults))
-    closed = bool(path.closed)
-    edges = _cached(('edges', segments, closed, defaults.italic_angle),
-                    lambda: node_edges(list(segments), closed, defaults.italic_angle))
+    segments, (_, _, edges, _) = _outline(path, defaults, items)
     if segments and not closed:
         first_cap = path.attributes.get(CAP_START_KEY, 'flat')
         last_cap = path.attributes.get(CAP_END_KEY, 'flat')
         if first_cap == 'ellipse' or last_cap == 'ellipse':
-            edges = dict(edges)  # the cached node edges belong to every cap style
+            edges = dict(edges)  # keep the cached result intact
             if first_cap == 'ellipse':
                 _, points, nib, _ = segments[0]
                 edges[0] = ellipse_nib_edges(points[0], sub(points[1], points[0]), nib)
@@ -488,9 +608,10 @@ def cut_angle(path, key):
         return DEFAULT_CUT_ANGLE
 
 
-def _sibling_paths(path):
-    """The same path in the glyph's other layers (masters, brace layers), when
-    compatible: needed so every layer rounds the same corners."""
+def _sibling_paths(path, count):
+    """On-curve path_nodes of the same path in the glyph's other layers (masters,
+    brace layers) with `count` on-curve nodes: needed so every layer rounds the
+    same corners."""
     layer = getattr(path, 'parent', None)
     glyph = getattr(layer, 'parent', None) if layer is not None else None
     if glyph is None:
@@ -501,14 +622,16 @@ def _sibling_paths(path):
         layers = list(glyph.layers)
     except Exception:
         return []
-    count = len(_on_curve_nodes(path))
     result = []
     for other_layer in layers:
         if other_layer == layer:
             continue
         other_paths = list(other_layer.paths)
-        if index < len(other_paths) and len(_on_curve_nodes(other_paths[index])) == count:
-            result.append(other_paths[index])
+        if index < len(other_paths):
+            other = other_paths[index]
+            on_curve = _on_curve(path_nodes(other), bool(other.closed))
+            if len(on_curve) == count:
+                result.append(on_curve)
     return result
 
 
@@ -537,32 +660,33 @@ def note_corner(node):
         pass
 
 
-def corner_specs(path):
+def corner_specs(path, items=None):
     """Live corner per on-curve node. A corner that is on in any other master of
     the glyph gets a zero-size arc here, so masters keep compatible outlines while
     each master switches its corners on or off on its own."""
-    nodes = _on_curve_nodes(path)
-    specs = [corner_spec(node) for node in nodes]
+    items = path_nodes(path) if items is None else items
+    specs = [corner_spec_of(data) for _, _, _, data in _on_curve(items, bool(path.closed))]
     if all(spec is not None for spec in specs) or not _glyph_has_corners(path):
         return specs
     rounded_elsewhere = set()
-    for sibling in _sibling_paths(path):
-        for k, node in enumerate(_on_curve_nodes(sibling)):
-            if corner_on(node):
+    for sibling in _sibling_paths(path, len(specs)):
+        for k, (_, _, _, data) in enumerate(sibling):
+            if corner_on_of(data):
                 rounded_elsewhere.add(k)
     return [spec if spec is not None or k not in rounded_elsewhere else dict(ZERO_CORNER)
             for k, spec in enumerate(specs)]
 
 
-def corner_widgets(path, defaults=None):
+def corner_widgets(path, defaults=None, items=None):
     """One dict per rounded outline corner (see outline_curves' report), with
     'node' set to the GSNode it belongs to."""
+    items = path_nodes(path) if items is None else items
     report = []
     try:
-        curves_for_path(path, defaults, report)
+        curves_for_path(path, defaults, report, items=items)
     except ValueError:
         return []
-    on_curve = _on_curve_nodes(path)
+    on_curve = [item[0] for item in _on_curve(items, bool(path.closed))]
     if not on_curve:
         return []
     for widget in report:
@@ -570,28 +694,57 @@ def corner_widgets(path, defaults=None):
     return report
 
 
-def curves_for_path(path, defaults=None, report=None):
-    defaults = _resolve(defaults, path)
-    segments = tuple(segments_for_path(path, defaults))
-    closed = bool(path.closed)
-    caps = (path.attributes.get(CAP_START_KEY, 'flat'), path.attributes.get(CAP_END_KEY, 'flat'))
-    angles = (cut_angle(path, CAP_START_ANGLE_KEY), cut_angle(path, CAP_END_ANGLE_KEY))
-    corners = corner_specs(path)
-    key = ('curves', segments, closed, caps, angles, defaults.italic_angle,
-           tuple(None if c is None else tuple(sorted(c.items())) for c in corners))
+def _outline(path, defaults, items):
+    """(segments, (contours, corner report, node edges)) of a path, cached by input."""
+    with PROFILE.section('outline inputs (segments, corners)'):
+        segments = tuple(segments_for_path(path, defaults, items))
+        closed = bool(path.closed)
+        attributes = path.attributes
+        caps = (attributes.get(CAP_START_KEY, 'flat'), attributes.get(CAP_END_KEY, 'flat'))
+        angles = (cut_angle(path, CAP_START_ANGLE_KEY), cut_angle(path, CAP_END_ANGLE_KEY))
+        corners = corner_specs(path, items)
+        key = ('curves', segments, closed, caps, angles, defaults.italic_angle,
+               tuple(None if c is None else tuple(sorted(c.items())) for c in corners))
 
     def compute():
-        collected = []
+        collected, edges = [], {}
         contours = outline_curves(list(segments), closed, caps[0], caps[1],
                                   italic_angle=defaults.italic_angle,
                                   start_angle=angles[0], end_angle=angles[1],
-                                  corner_radii=corners, report=collected)
-        return contours, collected
+                                  corner_radii=corners, report=collected, edges=edges)
+        # The last slot keeps the outline as GSPaths once built (see _outline_paths).
+        return [contours, collected, edges, None]
 
-    contours, collected = _cached(key, compute)
+    return segments, _cached(key, compute)
+
+
+def curves_for_path(path, defaults=None, report=None, items=None):
+    defaults = _resolve(defaults, path)
+    items = path_nodes(path) if items is None else items
+    _, (contours, collected, _, _) = _outline(path, defaults, items)
     if report is not None:
         report.extend(dict(widget) for widget in collected)  # callers annotate them
     return contours
+
+
+def _outline_paths(path, defaults, items):
+    """GSPaths of a centerline's outline. Glyphs prepares the whole layer again
+    for every mouse event while a node moves, so the outline of each unchanged
+    stroke is built once and handed out as copies (one call instead of one
+    GSNode per point)."""
+    _, cached = _outline(path, _resolve(defaults, path), items)
+    templates = cached[3]
+    if templates is None:
+        with PROFILE.section('build outline GSPaths'):
+            templates = cached[3] = generated_paths(path, contours=cached[0])
+    if not all(hasattr(template, 'copy') for template in templates):
+        return generated_paths(path, contours=cached[0])  # plain Python paths (tests)
+    with PROFILE.section('copy outline GSPaths'):
+        copies = [template.copy() for template in templates]
+        for copied in copies:
+            if not is_outline(copied):
+                copied.attributes[OUTLINE_KEY] = True
+    return copies
 
 
 def generated_paths(path, defaults=None, contours=None):
@@ -644,11 +797,11 @@ def is_outline(path):
     return bool(path.attributes.get(OUTLINE_KEY))
 
 
-def _valid_structure(path):
+def _valid_structure(path, types=None):
     """Only lines and cubics (two off-curves before a curve node): what
     segments_for_path accepts, checked without computing any widths."""
-    nodes = list(path.nodes)
-    types = [node.type for node in nodes]
+    if types is None:
+        types = [node.type for node in path.nodes]
     if not any(kind != OFFCURVE for kind in types):
         return False
     if path.closed:
@@ -709,8 +862,7 @@ def normalize_layer(layer, state):
         # Corners can arrive by paste; make sure the glyph is known to use them.
         paths = list(layer.paths)
         if paths and not _glyph_has_corners(paths[0]):
-            if any(node.type != OFFCURVE and corner_on(node)
-                   for path in paths for node in path.nodes):
+            if any(has_live_corners(path_nodes(path)) for path in paths):
                 note_corner(paths[0])
     return changed
 
@@ -747,10 +899,14 @@ def _expansion_plan(layer, glyph_on=None, defaults=None):
         return []
     plan = []
     for path in [shape for shape in list(layer.shapes) if isinstance(shape, GSPath)]:
-        if not (_is_centerline(path) and (glyph_on or enabled(path))):
+        if generated(path) or is_outline(path) or not (glyph_on or enabled(path)):
+            continue
+        with PROFILE.section('read nodes (prepare)'):
+            items = path_nodes(path)  # read once for the check and the outline
+        if not items or not _valid_structure(path, [item[1] for item in items]):
             continue
         try:
-            plan.append((path, generated_paths(path, defaults)))
+            plan.append((path, _outline_paths(path, defaults, items)))
         except ValueError:
             continue
     return plan

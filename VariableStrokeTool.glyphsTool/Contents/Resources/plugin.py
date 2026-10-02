@@ -1,6 +1,8 @@
 # encoding: utf-8
 """Variable Stroke editing tool for Glyphs 3."""
+import functools
 import math
+import time
 import traceback
 import objc
 from AppKit import (NSBezierPath, NSColor, NSEvent, NSImage, NSMenu, NSMenuItem, NSObject,
@@ -12,7 +14,7 @@ from GlyphsApp import (Glyphs, GSCallbackHandler, GSCustomParameter, OFFCURVE, D
                        UPDATEINTERFACE, DRAWBACKGROUND, CONTEXTMENUCALLBACK, WINDOW_MENU)
 from GlyphsApp.plugins import SelectTool
 from vanilla import (Window, FloatingWindow, Group, SegmentedButton, TextBox, EditText,
-                     ImageButton, Button, List)
+                     ImageButton, Button, List, HorizontalLine)
 from glyphs_bridge import (CAP_START_KEY, CAP_END_KEY, CAP_START_ANGLE_KEY, CAP_END_ANGLE_KEY,
                            WIDTH_KEY, HEIGHT_SCALE_KEY, CORNER_KEY, CORNER_ON_KEY, CORNER_INNER_KEY,
                            CORNER_TENSION_KEY, CORNER_RATIO_KEY, DEFAULT_CORNER_RADIUS,
@@ -30,8 +32,10 @@ from glyphs_bridge import (CAP_START_KEY, CAP_END_KEY, CAP_START_ANGLE_KEY, CAP_
                            LAYER_NIB_ANGLE_KEY, master_default_height, master_default_angle,
                            master_defaults,
                            layer_defaults, stroke_height, has_height_override, offset, rotation,
-                           edges_for_path, node_nib, selected_nib_nodes, ellipse_cap_nodes,
-                           set_node_nib_size)
+                           edges_for_path, selected_nib_nodes, ellipse_cap_nodes,
+                           set_node_nib_size, path_nodes, PROFILE, LAYER_STATE_KEY, has_live_corners, nib_of,
+                           scale_of, height_scale_of, offset_of, rotation_of,
+                           corner_on_of, corner_spec_of)
 from variable_stroke_core import (unit, sub, add, length, outline_curves,
                                   nib_edges, ellipse_nib_edges)
 
@@ -44,8 +48,40 @@ CAP_VALUES = [item[0] for item in CAP_NAMES]
 # Callback names from GlyphsCore/GSCallbackHandler.h: the inspector strip and the
 # outline preparation hooks.
 INSPECTOR_CALLBACK = 'GSInspectorViewControllersCallback'
+# Glyphs.defaults[PROFILE_KEY] = True (Macro panel) prints where the time of each
+# drag on the canvas went, after the mouse is released.
+PROFILE_KEY = 'com.codex.VariableStroke.profile'
+# Diagnostics while profiling: a comma-separated list of 'nohandles' (no handles
+# while nodes move) and 'noinspector' (the tool shows no panel at all).
+EXPERIMENT_KEY = 'com.codex.VariableStroke.experiment'
+# The panel is the tool's own inspector (the SDK's view() hook). Set this to
+# 'callback' to deliver it through INSPECTOR_CALLBACK instead, as earlier builds
+# did; Glyphs rebuilt that strip during node drags, stalling 100-250 ms each time.
+INSPECTOR_MODE_KEY = 'com.codex.VariableStroke.inspectorMode'
+
+
+def _inspector_via_callback():
+    try:
+        return str(Glyphs.defaults[INSPECTOR_MODE_KEY] or '') == 'callback'
+    except Exception:
+        return False
 PREPARE_LAYER_CALLBACK = 'GSPrepareLayerCallback'
-PANEL_SIZE = (530, 130)
+PANEL_SIZE = (545, 56)
+TAB_TOP = 32  # the tab row, below the stroke row
+TABS = (('node', 'Node', 'ノード'), ('caps', 'Caps', '線端'), ('corner', 'Corners', '角丸'))
+TAB_NAMES = [item[0] for item in TABS]
+TAB_DEFAULTS_KEY = 'com.codex.VariableStroke.inspectorTab'
+
+
+def _timed(name):
+    """Count a Python-only method's time in PROFILE (not for Objective-C methods)."""
+    def decorate(function):
+        @functools.wraps(function)
+        def timed(*args, **kwargs):
+            with PROFILE.section(name):
+                return function(*args, **kwargs)
+        return timed
+    return decorate
 
 
 def _loc(english, japanese):
@@ -81,29 +117,36 @@ def _invalidate(layer, paths=None):
 
 
 def _cap_icon(style):
-    """Template icon drawn with the real outline code: a diagonal stroke ending in `style`."""
+    """Template icon drawn with the real outline code: a diagonal stroke ending in `style`.
+
+    AppKit runs the drawing handler on every redraw of the inspector (which Glyphs
+    does while nodes move), so the outline is computed once, here, not there."""
+    start, end = (-4.0, -3.0), (11.0, 8.0)
+    nib = (7.0, 13.0, 0.0, 0.0) if style == 'ellipse' else 7.0
+    contours = outline_curves([('line', (start, end), nib, nib)], False, 'flat', style,
+                              end_angle=160.0)
+
     def draw(rect):
-        start, end = (-4.0, -3.0), (11.0, 8.0)
-        body = NSBezierPath.bezierPath()
-        nib = (7.0, 13.0, 0.0, 0.0) if style == 'ellipse' else 7.0
-        for contour in outline_curves([('line', (start, end), nib, nib)], False, 'flat', style,
-                                      end_angle=160.0):
-            body.moveToPoint_(contour[0][1][0])
-            for kind, points in contour:
-                if kind == 'cubic':
-                    body.curveToPoint_controlPoint1_controlPoint2_(points[3], points[1], points[2])
-                else:
-                    body.lineToPoint_(points[1])
-            body.closePath()
-        NSColor.colorWithCalibratedWhite_alpha_(0.0, 0.45).set()
-        body.fill()
-        NSColor.blackColor().set()
-        center = NSBezierPath.bezierPath()
-        center.moveToPoint_(start)
-        center.lineToPoint_(end)
-        center.setLineWidth_(1.0)
-        center.stroke()
-        NSBezierPath.bezierPathWithOvalInRect_(((end[0]-1.6, end[1]-1.6), (3.2, 3.2))).fill()
+        with PROFILE.section('draw cap icon'):
+            body = NSBezierPath.bezierPath()
+            for contour in contours:
+                body.moveToPoint_(contour[0][1][0])
+                for kind, points in contour:
+                    if kind == 'cubic':
+                        body.curveToPoint_controlPoint1_controlPoint2_(points[3], points[1],
+                                                                       points[2])
+                    else:
+                        body.lineToPoint_(points[1])
+                body.closePath()
+            NSColor.colorWithCalibratedWhite_alpha_(0.0, 0.45).set()
+            body.fill()
+            NSColor.blackColor().set()
+            center = NSBezierPath.bezierPath()
+            center.moveToPoint_(start)
+            center.lineToPoint_(end)
+            center.setLineWidth_(1.0)
+            center.stroke()
+            NSBezierPath.bezierPathWithOvalInRect_(((end[0]-1.6, end[1]-1.6), (3.2, 3.2))).fill()
         return True
     image = NSImage.imageWithSize_flipped_drawingHandler_((18, 14), False, draw)
     image.setTemplate_(True)
@@ -178,6 +221,18 @@ def _glyph_state(layer):
     return layer_state(layer)
 
 
+def _layer_shape(layer):
+    """What decides whether normalize_layer has anything to do: the glyph state
+    and each path's identity, node count and stroke flag."""
+    try:
+        state = glyph_enabled(layer.parent)
+        return (objc.pyobjc_id(layer), state,
+                tuple((objc.pyobjc_id(path), len(path.nodes), enabled(path))
+                      for path in layer.paths))
+    except Exception:
+        return None
+
+
 def _normalize_quietly(layer):
     """Sync path flags with the (real, edited) glyph's state without an undo step."""
     try:
@@ -211,6 +266,11 @@ CORNER_FIELDS = {'radius': CORNER_KEY, 'innerRadius': CORNER_INNER_KEY,
                  'tension': CORNER_TENSION_KEY, 'innerTension': CORNER_INNER_TENSION_KEY,
                  'ratio': CORNER_RATIO_KEY, 'innerRatio': CORNER_INNER_RATIO_KEY}
 NODE_FIELDS = ('scale', 'heightScale', 'offset', 'rotation') + tuple(CORNER_FIELDS)
+
+
+def _same(values):
+    """True when every value is set and (nearly) equal, so one number can show."""
+    return bool(values) and all(v is not None and abs(v-values[0]) < 0.001 for v in values)
 
 
 def _corner_color(which):
@@ -359,6 +419,8 @@ class VariableStrokeLayerProcessor(NSObject):
 
     @objc.signature(b'Z@:@@o^@')
     def processLayer_extraHandles_error_(self, layer, extraHandles, error):
+        start = time.perf_counter() if PROFILE.enabled else None
+        name = 'prepare layer: no strokes'
         try:
             # Glyphs also prepares layers for other plugins, sometimes off the main
             # thread (e.g. a reporter building paths in a worker thread). Leave
@@ -379,9 +441,16 @@ class VariableStrokeLayerProcessor(NSObject):
             nib_angle = layer.userData.get(LAYER_NIB_ANGLE_KEY)
             if nib_angle is not None:
                 defaults.nib_angle = float(nib_angle)
+            if start is not None:
+                name = 'prepare layer: %s, %s thread' % (
+                    'instance' if layer.userData.get(LAYER_STATE_KEY) is not None else 'master',
+                    'main' if NSThread.isMainThread() else 'background')
             expand_layer(layer, state, defaults)
         except Exception:
             print(traceback.format_exc())
+        finally:
+            if start is not None:
+                PROFILE.add(name, time.perf_counter() - start)
         return True, None
 
     @objc.signature(b'Z@:@@@o^@')
@@ -389,7 +458,8 @@ class VariableStrokeLayerProcessor(NSObject):
         # Instances in the preview, interpolation previews, virtual masters: carry
         # the ON state, stroke settings and blended values onto the new layer.
         try:
-            interpolate_layer(layer, glyph, interpolation)
+            with PROFILE.section('interpolate layer'):
+                interpolate_layer(layer, glyph, interpolation)
         except Exception:
             print(traceback.format_exc())
         return True, None
@@ -489,8 +559,15 @@ class VariableStrokeInspectorProvider(NSObject):
     def inspectorViewControllersForLayer_(self, layer):
         if not self._tool._is_current():
             return []
-        self._tool._last_ui_state = None
-        self._tool._refresh_ui()
+        try:
+            if 'noinspector' in str(Glyphs.defaults[EXPERIMENT_KEY] or ''):
+                return []
+        except Exception:
+            pass
+        with PROFILE.section('inspector callback'):
+            if not self._tool._moving_nodes:  # moving nodes changes no shown value
+                self._tool._last_ui_state = None
+                self._tool._refresh_ui()
         return [self._controller]
 
     def showSettings_(self, sender):
@@ -655,12 +732,23 @@ class VariableStrokeTool(SelectTool):
         self._menu_callback = VariableStrokeContextMenu.new()
         self._layer_processor = VariableStrokeLayerProcessor.new()
         self._settings = None
+        self._refresh_pending = False
+        self._moving_nodes = False  # a plain node drag is in progress
+        self._frame_profile, self._frame_last, self._frame_times = False, None, []
+        self._normalized = None  # what _normalize_quietly last saw (see _on_update)
+        try:
+            self._tab = str(Glyphs.defaults[TAB_DEFAULTS_KEY] or 'node')
+        except Exception:
+            self._tab = 'node'
+        if self._tab not in TAB_NAMES:
+            self._tab = 'node'
         self._build_inspector()
         self._inspector_provider = VariableStrokeInspectorProvider.alloc().initWithTool_(self)
 
     @objc.python_method
     def _build_inspector(self):
-        # Four sections in five rows: stroke, node, caps, corner headings, values.
+        # The stroke row (ON/OFF, width, height) stays; below it one tab at a time:
+        # node values, caps or corners.
         width_px, height_px = PANEL_SIZE
         self.infoBoxWindow = Window((width_px, height_px))
         group = self.infoBoxWindow.group = InspectorGroup((0, 0, width_px, height_px))
@@ -672,21 +760,64 @@ class VariableStrokeTool(SelectTool):
         group.heightField = SteppingEditText((174, 4, 42, 19), sizeStyle='small')
         group.widthReset = ImageButton((218, 5, 17, 17), imageNamed='NSRefreshTemplate',
                                        bordered=False, callback=self.resetWidthFromInspector_)
-        group.settings = ImageButton((508, 5, 17, 17), imageNamed='NSActionTemplate',
+        group.tabs = SegmentedButton((width_px - 241, 4, 210, 20),
+                                     [{'title': _loc(english, japanese)}
+                                      for _, english, japanese in TABS],
+                                     callback=self.tabFromInspector_, sizeStyle='small')
+        group.settings = ImageButton((width_px - 23, 5, 17, 17), imageNamed='NSActionTemplate',
                                      bordered=False, callback=self.showSettingsFromInspector_)
-        group.nodeLabel = TextBox((6, 34, 39, 14), _loc('Node', 'ノード'), sizeStyle='small')
-        group.scaleLabel = TextBox((52, 34, 24, 14), _loc('W', '幅'), sizeStyle='small')
-        group.scaleField = SteppingEditText((77, 30, 43, 19), sizeStyle='small')
-        group.scaleUnit = TextBox((122, 34, 12, 14), '%', sizeStyle='small')
-        group.heightScaleLabel = TextBox((147, 34, 24, 14), _loc('H', '高'), sizeStyle='small')
-        group.heightScaleField = SteppingEditText((172, 30, 43, 19), sizeStyle='small')
-        group.heightScaleUnit = TextBox((217, 34, 12, 14), '%', sizeStyle='small')
-        group.offsetLabel = TextBox((246, 34, 30, 14), _loc('Pos', '位置'), sizeStyle='small')
-        group.offsetField = SteppingEditText((277, 30, 43, 19), sizeStyle='small')
-        group.offsetUnit = TextBox((322, 34, 12, 14), '%', sizeStyle='small')
-        group.rotationLabel = TextBox((352, 34, 33, 14), _loc('Ang', '角度'), sizeStyle='small')
-        group.rotationField = SteppingEditText((387, 30, 43, 19), sizeStyle='small')
-        group.rotationUnit = TextBox((432, 34, 7, 14), '°', sizeStyle='small')
+        group.divider = HorizontalLine((6, 28, -6, 1))
+
+        node = group.nodeTab = Group((0, TAB_TOP, -0, 24))
+        node.scaleLabel = TextBox((6, 4, 24, 14), _loc('W', '幅'), sizeStyle='small')
+        node.scaleField = SteppingEditText((31, 0, 43, 19), sizeStyle='small')
+        node.scaleUnit = TextBox((76, 4, 12, 14), '%', sizeStyle='small')
+        node.heightScaleLabel = TextBox((100, 4, 24, 14), _loc('H', '高'), sizeStyle='small')
+        node.heightScaleField = SteppingEditText((125, 0, 43, 19), sizeStyle='small')
+        node.heightScaleUnit = TextBox((170, 4, 12, 14), '%', sizeStyle='small')
+        node.offsetLabel = TextBox((196, 4, 30, 14), _loc('Pos', '位置'), sizeStyle='small')
+        node.offsetField = SteppingEditText((227, 0, 43, 19), sizeStyle='small')
+        node.offsetUnit = TextBox((272, 4, 12, 14), '%', sizeStyle='small')
+        node.rotationLabel = TextBox((296, 4, 33, 14), _loc('Ang', '角度'), sizeStyle='small')
+        node.rotationField = SteppingEditText((331, 0, 43, 19), sizeStyle='small')
+        node.rotationUnit = TextBox((376, 4, 7, 14), '°', sizeStyle='small')
+
+        caps = [{'imageObject': _cap_icon(value), 'width': 21} for value in CAP_VALUES]
+        cap = group.capsTab = Group((0, TAB_TOP, -0, 24))
+        cap.startLabel = TextBox((6, 4, 30, 14), _loc('Start', '始点'), sizeStyle='small')
+        cap.startCap = SegmentedButton((36, 0, 147, 20), caps,
+                                       callback=self.startCapFromInspector_, sizeStyle='small')
+        cap.startAngle = SteppingEditText((187, 0, 36, 19), sizeStyle='small')
+        cap.startAngleUnit = TextBox((225, 4, 10, 14), '°', sizeStyle='small')
+        cap.endLabel = TextBox((254, 4, 30, 14), _loc('End', '終点'), sizeStyle='small')
+        cap.endCap = SegmentedButton((284, 0, 147, 20), caps,
+                                     callback=self.endCapFromInspector_, sizeStyle='small')
+        cap.endAngle = SteppingEditText((435, 0, 36, 19), sizeStyle='small')
+        cap.endAngleUnit = TextBox((473, 4, 10, 14), '°', sizeStyle='small')
+
+        corner = group.cornerTab = Group((0, TAB_TOP, -0, 24))
+        corner.toggle = SegmentedButton((6, 0, 64, 20), [{'title': 'ON'}, {'title': 'OFF'}],
+                                        callback=self.cornerToggleFromInspector_,
+                                        sizeStyle='small')
+        # Every pair below is (outer, inner), or (left, right) at path ends.
+        corner.sides = TextBox((76, 4, 44, 14), '', sizeStyle='small')
+        corner.radiusLabel = TextBox((122, 4, 36, 14), _loc('Radius', '半径'), sizeStyle='small')
+        corner.outerField = SteppingEditText((158, 0, 36, 19), sizeStyle='small')
+        corner.innerField = SteppingEditText((196, 0, 36, 19), sizeStyle='small')
+        corner.radiusLink = ImageButton((233, 0, 18, 19), imageObject=_link_icon(True),
+                                        bordered=False, callback=self.radiusLinkFromInspector_)
+        corner.tensionLabel = TextBox((259, 4, 46, 14), _loc('Strength', '強さ'),
+                                      sizeStyle='small')
+        corner.tensionField = SteppingEditText((305, 0, 36, 19), sizeStyle='small')
+        corner.innerTensionField = SteppingEditText((343, 0, 36, 19), sizeStyle='small')
+        corner.tensionLink = ImageButton((380, 0, 18, 19), imageObject=_link_icon(True),
+                                         bordered=False, callback=self.tensionLinkFromInspector_)
+        corner.ratioLabel = TextBox((406, 4, 38, 14), _loc('Ratio', '縦横比'), sizeStyle='small')
+        corner.ratioField = SteppingEditText((444, 0, 36, 19), sizeStyle='small')
+        corner.innerRatioField = SteppingEditText((482, 0, 36, 19), sizeStyle='small')
+        corner.ratioLink = ImageButton((519, 0, 18, 19), imageObject=_link_icon(True),
+                                       bordered=False, callback=self.ratioLinkFromInspector_)
+
         group.widthReset.getNSButton().setToolTip_(
             _loc('Follow the master default width and height', 'マスターの既定の幅・高さに戻す'))
         group.settings.getNSButton().setToolTip_(
@@ -696,106 +827,64 @@ class VariableStrokeTool(SelectTool):
                  'Grey: follows the master default.',
                  'パスの高さ（横線の太さ）。'
                  'グレー表示はマスターの既定値に従っています。'))
-        group.offsetField.getNSTextField().setToolTip_(
+        group.widthField.getNSTextField().setToolTip_(
+            _loc('Stroke width of the path (thickness of vertical strokes). '
+                 'Grey: follows the master default.',
+                 'パスの幅（縦線の太さ）。グレー表示はマスターの既定値に従っています。'))
+        node.scaleField.getNSTextField().setToolTip_(
+            _loc('Selected node width %. Empty shares the height %; both empty = 100%.',
+                 '選択ノードの幅％。空欄なら高さ％と共通。両方空欄なら100％。'))
+        node.heightScaleField.getNSTextField().setToolTip_(
+            _loc('Selected node height %. Empty shares the width %.',
+                 '選択ノードの高さ％。空欄なら幅％と共通。'))
+        node.offsetField.getNSTextField().setToolTip_(
             _loc('Where the centerline sits in the stroke at the selected nodes: 0 centre, '
                  '100 stroke on the left, -100 on the right (of the path direction). '
                  'Option-drag a handle to move one side only.',
                  '選択ノードでの中心線の位置：0 で中央、100 で線幅がパスの進行方向の左側、'
                  '−100 で右側。ハンドルを Option ドラッグすると片側だけ動かせます。'))
-        group.rotationField.getNSTextField().setToolTip_(
+        node.rotationField.getNSTextField().setToolTip_(
             _loc('Page angle of the width and height axes. Grey follows the master default. '
                  'Drag the purple ellipse handle on the canvas.',
                  '幅と高さの軸のページ上の角度。グレー表示はマスターの既定値。'
                  'キャンバスの紫ハンドルでも回転できます。'))
-        caps = [{'imageObject': _cap_icon(value), 'width': 21} for value in CAP_VALUES]
-        group.startLabel = TextBox((6, 59, 30, 14), _loc('Start', '始点'), sizeStyle='small')
-        group.startCap = SegmentedButton((36, 55, 147, 20), caps,
-                                         callback=self.startCapFromInspector_, sizeStyle='small')
-        group.startAngle = SteppingEditText((187, 55, 36, 19), sizeStyle='small')
-        group.startAngleUnit = TextBox((225, 59, 10, 14), '°', sizeStyle='small')
-        group.endLabel = TextBox((254, 59, 30, 14), _loc('End', '終点'), sizeStyle='small')
-        group.endCap = SegmentedButton((284, 55, 147, 20), caps,
-                                       callback=self.endCapFromInspector_, sizeStyle='small')
-        group.endAngle = SteppingEditText((435, 55, 36, 19), sizeStyle='small')
-        group.endAngleUnit = TextBox((473, 59, 10, 14), '°', sizeStyle='small')
-        group.cornerLabel = TextBox((6, 87, 30, 14), _loc('Corner', '角丸'), sizeStyle='small')
-        group.cornerToggle = SegmentedButton((36, 83, 64, 20), [{'title': 'ON'}, {'title': 'OFF'}],
-                                             callback=self.cornerToggleFromInspector_,
-                                             sizeStyle='small')
-        group.radiusLabel = TextBox((105, 86, 130, 14), _loc('Radius', '半径'), sizeStyle='small')
-        group.tensionLabel = TextBox((246, 86, 130, 14), _loc('Strength', '強さ'), sizeStyle='small')
-        group.ratioLabel = TextBox((387, 86, 130, 14), _loc('Ratio', '縦横比'), sizeStyle='small')
-        group.outerLabel = TextBox((105, 111, 17, 14), _loc('Out', '外'), sizeStyle='small')
-        group.outerField = SteppingEditText((123, 107, 38, 19), sizeStyle='small')
-        group.innerLabel = TextBox((164, 111, 17, 14), _loc('In', '内'), sizeStyle='small')
-        group.innerField = SteppingEditText((182, 107, 38, 19), sizeStyle='small')
-        group.radiusLink = ImageButton((222, 107, 20, 19), imageObject=_link_icon(True),
-                                       bordered=False, callback=self.radiusLinkFromInspector_)
-        group.tensionOuterLabel = TextBox((246, 111, 17, 14), _loc('Out', '外'), sizeStyle='small')
-        group.tensionField = SteppingEditText((264, 107, 38, 19), sizeStyle='small')
-        group.tensionInnerLabel = TextBox((305, 111, 17, 14), _loc('In', '内'), sizeStyle='small')
-        group.innerTensionField = SteppingEditText((323, 107, 38, 19), sizeStyle='small')
-        group.tensionLink = ImageButton((363, 107, 20, 19), imageObject=_link_icon(True),
-                                        bordered=False, callback=self.tensionLinkFromInspector_)
-        group.ratioOuterLabel = TextBox((387, 111, 17, 14), _loc('Out', '外'), sizeStyle='small')
-        group.ratioField = SteppingEditText((405, 107, 38, 19), sizeStyle='small')
-        group.ratioInnerLabel = TextBox((446, 111, 17, 14), _loc('In', '内'), sizeStyle='small')
-        group.innerRatioField = SteppingEditText((464, 107, 38, 19), sizeStyle='small')
-        group.ratioLink = ImageButton((504, 107, 20, 19), imageObject=_link_icon(True),
-                                      bordered=False, callback=self.ratioLinkFromInspector_)
-        for button, english, japanese in (
-                (group.radiusLink, 'Link or separate the two corner radii', '両側の半径の連動を切り替え'),
-                (group.tensionLink, 'Link or separate the two curve strengths', '両側の強さの連動を切り替え'),
-                (group.ratioLink, 'Link or separate the two aspect ratios', '両側の縦横比の連動を切り替え')):
-            button.getNSButton().setToolTip_(_loc(english, japanese))
-        for field, english, japanese in (
-                (group.outerField, 'Radius of the outer corner at the selected nodes (also the '
-                 'cap corners at ends). Drag the orange handle on the canvas.',
-                 '選択ノードの外側の角丸の半径（端点では線端の角）。キャンバスのオレンジのハンドルでも調整できます'),
-                (group.innerField, 'Radius of the inner corner (defaults to the outer radius). '
-                 'Drag the green handle on the canvas.',
-                 '内側の角丸の半径（未指定なら外側と同じ）。キャンバスの緑のハンドルでも調整できます'),
-                (group.tensionField, 'Curve strength: 100 = circular arc, lower = tighter, '
-                 'higher = squarer', 'カーブの強さ：100 で円弧、小さいほど尖り、大きいほど角張ります'),
-                (group.innerTensionField, 'Inner or right curve strength when unlinked',
-                 'リンク解除時の内側または右側の強さ'),
-                (group.ratioField, 'Aspect ratio: 100 = symmetric; above 100 the rounding runs '
-                 'further along the side before the node (path direction)',
-                 '縦横比：100 で対称。大きいほどパスの進行方向の手前側に長く、小さいほど先側に長く丸めます'),
-                (group.innerRatioField, 'Inner or right aspect ratio when unlinked',
-                 'リンク解除時の内側または右側の縦横比')):
-            field.getNSTextField().setToolTip_(_loc(english, japanese))
-        for field in (group.startAngle, group.endAngle):
+        for field in (cap.startAngle, cap.endAngle):
             field.getNSTextField().setToolTip_(_loc(
                 'Cut angle on the page (0 horizontal, 90 vertical); typing one selects the angle cut',
                 'カットの角度（ページ上、0 で水平、90 で垂直）。入力すると角度カットになります'))
-        for control in (group.startCap, group.endCap):
+        for control in (cap.startCap, cap.endCap):
             segmented = control.getNSSegmentedButton()
             for index, (_, english, japanese) in enumerate(CAP_NAMES):
                 segmented.setToolTip_forSegment_(_loc(english, japanese), index)
-        group.widthField.getNSTextField().setToolTip_(
-            _loc('Stroke width of the path (thickness of vertical strokes). '
-                 'Grey: follows the master default.',
-                 'パスの幅（縦線の太さ）。グレー表示はマスターの既定値に従っています。'))
-        group.scaleField.getNSTextField().setToolTip_(
-            _loc('Selected node width %. Empty shares the height %; both empty = 100%.',
-                 '選択ノードの幅％。空欄なら高さ％と共通。両方空欄なら100％。'))
-        group.heightScaleField.getNSTextField().setToolTip_(
-            _loc('Selected node height %. Empty shares the width %.',
-                 '選択ノードの高さ％。空欄なら幅％と共通。'))
+        for field, english, japanese in (
+                (corner.outerField, 'Radius of the outer corner at the selected nodes (also the '
+                 'cap corners at ends). Drag the orange handle on the canvas.',
+                 '選択ノードの外側の角丸の半径（端点では線端の角）。キャンバスのオレンジのハンドルでも調整できます'),
+                (corner.innerField, 'Radius of the inner corner (defaults to the outer radius). '
+                 'Drag the green handle on the canvas.',
+                 '内側の角丸の半径（未指定なら外側と同じ）。キャンバスの緑のハンドルでも調整できます'),
+                (corner.tensionField, 'Curve strength: 100 = circular arc, lower = tighter, '
+                 'higher = squarer', 'カーブの強さ：100 で円弧、小さいほど尖り、大きいほど角張ります'),
+                (corner.innerTensionField, 'Inner or right curve strength when unlinked',
+                 'リンク解除時の内側または右側の強さ'),
+                (corner.ratioField, 'Aspect ratio: 100 = symmetric; above 100 the rounding runs '
+                 'further along the side before the node (path direction)',
+                 '縦横比：100 で対称。大きいほどパスの進行方向の手前側に長く、小さいほど先側に長く丸めます'),
+                (corner.innerRatioField, 'Inner or right aspect ratio when unlinked',
+                 'リンク解除時の内側または右側の縦横比')):
+            field.getNSTextField().setToolTip_(_loc(english, japanese))
         group.enableStroke.set(1)
         # Numeric fields: live preview while typing, Tab / Shift-Tab between them.
         self._field_delegates = []
         self._shown = {}  # text each field showed after the last refresh
+        # Hidden tabs drop out of the Tab key loop by themselves.
         fields = [('width', group.widthField), ('height', group.heightField),
-                  ('scale', group.scaleField), ('heightScale', group.heightScaleField),
-                  ('offset', group.offsetField),
-                  ('rotation', group.rotationField),
-
-                  ('startAngle', group.startAngle), ('endAngle', group.endAngle),
-                  ('radius', group.outerField), ('innerRadius', group.innerField),
-                  ('tension', group.tensionField), ('innerTension', group.innerTensionField),
-                  ('ratio', group.ratioField), ('innerRatio', group.innerRatioField)]
+                  ('scale', node.scaleField), ('heightScale', node.heightScaleField),
+                  ('offset', node.offsetField), ('rotation', node.rotationField),
+                  ('startAngle', cap.startAngle), ('endAngle', cap.endAngle),
+                  ('radius', corner.outerField), ('innerRadius', corner.innerField),
+                  ('tension', corner.tensionField), ('innerTension', corner.innerTensionField),
+                  ('ratio', corner.ratioField), ('innerRatio', corner.innerRatioField)]
         self._fields = dict(fields)
         for name, field in fields:
             delegate = VariableStrokeFieldDelegate.alloc().initWithTool_name_(self, name)
@@ -806,6 +895,7 @@ class VariableStrokeTool(SelectTool):
             text_field.setAction_('stepped:')
         for (_, field), (_, following) in zip(fields, fields[1:] + fields[:1]):
             field.getNSTextField().setNextKeyView_(following.getNSTextField())
+        self._show_tab(self._tab)
         view = group.getNSView()
         # Glyphs lays the strip out with Auto Layout. A frame-only view collapses to
         # zero size there, which is why the panel never appeared; pin its size.
@@ -814,8 +904,7 @@ class VariableStrokeTool(SelectTool):
         view.widthAnchor().constraintEqualToConstant_(width_px).setActive_(True)
         view.heightAnchor().constraintEqualToConstant_(height_px).setActive_(True)
         self.infoBoxView = view
-        # The panel is delivered through INSPECTOR_CALLBACK, not the SDK's view() hook.
-        self.inspectorDialogView = None
+        self.inspectorDialogView = None if _inspector_via_callback() else view
 
     @objc.python_method
     def start(self):
@@ -823,7 +912,9 @@ class VariableStrokeTool(SelectTool):
         Glyphs.addCallback(self._on_update, UPDATEINTERFACE)
         Glyphs.addCallback(self._draw_centerlines, DRAWBACKGROUND)
         GSCallbackHandler.addCallback_forOperation_(self._menu_callback, CONTEXTMENUCALLBACK)
-        GSCallbackHandler.addCallback_forOperation_(self._inspector_provider, INSPECTOR_CALLBACK)
+        if _inspector_via_callback():
+            GSCallbackHandler.addCallback_forOperation_(self._inspector_provider,
+                                                        INSPECTOR_CALLBACK)
         GSCallbackHandler.addCallback_forOperation_(self._layer_processor, PREPARE_LAYER_CALLBACK)
         item = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
             _loc('Variable Stroke Settings…', '可変ストローク設定…'), 'showSettings:', '')
@@ -837,12 +928,13 @@ class VariableStrokeTool(SelectTool):
     def activate(self):
         self._is_active = True
         self._last_ui_state = None
-        self._sync_export()
+        self._sync_export()  # also fills the panel (_refresh_ui)
         self._inspector_provider.performSelector_withObject_afterDelay_('reloadInspector:', None, 0.0)
 
     @objc.python_method
     def deactivate(self):
         self._is_active = False
+        self._moving_nodes = False
         self._inspector_provider.performSelector_withObject_afterDelay_('reloadInspector:', None, 0.0)
 
     @objc.python_method
@@ -881,26 +973,94 @@ class VariableStrokeTool(SelectTool):
         self._show_settings()
 
     @objc.python_method
+    def _show_tab(self, name):
+        group = self.infoBoxWindow.group
+        for tab, view in (('node', group.nodeTab), ('caps', group.capsTab),
+                          ('corner', group.cornerTab)):
+            view.show(tab == name)
+        group.tabs.set(TAB_NAMES.index(name))
+
+    @objc.python_method
+    def _select_tab(self, name):
+        """Show tab `name`, also when a canvas handle of that kind is grabbed."""
+        if name == self._tab:
+            return
+        self._tab = name
+        try:
+            Glyphs.defaults[TAB_DEFAULTS_KEY] = name
+        except Exception:
+            pass
+        self._show_tab(name)
+        self._last_ui_state = None
+        self._refresh_ui()
+
+    def tabFromInspector_(self, sender):
+        if 0 <= sender.get() < len(TAB_NAMES):
+            self._select_tab(TAB_NAMES[sender.get()])
+
+    @objc.python_method
+    def _frame_tick(self):
+        """With profiling on, time edit view draws while the mouse button is down,
+        whichever tool is active (this callback draws for every tool), and print
+        the result once it is released: a baseline to compare tools."""
+        if not self._frame_profile:
+            return
+        now = time.perf_counter()
+        if NSEvent.pressedMouseButtons() & 1:
+            if self._frame_last is not None and now - self._frame_last > 0.0005:
+                self._frame_times.append(now - self._frame_last)
+            self._frame_last = now
+            return
+        self._frame_last = None
+        times, self._frame_times = self._frame_times, []
+        if len(times) >= 3:
+            try:
+                tool = Glyphs.font.tool
+            except Exception:
+                tool = '?'
+            times.sort()
+            print('Frame timing (%s): %d draws, average %.1f ms, median %.1f ms, slowest %.1f ms'
+                  % (tool, len(times), sum(times) / len(times) * 1000,
+                     times[len(times) // 2] * 1000, times[-1] * 1000))
+
+    @objc.python_method
+    @_timed('update callback')
     def _on_update(self, notification=None):
+        try:
+            self._frame_profile = bool(Glyphs.defaults[PROFILE_KEY])
+        except Exception:
+            self._frame_profile = False
         # Runs after every edit with any tool: new paths in an ON glyph become
         # strokes, pasted strokes in an OFF glyph stop being strokes.
         # This tool already invalidates its edited path during a drag. A full
         # layer scan and inspector refresh on every mouse event stalls drawing.
-        if getattr(self, '_drag', None) is not None:
-            return
+        if getattr(self, '_drag', None) is not None or self._moving_nodes:
+            return  # mouseUp_ catches up once
         if not self._normalizing:
             self._normalizing = True
             try:
                 layer = Glyphs.font.currentTab.activeLayer() if Glyphs.font and \
                     Glyphs.font.currentTab else None
                 if layer is not None:
-                    _normalize_quietly(layer)
+                    # Dragging nodes sends this for every mouse event, but only new,
+                    # pasted, re-flagged or newly drawn-into paths need a look.
+                    shape = _layer_shape(layer)
+                    if shape is None or shape != self._normalized:
+                        _normalize_quietly(layer)
+                        self._normalized = _layer_shape(layer)
                 if self._settings is not None and self._settings.is_open():
                     self._settings.reload()
             except Exception:
                 pass
             finally:
                 self._normalizing = False
+        # Several updates can arrive for one event; refresh the panel once after it.
+        if not self._refresh_pending and self._is_current():
+            self._refresh_pending = True
+            self.performSelector_withObject_afterDelay_('deferredRefresh:', None, 0.0)
+
+    def deferredRefresh_(self, sender):
+        self._refresh_pending = False
         self._refresh_ui()
 
     @objc.python_method
@@ -940,7 +1100,9 @@ class VariableStrokeTool(SelectTool):
         return line
 
     @objc.python_method
+    @_timed('draw centerlines')
     def _draw_centerlines(self, layer, options=None):
+        self._frame_tick()
         # Glyphs draws the prepared outline itself; only the light blue
         # centerline is ours.
         if layer is None or not glyph_enabled(getattr(layer, 'parent', None)):
@@ -953,9 +1115,16 @@ class VariableStrokeTool(SelectTool):
             if not enabled(source) or generated(source):
                 continue
             try:
-                line = self._centerline(source)
-            except ValueError:
-                continue
+                # Glyphs keeps the path's own Bézier path ready; copy it so the
+                # styling below never touches its cache.
+                line = source.bezierPath.copy()
+            except Exception:
+                line = None
+            if line is None:
+                try:
+                    line = self._centerline(source)
+                except ValueError:
+                    continue
             line.setLineWidth_(3.0 / scale)
             line.setLineCapStyle_(NSRoundLineCapStyle)
             line.setLineJoinStyle_(NSRoundLineJoinStyle)
@@ -1031,8 +1200,25 @@ class VariableStrokeTool(SelectTool):
                                    if node.type != OFFCURVE]
 
     @objc.python_method
+    def _target_entries(self, paths, selected):
+        """[(node, data, endpoint)] for the selected on-curve nodes of `paths` (all
+        of them if none is selected), with node_data read once; `endpoint` marks
+        the ends of open paths."""
+        entries = []
+        for path in paths:
+            on_curve = [(node, data) for node, _, _, data in path_nodes(path)
+                        if data is not None]
+            ends = (on_curve[0][0], on_curve[-1][0]) if on_curve and not path.closed else ()
+            entries.extend((node, data, any(node is end for end in ends))
+                           for node, data in on_curve)
+        chosen = [entry for entry in entries if entry[0] in selected]
+        return chosen or entries
+
+    @objc.python_method
+    @_timed('refresh panel')
     def _refresh_ui(self, notification=None):
-        if self._updating_ui or self._live is not None or not hasattr(self, 'infoBoxWindow'):
+        if self._updating_ui or self._live is not None or not hasattr(self, 'infoBoxWindow') \
+                or not self._is_current():
             return
         layer = self._layer()
         # One set for all membership tests: layer.selection builds a new list per call.
@@ -1040,140 +1226,140 @@ class VariableStrokeTool(SelectTool):
         paths = self._target_paths(layer, selected) if layer is not None else []
         active = bool(layer) and glyph_enabled(layer.parent)
         editable = bool(paths) and active
-        nodes = self._target_nodes(layer, paths, selected) if editable else []
-        bases = [stroke_width(path) for path in paths] if editable else []
-        heights = [stroke_height(path) for path in paths] if editable else []
-        overridden = [has_width_override(path) for path in paths] if editable else []
-        height_overridden = [has_height_override(path) for path in paths] if editable else []
-        # Glyphs may deserialize userData numbers as NSString/pyobjc_unicode.
-        # Use the bridge accessors so UI comparison and %g formatting get floats.
-        scales = [scale(node) if SCALE_KEY in node.userData or
-                  HEIGHT_SCALE_KEY not in node.userData else None for node in nodes]
-        height_scales = [height_scale(node) if HEIGHT_SCALE_KEY in node.userData
-                         else None for node in nodes]
-        offsets = [offset(node) for node in nodes]
-        default_angle = layer_defaults(layer).nib_angle if layer is not None else 0.0
-        rotations = [rotation(node, default_angle) for node in nodes]
-        rotation_overridden = [ROTATION_KEY in node.userData for node in nodes]
-        corner_states = [corner_on(node) for node in nodes]
-        corner_values = [corner_spec(node) or {} for node in nodes]
-        corner_links = [tuple(corner_linked(node, kind) for kind in
-                              ('radius', 'tension', 'ratio')) for node in nodes]
-        cap_endpoints = {node for path in paths if not path.closed
-                         for node in (next((n for n in path.nodes if n.type != OFFCURVE), None),
-                                      next((n for n in reversed(list(path.nodes))
-                                            if n.type != OFFCURVE), None)) if node is not None}
-        cap_mode = bool(nodes) and all(node in cap_endpoints for node in nodes)
-        layer_paths = list(layer.paths) if layer is not None else []
-        ui_state = (
-            (layer.parent.name, layer.layerId) if layer else None,
-            tuple((i, j) for i, path in enumerate(layer_paths)
-                  for j, node in enumerate(path.nodes)
-                  if node in selected) if selected else (),
-            tuple((layer_paths.index(path), enabled(path), bool(path.closed),
-                   path.attributes.get(CAP_START_KEY, 'flat'),
-                   path.attributes.get(CAP_END_KEY, 'flat'),
-                   path.attributes.get(CAP_START_ANGLE_KEY), path.attributes.get(CAP_END_ANGLE_KEY))
-                  for path in paths),
-            tuple(bases), tuple(heights), tuple(overridden), tuple(height_overridden),
-            tuple(scales), tuple(height_scales), tuple(offsets), tuple(rotations),
-            tuple(rotation_overridden), tuple(corner_states),
-            tuple(tuple(sorted(v.items())) for v in corner_values),
-            tuple(corner_links), cap_mode,
-            glyph_enabled(layer.parent) if layer else False,
-        )
+        tab = self._tab
+        # Only the stroke row and the visible tab are read and compared.
+        if not editable:
+            paths = []
+        stroke = (layer is not None, active, editable,
+                  tuple(stroke_width(path) for path in paths),
+                  tuple(stroke_height(path) for path in paths),
+                  tuple(has_width_override(path) for path in paths),
+                  tuple(has_height_override(path) for path in paths))
+        if tab == 'caps':
+            open_paths = [path for path in paths if not path.closed]
+            details = tuple((path.attributes.get(CAP_START_KEY, 'flat'),
+                             path.attributes.get(CAP_END_KEY, 'flat'),
+                             cut_angle(path, CAP_START_ANGLE_KEY),
+                             cut_angle(path, CAP_END_ANGLE_KEY)) for path in open_paths)
+        else:
+            entries = self._target_entries(paths, selected) if paths else []
+            if tab == 'node':
+                default_angle = layer_defaults(layer).nib_angle if layer is not None else 0.0
+                details = tuple((
+                    # Glyphs may deserialize userData numbers as NSString; the
+                    # accessors return floats for comparison and %g formatting.
+                    scale_of(data) if SCALE_KEY in data or HEIGHT_SCALE_KEY not in data
+                    else None,
+                    height_scale_of(data) if HEIGHT_SCALE_KEY in data else None,
+                    offset_of(data), rotation_of(data, default_angle), ROTATION_KEY in data)
+                    for _, data, _ in entries)
+            else:
+                details = (tuple((corner_on_of(data),
+                                  tuple(sorted((corner_spec_of(data) or {}).items())),
+                                  CORNER_INNER_KEY not in data,
+                                  CORNER_INNER_TENSION_KEY not in data,
+                                  CORNER_INNER_RATIO_KEY not in data)
+                                 for _, data, _ in entries),
+                           bool(entries) and all(end for _, _, end in entries))
+        ui_state = (tab, stroke, details)
         if ui_state == self._last_ui_state:
             return
         self._last_ui_state = ui_state
         group = self.infoBoxWindow.group
         self._updating_ui = True
-
-        def same(values):
-            return values and all(v is not None and abs(v-values[0]) < 0.001 for v in values)
         try:
-            open_paths = editable and any(not path.closed for path in paths)
-            group.enableStroke.enable(layer is not None)
-            group.enableStroke.set(0 if active else 1)
-            for field in (group.widthField, group.heightField, group.scaleField,
-                          group.heightScaleField,
-                          group.offsetField, group.rotationField, group.outerField, group.innerField,
-                          group.tensionField, group.innerTensionField,
-                          group.ratioField, group.innerRatioField):
-                field.enable(editable)
-            group.cornerToggle.enable(editable and bool(nodes))
-            if corner_states and all(corner_states):
-                group.cornerToggle.set(0)
-            elif corner_states and not any(corner_states):
-                group.cornerToggle.set(1)
+            self._show_stroke_row(group, layer, active, editable, stroke)
+            if tab == 'node':
+                self._show_node_tab(group.nodeTab, editable, details)
+            elif tab == 'caps':
+                self._show_caps_tab(group.capsTab, bool(details), details)
             else:
-                group.cornerToggle.getNSSegmentedButton().setSelectedSegment_(-1)
-            corner_color = NSColor.labelColor() if any(corner_states) else \
-                NSColor.secondaryLabelColor()
-            first_name = _loc('L', '左') if cap_mode else _loc('Out', '外')
-            second_name = _loc('R', '右') if cap_mode else _loc('In', '内')
-            for label in (group.outerLabel, group.tensionOuterLabel, group.ratioOuterLabel):
-                label.set(first_name)
-            for label in (group.innerLabel, group.tensionInnerLabel, group.ratioInnerLabel):
-                label.set(second_name)
-            for field, key in ((group.outerField, 'outer'), (group.innerField, 'inner'),
-                               (group.tensionField, 'tension'),
-                               (group.innerTensionField, 'inner_tension'),
-                               (group.ratioField, 'ratio'),
-                               (group.innerRatioField, 'inner_ratio')):
-                values = [v[key] for v in corner_values if v]
-                if not values:  # all off: show what switching on would give
-                    values = [{'outer': DEFAULT_CORNER_RADIUS, 'inner': DEFAULT_CORNER_RADIUS,
-                               'tension': 100.0, 'inner_tension': 100.0,
-                               'ratio': 100.0, 'inner_ratio': 100.0}[key]] if nodes else []
-                field.set(('%g' % round(values[0], 2)) if same(values) else '')
-                field.getNSTextField().setTextColor_(corner_color)
-            for index, button, field in ((0, group.radiusLink, group.innerField),
-                                         (1, group.tensionLink, group.innerTensionField),
-                                         (2, group.ratioLink, group.innerRatioField)):
-                linked = bool(corner_links) and all(state[index] for state in corner_links)
-                button.enable(editable and bool(nodes))
-                button.getNSButton().setImage_(_link_icon(linked))
-                button.getNSButton().setToolTip_(
-                    _loc('Linked; click to separate values', '連動中。クリックで独立') if linked else
-                    _loc('Independent; click to link values', '独立中。クリックで連動'))
-                field.enable(editable and not linked)
-            group.startCap.enable(open_paths)
-            group.endCap.enable(open_paths)
-            group.widthField.set(('%g' % bases[0]) if same(bases) else '')
-            group.heightField.set(('%g' % round(heights[0], 2)) if same(heights) else '')
-            group.widthReset.enable(any(overridden) or any(height_overridden))
-            for field, flags in ((group.widthField, overridden),
-                                 (group.heightField, height_overridden)):
-                field.getNSTextField().setTextColor_(
-                    NSColor.labelColor() if any(flags) else NSColor.secondaryLabelColor())
-            group.offsetField.set(('%g' % offsets[0]) if same(offsets) else '')
-            group.rotationField.set(('%g' % rotations[0]) if same(rotations) else '')
-            group.rotationField.getNSTextField().setTextColor_(
-                NSColor.labelColor() if any(rotation_overridden) else NSColor.secondaryLabelColor())
-
-            group.scaleField.set(('%g' % scales[0]) if same(scales) else '')
-            group.heightScaleField.set(('%g' % height_scales[0]) if same(height_scales) else '')
-            for key, angle_key, field in ((CAP_START_KEY, CAP_START_ANGLE_KEY, group.startAngle),
-                                          (CAP_END_KEY, CAP_END_ANGLE_KEY, group.endAngle)):
-                open_ones = [path for path in paths if not path.closed]
-                angles = [cut_angle(path, angle_key) for path in open_ones]
-                field.enable(open_paths)
-                field.set(('%g' % angles[0]) if same(angles) else '')
-                field.getNSTextField().setTextColor_(
-                    NSColor.labelColor() if any(path.attributes.get(key) == 'angle'
-                                                for path in open_ones)
-                    else NSColor.secondaryLabelColor())
-            for key, control in ((CAP_START_KEY, group.startCap), (CAP_END_KEY, group.endCap)):
-                styles = {path.attributes.get(key, 'flat') for path in paths if not path.closed}
-                segmented = control.getNSSegmentedButton()
-                if len(styles) == 1 and next(iter(styles)) in CAP_VALUES:
-                    control.set(CAP_VALUES.index(next(iter(styles))))
-                else:
-                    segmented.setSelectedSegment_(-1)  # mixed or none
+                self._show_corner_tab(group.cornerTab, editable, *details)
             self._shown = {name: str(field.getNSTextField().stringValue())
                            for name, field in self._fields.items()}
         finally:
             self._updating_ui = False
+
+    @objc.python_method
+    def _show_stroke_row(self, group, layer, active, editable, stroke):
+        _, _, _, bases, heights, overridden, height_overridden = stroke
+        group.enableStroke.enable(layer is not None)
+        group.enableStroke.set(0 if active else 1)
+        for field in (group.widthField, group.heightField):
+            field.enable(editable)
+        group.widthField.set(('%g' % bases[0]) if _same(bases) else '')
+        group.heightField.set(('%g' % round(heights[0], 2)) if _same(heights) else '')
+        group.widthReset.enable(any(overridden) or any(height_overridden))
+        for field, flags in ((group.widthField, overridden),
+                             (group.heightField, height_overridden)):
+            field.getNSTextField().setTextColor_(
+                NSColor.labelColor() if any(flags) else NSColor.secondaryLabelColor())
+
+    @objc.python_method
+    def _show_node_tab(self, tab, editable, details):
+        scales, height_scales, offsets, rotations, rotation_overridden = \
+            [list(column) for column in zip(*details)] or ([], [], [], [], [])
+        for field in (tab.scaleField, tab.heightScaleField, tab.offsetField, tab.rotationField):
+            field.enable(editable)
+        tab.scaleField.set(('%g' % scales[0]) if _same(scales) else '')
+        tab.heightScaleField.set(('%g' % height_scales[0]) if _same(height_scales) else '')
+        tab.offsetField.set(('%g' % offsets[0]) if _same(offsets) else '')
+        tab.rotationField.set(('%g' % rotations[0]) if _same(rotations) else '')
+        tab.rotationField.getNSTextField().setTextColor_(
+            NSColor.labelColor() if any(rotation_overridden) else NSColor.secondaryLabelColor())
+
+    @objc.python_method
+    def _show_caps_tab(self, tab, open_paths, details):
+        for index, (control, field) in enumerate(((tab.startCap, tab.startAngle),
+                                                  (tab.endCap, tab.endAngle))):
+            styles = {item[index] for item in details}
+            angles = [item[2 + index] for item in details]
+            control.enable(open_paths)
+            if len(styles) == 1 and next(iter(styles)) in CAP_VALUES:
+                control.set(CAP_VALUES.index(next(iter(styles))))
+            else:
+                control.getNSSegmentedButton().setSelectedSegment_(-1)  # mixed or none
+            field.enable(open_paths)
+            field.set(('%g' % angles[0]) if _same(angles) else '')
+            field.getNSTextField().setTextColor_(
+                NSColor.labelColor() if 'angle' in styles else NSColor.secondaryLabelColor())
+
+    @objc.python_method
+    def _show_corner_tab(self, tab, editable, details, cap_mode):
+        states = [item[0] for item in details]
+        values = [dict(item[1]) for item in details]
+        has_nodes = bool(details)
+        tab.toggle.enable(editable and has_nodes)
+        if states and all(states):
+            tab.toggle.set(0)
+        elif states and not any(states):
+            tab.toggle.set(1)
+        else:
+            tab.toggle.getNSSegmentedButton().setSelectedSegment_(-1)
+        tab.sides.set(_loc('L / R', '左 / 右') if cap_mode else _loc('Out / In', '外 / 内'))
+        color = NSColor.labelColor() if any(states) else NSColor.secondaryLabelColor()
+        for field, key in ((tab.outerField, 'outer'), (tab.innerField, 'inner'),
+                           (tab.tensionField, 'tension'),
+                           (tab.innerTensionField, 'inner_tension'),
+                           (tab.ratioField, 'ratio'), (tab.innerRatioField, 'inner_ratio')):
+            shown = [v[key] for v in values if v]
+            if not shown:  # all off: show what switching on would give
+                shown = [{'outer': DEFAULT_CORNER_RADIUS, 'inner': DEFAULT_CORNER_RADIUS,
+                          'tension': 100.0, 'inner_tension': 100.0,
+                          'ratio': 100.0, 'inner_ratio': 100.0}[key]] if has_nodes else []
+            field.enable(editable)
+            field.set(('%g' % round(shown[0], 2)) if _same(shown) else '')
+            field.getNSTextField().setTextColor_(color)
+        for index, button, field in ((0, tab.radiusLink, tab.innerField),
+                                     (1, tab.tensionLink, tab.innerTensionField),
+                                     (2, tab.ratioLink, tab.innerRatioField)):
+            linked = has_nodes and all(item[2 + index] for item in details)
+            button.enable(editable and has_nodes)
+            button.getNSButton().setImage_(_link_icon(linked))
+            button.getNSButton().setToolTip_(
+                _loc('Linked; click to separate values', '連動中。クリックで独立') if linked else
+                _loc('Independent; click to link values', '独立中。クリックで連動'))
+            field.enable(editable and not linked)
 
     def toggleStroke_(self, sender):
         layer = self._layer()
@@ -1398,21 +1584,29 @@ class VariableStrokeTool(SelectTool):
         self._redraw()
 
     @objc.python_method
-    def _node_tangent(self, path, index):
+    def _strokes(self, layer):
+        """(defaults, [(path, path_nodes)]) of the layer's editable strokes: each
+        node is read once for all handles of a redraw or a click."""
+        if layer is None or not glyph_enabled(getattr(layer, 'parent', None)):
+            return None, []
+        return layer_defaults(layer), [(path, path_nodes(path)) for path in layer.paths
+                                       if enabled(path) and not generated(path)]
+
+    @objc.python_method
+    def _node_tangent(self, items, closed, index):
         """Direction of the centerline through a node, from its own handles/neighbours."""
-        nodes = list(path.nodes)
-        count = len(nodes)
-        here = (nodes[index].position.x, nodes[index].position.y)
+        count = len(items)
+        here = items[index][2]
 
         def neighbour(step):
             i = index
             for _ in range(count-1):
                 i += step
-                if not path.closed and not 0 <= i < count:
+                if not closed and not 0 <= i < count:
                     return None
-                other = nodes[i % count].position
-                if length(sub((other.x, other.y), here)) > 1e-6:
-                    return (other.x, other.y)
+                other = items[i % count][2]
+                if length(sub(other, here)) > 1e-6:
+                    return other
             return None
 
         before, after = neighbour(-1), neighbour(1)
@@ -1425,51 +1619,42 @@ class VariableStrokeTool(SelectTool):
             length(add(directions[0], directions[-1])) > 1e-6 else directions[-1]
 
     @objc.python_method
-    def _handles(self, layer):
+    def _handles(self, strokes, defaults):
         """Width handles where the outline really passes each centerline node:
         across the stroke on smooth nodes, on the miter / inner corner at corners."""
-        if not glyph_enabled(getattr(layer, 'parent', None)):
-            return
-        defaults = layer_defaults(layer)
-        for path in layer.paths:
-            if not enabled(path) or generated(path):
-                continue
-            ellipse_ends = set(ellipse_cap_nodes(path))
-            if ellipse_ends and len(ellipse_ends) == sum(
-                    node.type != OFFCURVE for node in path.nodes):
+        for path, items in strokes:
+            ellipse_ends = set(ellipse_cap_nodes(path, items))
+            on_curve = {node: point for node, kind, point, _ in items if kind != OFFCURVE}
+            if ellipse_ends and len(ellipse_ends) == len(on_curve):
                 continue
             try:
-                edges = edges_for_path(path, defaults)
+                edges = edges_for_path(path, defaults, items)
             except ValueError:
                 continue
             for node, pair in edges:
                 if node in ellipse_ends:
                     continue
-                yield path, node, (node.position.x, node.position.y), pair
+                yield path, node, on_curve[node], pair
 
     @objc.python_method
-    def _corner_handles(self, layer):
+    def _corner_handles(self, strokes, defaults):
         """[(path, widget)] for every rounded outline corner of nodes whose live
         corner is on (widget: see corner_widgets)."""
-        if not glyph_enabled(getattr(layer, 'parent', None)):
-            return []
-        defaults = layer_defaults(layer)
         result = []
-        for path in layer.paths:
-            if enabled(path) and not generated(path) and any(corner_on(n) for n in path.nodes):
-                result.extend((path, widget) for widget in corner_widgets(path, defaults))
+        for path, items in strokes:
+            if has_live_corners(items):
+                result.extend((path, widget) for widget in corner_widgets(path, defaults, items))
         return result
 
     @objc.python_method
-    def _corner_parts(self, layer):
+    def _corner_parts(self, strokes, defaults, selected):
         """Draggable corner handles: (kind, path, widget, position). The radius handle
         (arc midpoint) is always shown; the ratio handles (arc ends) and tension
         handle (on the corner diagonal) only for selected nodes."""
-        selection = list(layer.selection)
         parts = []
-        for path, widget in self._corner_handles(layer):
+        for path, widget in self._corner_handles(strokes, defaults):
             parts.append(('radius', path, widget, widget['middle']))
-            if widget['node'] not in selection:
+            if widget['node'] not in selected:
                 continue
             parts.append(('ratio1', path, widget, widget['p1']))
             parts.append(('ratio2', path, widget, widget['p2']))
@@ -1483,29 +1668,22 @@ class VariableStrokeTool(SelectTool):
         return parts
 
     @objc.python_method
-    def _selected_nibs(self, layer):
+    def _selected_nibs(self, strokes, defaults, selected):
         """Selected nibs; only ellipse caps receive the full preview."""
-        if not glyph_enabled(getattr(layer, 'parent', None)):
-            return
-        selected = set(layer.selection)
         if not selected:
             return
-        defaults = layer_defaults(layer)
-        for path in layer.paths:
-            if not enabled(path) or generated(path):
-                continue
-            owners = set(selected_nib_nodes(path, selected))
+        for path, items in strokes:
+            owners = set(selected_nib_nodes(path, selected, items))
             if not owners:
                 continue
-            ellipse_ends = set(ellipse_cap_nodes(path))
+            ellipse_ends = set(ellipse_cap_nodes(path, items))
             base_w = stroke_width(path, defaults)
             base_h = stroke_height(path, defaults)
-            for index, node in enumerate(path.nodes):
+            for index, (node, _, point, data) in enumerate(items):
                 if node not in owners:
                     continue
-                nib = node_nib(node, path, base_w, base_h, defaults.nib_angle)
-                tangent = self._node_tangent(path, index)
-                point = (node.position.x, node.position.y)
+                nib = nib_of(data, base_w, base_h, defaults.nib_angle)
+                tangent = self._node_tangent(items, path.closed, index)
                 ellipse_end = node in ellipse_ends
                 left, right = (ellipse_nib_edges if ellipse_end else nib_edges)(
                     point, tangent, nib)
@@ -1514,11 +1692,10 @@ class VariableStrokeTool(SelectTool):
                 yield path, node, middle, nib, ellipse_end
 
     @objc.python_method
-    def _angle_handles(self, layer, previews=None):
+    def _angle_handles(self, previews):
         """Angle knobs for every selected stroke node."""
         reach = 18.0 / self._scale()
-        for path, node, middle, nib, ellipse_end in (previews if previews is not None
-                                                     else self._selected_nibs(layer)):
+        for path, node, middle, nib, ellipse_end in previews:
             degrees = nib[3]
             if node == getattr(self, '_angle_visual_node', None) and abs(
                     (self._angle_visual_angle - degrees + 90.0) % 180.0 - 90.0) < 0.11:
@@ -1544,16 +1721,35 @@ class VariableStrokeTool(SelectTool):
                 yield axis, path, node, middle, direction, tip
 
     @objc.python_method
+    @_timed('draw handles (foreground)')
     def foreground(self, layer):
         if layer is None:
             return
+        if PROFILE.enabled and getattr(self, '_drag_handled', None) is not None:
+            PROFILE.add('gap: event handled -> handles drawn', time.perf_counter() -
+                        self._drag_handled)
+            self._drag_handled = None
+        try:
+            self._draw_handles(layer)
+        finally:
+            if PROFILE.enabled:
+                self._handles_drawn = time.perf_counter()
+
+    @objc.python_method
+    def _draw_handles(self, layer):
         scale = self._scale()
         radius = 4.0 / scale
         small = 3.0 / scale
-        handles = list(self._handles(layer))
-        selected_nibs = list(self._selected_nibs(layer))
+        if self._moving_nodes and 'nohandles' in getattr(self, '_experiment', ()):
+            return
+        defaults, strokes = self._strokes(layer)
+        if not strokes:
+            return
+        selected = set(layer.selection)
+        handles = list(self._handles(strokes, defaults))
+        selected_nibs = list(self._selected_nibs(strokes, defaults, selected))
         previews = [item for item in selected_nibs if item[4]]
-        for kind, _, widget, position in self._corner_parts(layer):
+        for kind, _, widget, position in self._corner_parts(strokes, defaults, selected):
             color = _corner_color(widget['which'])
             line = NSBezierPath.bezierPath()
             if kind == 'radius':
@@ -1648,7 +1844,7 @@ class VariableStrokeTool(SelectTool):
                 diamond.lineToPoint_((x-small*1.4, y))
                 diamond.closePath()
                 diamond.fill()
-        for _, _, middle, tip, knob, ellipse_end in self._angle_handles(layer, selected_nibs):
+        for _, _, middle, tip, knob, ellipse_end in self._angle_handles(selected_nibs):
             line = NSBezierPath.bezierPath()
             line.moveToPoint_(tip if ellipse_end else middle)
             line.lineToPoint_(knob)
@@ -1671,16 +1867,34 @@ class VariableStrokeTool(SelectTool):
         node.selected = True
 
     def mouseDown_(self, event):
+        self._moving_nodes = False  # in case a drag ended outside this tool
+        try:
+            PROFILE.enabled = bool(Glyphs.defaults[PROFILE_KEY])
+        except Exception:
+            PROFILE.enabled = False
+        self._experiment = ()
+        if PROFILE.enabled:
+            PROFILE.reset()
+            self._last_drag_event = None
+            self._drag_handled = self._handles_drawn = None
+            try:
+                self._experiment = tuple(part.strip() for part in
+                                         str(Glyphs.defaults[EXPERIMENT_KEY] or '').split(','))
+            except Exception:
+                pass
         layer = self._layer()
         if layer is not None:
             loc = self.editViewController().graphicView().getActiveLocation_(event)
             point = (loc.x, loc.y)
             threshold = 8.0 / self._scale()
-            handles = list(self._handles(layer))
-            selected_nibs = list(self._selected_nibs(layer))
+            defaults, strokes = self._strokes(layer)
+            selected = set(layer.selection)
+            handles = list(self._handles(strokes, defaults))
+            selected_nibs = list(self._selected_nibs(strokes, defaults, selected))
             previews = [item for item in selected_nibs if item[4]]
             # Small handles first: they can sit right next to the radius handle.
-            parts = sorted(self._corner_parts(layer), key=lambda part: part[0] == 'radius')
+            parts = sorted(self._corner_parts(strokes, defaults, selected),
+                           key=lambda part: part[0] == 'radius')
             for kind, path, widget, position in parts:
                 if length(sub(point, position)) > threshold:
                     continue
@@ -1693,10 +1907,11 @@ class VariableStrokeTool(SelectTool):
                               'radius': spec.get(widget['which'], 0.0),
                               'tension': spec.get('inner_tension' if widget['which'] == 'inner'
                                                   else 'tension', 100.0)}
+                self._select_tab('corner')  # show the values being dragged
                 self._last_ui_state = None
                 self._refresh_ui()
                 return
-            for path, node, origin, _, knob, _ in self._angle_handles(layer, selected_nibs):
+            for path, node, origin, _, knob, _ in self._angle_handles(selected_nibs):
                 if length(sub(point, knob)) > threshold:
                     continue
                 self._select_node(layer, node)
@@ -1706,6 +1921,7 @@ class VariableStrokeTool(SelectTool):
                     knob[1]-origin[1], knob[0]-origin[0]))
                 self._drag = {'kind': 'rotation', 'layer': layer, 'path': path,
                               'node': node, 'center': origin}
+                self._select_tab('node')
                 self._last_ui_state = None
                 self._refresh_ui()
                 return
@@ -1715,12 +1931,12 @@ class VariableStrokeTool(SelectTool):
                 self._select_node(layer, node)
                 layer.beginChanges()
                 migrate_path(path)
-                defaults = layer_defaults(layer)
                 self._drag = {'kind': 'nib-size', 'axis': axis, 'layer': layer,
                               'path': path, 'node': node, 'center': origin,
                               'direction': direction,
                               'base_width': stroke_width(path, defaults),
                               'base_height': stroke_height(path, defaults)}
+                self._select_tab('node')
                 self._last_ui_state = None
                 self._refresh_ui()
                 return
@@ -1742,7 +1958,8 @@ class VariableStrokeTool(SelectTool):
                                   'offset': offset(node) / 100.0,
                                   'scale': scale(node) if scale_key == SCALE_KEY else height_scale(node),
                                   'scale_key': scale_key,
-                                  'rotation': rotation(node, layer_defaults(layer).nib_angle)}
+                                  'rotation': rotation(node, defaults.nib_angle)}
+                    self._select_tab('node')
                     self._last_ui_state = None
                     self._refresh_ui()
                     return
@@ -1802,9 +2019,25 @@ class VariableStrokeTool(SelectTool):
         node.userData[CORNER_ON_KEY] = True
 
     def mouseDragged_(self, event):
+        if PROFILE.enabled:
+            now = time.perf_counter()
+            if getattr(self, '_last_drag_event', None) is not None:
+                PROFILE.add('time between drag events', now - self._last_drag_event)
+                if self._handles_drawn is not None:
+                    PROFILE.add('gap: handles drawn -> next event', now - self._handles_drawn)
+                else:
+                    PROFILE.add('gap: event without handle drawing', now - self._last_drag_event)
+            self._last_drag_event = now
+            self._handles_drawn = None
         if self._drag is None:
-            objc.super(VariableStrokeTool, self).mouseDragged_(event)
-            self._redraw()
+            # Moving nodes changes nothing the panel shows; skip its updates.
+            self._moving_nodes = True
+            with PROFILE.section('Glyphs moves the nodes (super)'):
+                objc.super(VariableStrokeTool, self).mouseDragged_(event)
+            # No full view redraw here: Glyphs redraws what the move changes, and
+            # repainting the whole edit view cost ~17 ms per event.
+            if PROFILE.enabled:
+                self._drag_handled = time.perf_counter()
             return
         drag = self._drag
         loc = self.editViewController().graphicView().getActiveLocation_(event)
@@ -1869,6 +2102,15 @@ class VariableStrokeTool(SelectTool):
         self._redraw()
 
     def mouseUp_(self, event):
+        try:
+            self._mouse_up(event)
+        finally:
+            if PROFILE.enabled:
+                print(PROFILE.report())
+                PROFILE.enabled = False
+
+    @objc.python_method
+    def _mouse_up(self, event):
         if self._drag is not None:
             layer, path = self._drag['layer'], self._drag['path']
             self._drag = None
@@ -1879,6 +2121,9 @@ class VariableStrokeTool(SelectTool):
             self._redraw()
             return
         objc.super(VariableStrokeTool, self).mouseUp_(event)
+        if self._moving_nodes:
+            self._moving_nodes = False
+            self._on_update()
         self._refresh_ui()
         self._redraw()
 
