@@ -2,32 +2,41 @@
 import collections
 import threading
 from GlyphsApp import GSPath, GSNode, LINE, CURVE, OFFCURVE
-from variable_stroke_core import outline_curves, node_edges
+from variable_stroke_core import outline_curves, node_edges, ellipse_nib_edges, sub
 
 PATH_KEY = 'com.codex.VariableStroke.enabled'
 # Legacy absolute node width; converted to STROKE_WIDTH_KEY x SCALE_KEY on edit.
 WIDTH_KEY = 'com.codex.VariableStroke.width'
 STROKE_WIDTH_KEY = 'com.codex.VariableStroke.strokeWidth'  # per path, font units
 SCALE_KEY = 'com.codex.VariableStroke.scale'  # per node, percent of the path width
+HEIGHT_SCALE_KEY = 'com.codex.VariableStroke.heightScale'  # per node, percent of path height
 STROKE_HEIGHT_KEY = 'com.codex.VariableStroke.strokeHeight'  # per path, font units
 OFFSET_KEY = 'com.codex.VariableStroke.offset'  # per node, -100 (right) .. 100 (left)
-ROTATION_KEY = 'com.codex.VariableStroke.rotation'  # per node, section degrees
+ROTATION_KEY = 'com.codex.VariableStroke.rotation'  # per node, nib axes angle in page degrees
 # Live corners, per node. The radius key alone (older files) also means ON.
 CORNER_ON_KEY = 'com.codex.VariableStroke.corner'  # bool
 CORNER_KEY = 'com.codex.VariableStroke.cornerRadius'  # outer radius, font units
 CORNER_INNER_KEY = 'com.codex.VariableStroke.cornerInner'  # inner radius; absent = outer
 CORNER_TENSION_KEY = 'com.codex.VariableStroke.cornerTension'  # %, 100 = circular arc
 CORNER_RATIO_KEY = 'com.codex.VariableStroke.cornerRatio'  # %, 100 = symmetric
+CORNER_INNER_TENSION_KEY = 'com.codex.VariableStroke.cornerInnerTension'
+CORNER_INNER_RATIO_KEY = 'com.codex.VariableStroke.cornerInnerRatio'
 DEFAULT_CORNER_RADIUS = 20.0
 # Written by interpolate_layer on interpolated (instance) layers, whose glyph copy
 # does not carry the ON/OFF state or the master's italic angle.
 LAYER_STATE_KEY = 'com.codex.VariableStroke.layerGlyphEnabled'
 LAYER_ITALIC_KEY = 'com.codex.VariableStroke.layerItalicAngle'
-ZERO_CORNER = {'outer': 0.0, 'inner': 0.0, 'tension': 100.0, 'ratio': 100.0}
-_CORNER_PARTS = ('outer', 'inner', 'tension', 'ratio')
+LAYER_NIB_ANGLE_KEY = 'com.codex.VariableStroke.layerNibAngle'
+ZERO_CORNER = {'outer': 0.0, 'inner': 0.0, 'tension': 100.0,
+               'inner_tension': 100.0, 'ratio': 100.0, 'inner_ratio': 100.0}
+_CORNER_PARTS = ('outer', 'inner', 'tension', 'inner_tension', 'ratio', 'inner_ratio')
+_CORNER_PAIRS = {'radius': (CORNER_KEY, CORNER_INNER_KEY),
+                 'tension': (CORNER_TENSION_KEY, CORNER_INNER_TENSION_KEY),
+                 'ratio': (CORNER_RATIO_KEY, CORNER_INNER_RATIO_KEY)}
 
 MASTER_WIDTH_KEY = 'com.codex.VariableStroke.defaultWidth'  # per master, font units
 MASTER_HEIGHT_KEY = 'com.codex.VariableStroke.defaultHeight'  # per master; unset = width
+MASTER_ANGLE_KEY = 'com.codex.VariableStroke.defaultAngle'  # ellipse axes on page
 CAP_START_KEY = 'com.codex.VariableStroke.capStart'
 CAP_END_KEY = 'com.codex.VariableStroke.capEnd'
 CAP_START_ANGLE_KEY = 'com.codex.VariableStroke.capStartAngle'  # degrees, 'angle' caps
@@ -89,13 +98,21 @@ def _number(value, default):
     return value if value > 0 else default
 
 
-class StrokeDefaults(object):
-    """What a master contributes to its strokes: default width/height and italic angle."""
+def _blend_angles(values):
+    """Interpolate ellipse axes by the shortest turn (angles repeat at 180°)."""
+    reference = values[0][0]
+    return (reference + sum(factor * ((angle - reference + 90.0) % 180.0 - 90.0)
+                            for angle, factor in values)) % 180.0
 
-    def __init__(self, width=DEFAULT_WIDTH, height=None, italic_angle=0.0):
+
+class StrokeDefaults(object):
+    """What a master contributes to its strokes."""
+
+    def __init__(self, width=DEFAULT_WIDTH, height=None, italic_angle=0.0, nib_angle=0.0):
         self.width = width
         self.height = height  # None: same as the width
         self.italic_angle = italic_angle
+        self.nib_angle = nib_angle
 
 
 def master_default_width(master):
@@ -114,6 +131,14 @@ def master_default_height(master):
         return None
 
 
+def master_default_angle(master):
+    """Page angle of a master's elliptical pen; zero preserves old fonts."""
+    try:
+        return float(master.userData.get(MASTER_ANGLE_KEY, 0.0)) % 180.0
+    except (AttributeError, TypeError, ValueError):
+        return 0.0
+
+
 def master_defaults(master):
     if master is None:
         return StrokeDefaults()
@@ -121,7 +146,8 @@ def master_defaults(master):
         angle = float(master.italicAngle or 0.0)
     except (AttributeError, TypeError, ValueError):
         angle = 0.0
-    return StrokeDefaults(master_default_width(master), master_default_height(master), angle)
+    return StrokeDefaults(master_default_width(master), master_default_height(master), angle,
+                          master_default_angle(master))
 
 
 def layer_master(layer):
@@ -139,7 +165,15 @@ def layer_master(layer):
 
 
 def layer_defaults(layer):
-    return master_defaults(layer_master(layer)) if layer is not None else StrokeDefaults()
+    defaults = master_defaults(layer_master(layer)) if layer is not None else StrokeDefaults()
+    if layer is not None:
+        try:
+            value = layer.userData.get(LAYER_NIB_ANGLE_KEY)
+            if value is not None:
+                defaults.nib_angle = float(value) % 180.0
+        except (AttributeError, TypeError, ValueError):
+            pass
+    return defaults
 
 
 def layer_default_width(layer):
@@ -179,8 +213,29 @@ def stroke_height(path, defaults=None):
 
 
 def scale(node):
-    """The node's width as a percentage of its path's base width."""
-    return _number(node.userData.get(SCALE_KEY), 100.0)
+    """Width percent; an unset width shares the height percent."""
+    return _number(node.userData.get(SCALE_KEY,
+                   node.userData.get(HEIGHT_SCALE_KEY)), 100.0)
+
+
+def height_scale(node):
+    """Height percent; an unset height shares the width percent."""
+    return _number(node.userData.get(HEIGHT_SCALE_KEY,
+                   node.userData.get(SCALE_KEY)), 100.0)
+
+
+def set_node_nib_size(node, axis, size, base_width, base_height):
+    """Edit one nib axis without changing the other axis's effective size."""
+    if axis == 'width':
+        if HEIGHT_SCALE_KEY not in node.userData:
+            node.userData[HEIGHT_SCALE_KEY] = height_scale(node)
+        node.userData[SCALE_KEY] = max(1.0, round(size / base_width * 100.0, 1))
+    elif axis == 'height':
+        if SCALE_KEY not in node.userData:
+            node.userData[SCALE_KEY] = scale(node)
+        node.userData[HEIGHT_SCALE_KEY] = max(1.0, round(size / base_height * 100.0, 1))
+    else:
+        raise ValueError('Unknown nib axis: ' + str(axis))
 
 
 def offset(node):
@@ -192,12 +247,12 @@ def offset(node):
     return max(-100.0, min(100.0, value))
 
 
-def rotation(node):
-    """Angle of this node's width section relative to its path normal."""
+def rotation(node, default=0.0):
+    """Page angle of this node's ellipse axes, or its master's default."""
     try:
-        return max(-75.0, min(75.0, float(node.userData.get(ROTATION_KEY, 0.0))))
+        return float(node.userData.get(ROTATION_KEY, default)) % 180.0
     except (TypeError, ValueError):
-        return 0.0
+        return default
 
 
 def corner_on(node):
@@ -225,31 +280,67 @@ def corner_spec(node):
     outer = corner_radius(node)
     if outer is None:
         return None
+    tension = _corner_value(node, CORNER_TENSION_KEY, 100.0)
+    ratio = _corner_value(node, CORNER_RATIO_KEY, 100.0)
     return {'outer': outer, 'inner': max(0.0, _corner_value(node, CORNER_INNER_KEY, outer)),
-            'tension': _corner_value(node, CORNER_TENSION_KEY, 100.0),
-            'ratio': _corner_value(node, CORNER_RATIO_KEY, 100.0)}
+            'tension': tension,
+            'inner_tension': _corner_value(node, CORNER_INNER_TENSION_KEY, tension),
+            'ratio': ratio,
+            'inner_ratio': _corner_value(node, CORNER_INNER_RATIO_KEY, ratio)}
+
+
+def corner_linked(node, kind):
+    """An absent second value follows the first, including in legacy files."""
+    return _CORNER_PAIRS[kind][1] not in node.userData
+
+
+def set_corner_linked(node, kind, linked):
+    first, second = _CORNER_PAIRS[kind]
+    if linked:
+        if second in node.userData:
+            del node.userData[second]
+    elif second not in node.userData:
+        spec = corner_spec(node)
+        default = {'radius': DEFAULT_CORNER_RADIUS,
+                   'tension': 100.0, 'ratio': 100.0}[kind]
+        node.userData[second] = (spec or {}).get(
+            {'radius': 'inner', 'tension': 'inner_tension', 'ratio': 'inner_ratio'}[kind],
+            _corner_value(node, first, default))
+
+
+def corner_side_key(node, kind, which):
+    """Write the shared value while linked, or one side while independent."""
+    first, second = _CORNER_PAIRS[kind]
+    return second if which == 'inner' and not corner_linked(node, kind) else first
 
 
 def width(node, path=None, base=None):
     """Effective stroke width at an on-curve node."""
-    if SCALE_KEY not in node.userData and WIDTH_KEY in node.userData:
+    if SCALE_KEY not in node.userData and HEIGHT_SCALE_KEY not in node.userData \
+            and WIDTH_KEY in node.userData:
         return max(1.0, _number(node.userData.get(WIDTH_KEY), DEFAULT_WIDTH))
     if base is None:
         base = stroke_width(path) if path is not None else DEFAULT_WIDTH
     return max(1.0, base * scale(node) / 100.0)
 
 
-def node_nib(node, path, base_width, base_height):
+def node_nib(node, path, base_width, base_height, default_angle=None):
     """(width, height, offset fraction, rotation) at an on-curve node."""
     w = width(node, path, base_width)
-    return (w, max(1.0, w * base_height / base_width),
-            offset(node) / 100.0, rotation(node))
+    legacy = WIDTH_KEY in node.userData and SCALE_KEY not in node.userData \
+        and HEIGHT_SCALE_KEY not in node.userData
+    h = w * base_height / base_width if legacy else base_height * height_scale(node) / 100.0
+    if default_angle is None:
+        default_angle = layer_defaults(getattr(path, 'parent', None)).nib_angle
+    return (w, max(1.0, h),
+            offset(node) / 100.0, rotation(node, default_angle))
 
 
 def migrate_path(path):
     """Turn legacy absolute node widths into path width + node percentages."""
     legacy = [node for node in path.nodes if node.type != OFFCURVE
-              and WIDTH_KEY in node.userData and SCALE_KEY not in node.userData]
+              and WIDTH_KEY in node.userData and SCALE_KEY not in node.userData
+              and HEIGHT_SCALE_KEY not in node.userData]
     if not legacy:
         return False
     widths = [_number(node.userData.get(WIDTH_KEY), DEFAULT_WIDTH) for node in legacy]
@@ -291,7 +382,7 @@ def segments_for_path(path, defaults=None):
     base_height = stroke_height(path, defaults)
 
     def width_at(node):
-        return node_nib(node, path, base_width, base_height)
+        return node_nib(node, path, base_width, base_height, defaults.nib_angle)
 
     for node in run:
         if node.type == OFFCURVE:
@@ -321,6 +412,49 @@ def _on_curve_nodes(path):
     return [node for node in ordered if node.type != OFFCURVE]
 
 
+def selected_nib_nodes(path, selected):
+    """On-curve nodes whose own point or attached Bézier handle is selected."""
+    nodes = list(path.nodes)
+    count = len(nodes)
+    owners = set()
+    for index, node in enumerate(nodes):
+        if node not in selected:
+            continue
+        if node.type != OFFCURVE:
+            owners.add(index)
+            continue
+        for distance in range(1, count):
+            before = index - distance
+            after = index + distance
+            candidates = (before, after)
+            for candidate in candidates:
+                if not path.closed and not 0 <= candidate < count:
+                    continue
+                candidate %= count
+                if nodes[candidate].type != OFFCURVE:
+                    owners.add(candidate)
+                    break
+            else:
+                continue
+            break
+    return [node for index, node in enumerate(nodes) if index in owners]
+
+
+def ellipse_cap_nodes(path):
+    """Open-path end nodes whose cap is the oriented nib ellipse."""
+    if path.closed:
+        return []
+    on_curve = _on_curve_nodes(path)
+    if not on_curve:
+        return []
+    result = []
+    if path.attributes.get(CAP_START_KEY) == 'ellipse':
+        result.append(on_curve[0])
+    if path.attributes.get(CAP_END_KEY) == 'ellipse' and on_curve[-1] not in result:
+        result.append(on_curve[-1])
+    return result
+
+
 def edges_for_path(path, defaults=None):
     """[(node, (left, right))] for each on-curve node: where the outline really
     passes on both sides of it (miter/crossing points at corners)."""
@@ -332,6 +466,18 @@ def edges_for_path(path, defaults=None):
     closed = bool(path.closed)
     edges = _cached(('edges', segments, closed, defaults.italic_angle),
                     lambda: node_edges(list(segments), closed, defaults.italic_angle))
+    if segments and not closed:
+        first_cap = path.attributes.get(CAP_START_KEY, 'flat')
+        last_cap = path.attributes.get(CAP_END_KEY, 'flat')
+        if first_cap == 'ellipse' or last_cap == 'ellipse':
+            edges = dict(edges)  # the cached node edges belong to every cap style
+            if first_cap == 'ellipse':
+                _, points, nib, _ = segments[0]
+                edges[0] = ellipse_nib_edges(points[0], sub(points[1], points[0]), nib)
+            if last_cap == 'ellipse':
+                _, points, _, nib = segments[-1]
+                edges[len(on_curve)-1] = ellipse_nib_edges(
+                    points[-1], sub(points[-1], points[-2]), nib)
     return [(on_curve[i], pair) for i, pair in sorted(edges.items()) if i < len(on_curve)]
 
 
@@ -658,22 +804,24 @@ def interpolate_layer(layer, glyph, interpolation):
     layer.userData[LAYER_STATE_KEY] = state
     layer.userData[LAYER_ITALIC_KEY] = sum(factor * layer_defaults(source).italic_angle
                                            for source, _, factor in sources)
+    layer.userData[LAYER_NIB_ANGLE_KEY] = _blend_angles([
+        (layer_defaults(source).nib_angle, factor) for source, _, factor in sources])
     if not state:
         return True
     for index, path in enumerate(layer.paths):
-        others = [(paths[index], factor) for _, paths, factor in sources
+        others = [(source, paths[index], factor) for source, paths, factor in sources
                   if index < len(paths) and len(paths[index].nodes) == len(path.nodes)]
         if len(others) != len(sources):
             continue
-        template = next((other for other, _ in others if enabled(other)), None)
+        template = next((other for _, other, _ in others if enabled(other)), None)
         if template is None:
             continue
         for key in _STROKE_ATTRIBUTES:
             if template.attributes.get(key) is not None:
                 path.attributes[key] = template.attributes[key]
         path.attributes['fill'] = False
-        base_w = sum(factor * stroke_width(other) for other, factor in others)
-        base_h = sum(factor * stroke_height(other) for other, factor in others)
+        base_w = sum(factor * stroke_width(other) for _, other, factor in others)
+        base_h = sum(factor * stroke_height(other) for _, other, factor in others)
         if base_w <= 0 or base_h <= 0:
             continue
         path.attributes[STROKE_WIDTH_KEY] = base_w
@@ -681,26 +829,33 @@ def interpolate_layer(layer, glyph, interpolation):
         for position, node in enumerate(path.nodes):
             if node.type == OFFCURVE:
                 continue
-            w = o = a = 0.0
+            w = h = o = 0.0
+            angles = []
             corner, any_corner = dict.fromkeys(_CORNER_PARTS, 0.0), False
-            for other, factor in others:
+            for source, other, factor in others:
                 source_node = other.nodes[position]
                 w += factor * width(source_node, other, stroke_width(other))
+                h += factor * node_nib(source_node, other, stroke_width(other),
+                                       stroke_height(other))[1]
                 o += factor * offset(source_node)
-                a += factor * rotation(source_node)
+                angles.append((rotation(source_node,
+                                        layer_defaults(source).nib_angle), factor))
                 spec = corner_spec(source_node)
                 any_corner = any_corner or spec is not None
                 for key in _CORNER_PARTS:
                     corner[key] += factor * (spec or ZERO_CORNER)[key]
             node.userData[SCALE_KEY] = w / base_w * 100.0
+            node.userData[HEIGHT_SCALE_KEY] = h / base_h * 100.0
             node.userData[OFFSET_KEY] = o
-            node.userData[ROTATION_KEY] = a
+            node.userData[ROTATION_KEY] = _blend_angles(angles)
             node.userData[CORNER_ON_KEY] = any_corner
             if any_corner:
                 node.userData[CORNER_KEY] = corner['outer']
                 node.userData[CORNER_INNER_KEY] = corner['inner']
                 node.userData[CORNER_TENSION_KEY] = corner['tension']
+                node.userData[CORNER_INNER_TENSION_KEY] = corner['inner_tension']
                 node.userData[CORNER_RATIO_KEY] = corner['ratio']
+                node.userData[CORNER_INNER_RATIO_KEY] = corner['inner_ratio']
             if WIDTH_KEY in node.userData:
                 del node.userData[WIDTH_KEY]
     return True

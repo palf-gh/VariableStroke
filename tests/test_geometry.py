@@ -8,20 +8,98 @@ from variable_stroke_core import (outline, outline_curves, node_edges, nib_edges
 
 
 class GeometryTests(unittest.TestCase):
-    def test_rotated_width_section_shifts_its_ends_without_changing_thickness(self):
+    def test_nib_angle_rotates_width_and_height_axes(self):
         left, right = nib_edges((0, 0), (1, 0), (165, 140, 0, 30))
-        self.assertAlmostEqual(left[1] - right[1], 140)
+        expected = math.hypot(165*math.sin(math.radians(30)),
+                              140*math.cos(math.radians(30)))
+        self.assertAlmostEqual(length(sub(left, right)), expected)
+        self.assertAlmostEqual(left[1] - right[1], expected)
         self.assertAlmostEqual(left[0], -right[0])
-        self.assertLess(left[0], -35)
+        self.assertAlmostEqual(left[0], 0)
         plain = nib_edges((0, 0), (1, 0), (165, 140, 0, 0))
         self.assertEqual(plain, ((0.0, 70.0), (0.0, -70.0)))
+        turned = nib_edges((0, 0), (1, 0), (165, 140, 0, 90))
+        self.assertAlmostEqual(turned[0][1] - turned[1][1], 165)
+        vertical = nib_edges((0, 0), (0, 1), (165, 140, 0, 90))
+        self.assertAlmostEqual(vertical[0][0] - vertical[1][0], -140)
 
     def test_node_rotation_changes_only_its_own_width_section(self):
         nib0, nib1 = (165, 140, 0, 0), (165, 140, 0, 30)
         contour = outline_curves([('line', ((0, 0), (100, 0)), nib0, nib1)])[0]
         self.assertEqual(contour[0][1][0], (0.0, 70.0))
-        self.assertLess(contour[0][1][1][0], 100)
-        self.assertGreater(contour[2][1][0][0], 100)
+        self.assertEqual(contour[0][1][1][0], 100)
+        self.assertGreater(contour[0][1][1][1], 70)
+        self.assertLess(contour[2][1][0][1], -70)
+
+    def test_nib_angle_crossing_180_does_not_turn_through_90(self):
+        side = _Side('line', ((0, 0), (100, 0)),
+                     (165, 40, 0, 179), (165, 40, 0, 1), 1)
+        self.assertLess(side.at(0.5)[1], 25)
+        self.assertAlmostEqual(side.at(0.5)[1], 20, delta=0.1)
+
+    def test_smooth_centerline_join_preserves_outline_tangent(self):
+        nib0, nib1, nib2 = ((165, 140, 0, 0),
+                              (165, 140, 0, 0),
+                              (165, 70, 0, 0))
+        segments = [
+            ('cubic', ((0, 0), (70, 0), (130, 100), (200, 100)), nib0, nib1),
+            ('cubic', ((200, 100), (270, 100), (330, 0), (400, 0)), nib1, nib2),
+        ]
+        contour = outline_curves(segments)[0]
+        for incoming, outgoing in ((contour[0][1], contour[1][1]),
+                                    (contour[3][1], contour[4][1])):
+            before = unit(sub(incoming[-1], incoming[-2]))
+            after = unit(sub(outgoing[1], outgoing[0]))
+            self.assertGreater(before[0]*after[0] + before[1]*after[1], 0.995)
+
+    def test_nearly_smooth_svg_join_stays_smooth_at_heavy_width(self):
+        # SVG: M0,78.928c100-95,285-115,349,0c53,95,216,103,305,41
+        nib = (165, 140, 0, 0)
+        segments = [
+            ('cubic', ((0, 78.928), (100, -16.072), (285, -36.072),
+                       (349, 78.928)), nib, nib),
+            ('cubic', ((349, 78.928), (402, 173.928), (565, 181.928),
+                       (654, 119.928)), nib, nib),
+        ]
+        contour = outline_curves(segments)[0]
+        for incoming, outgoing in ((contour[0][1], contour[1][1]),
+                                    (contour[3][1], contour[4][1])):
+            before = unit(sub(incoming[-1], incoming[-2]))
+            after = unit(sub(outgoing[1], outgoing[0]))
+            self.assertGreater(before[0]*after[0] + before[1]*after[1], 0.995)
+
+    def test_nearby_svg_paths_keep_nearby_outlines(self):
+        nib = (165, 140, 0, 0)
+        outlines = []
+        for y, first_control, second_control in ((33.374, 48, -41),
+                                                  (33.224, 49, -42)):
+            segments = [
+                ('cubic', ((0, y), (100, y-95), (227, y+first_control),
+                           (349, y)), nib, nib),
+                ('cubic', ((349, y), (453, y+second_control), (565, y+103),
+                           (654, y+41)), nib, nib),
+            ]
+            outlines.append(outline_curves(segments)[0])
+        for index in (0, 1, 3, 4):
+            first, second = outlines[0][index][1], outlines[1][index][1]
+            for p, q in zip(first, second):
+                self.assertLess(length(sub(p, q)), 3.0)
+
+    def test_nearby_svg_paths_across_gentle_curve_threshold(self):
+        nib = (165, 140, 0, 0)
+        outlines = []
+        for y, x, first_control, second_control in ((29.7, 244, 75, -74),
+                                                     (29.823, 243, 74, -73)):
+            segments = [
+                ('cubic', ((0, y), (100, y-95), (x, y+first_control),
+                           (349, y)), nib, nib),
+                ('cubic', ((349, y), (453, y+second_control), (565, y+103),
+                           (654, y+41)), nib, nib),
+            ]
+            outlines.append(outline_curves(segments)[0])
+        for index in (0, 1, 3, 4):
+            for p, q in zip(outlines[0][index][1], outlines[1][index][1]):
+                self.assertLess(length(sub(p, q)), 3.0)
 
     def test_rotated_smooth_node_keeps_source_handle_angle(self):
         plain, tilted = (165, 140, 0, 0), (165, 140, 0, 30)
@@ -310,6 +388,41 @@ class GeometryTests(unittest.TestCase):
                       and abs(points[0][1]) < 0.001 and abs(points[-1][1]) < 0.001]
         self.assertTrue(horizontal)
 
+    def test_ellipse_cap_uses_along_path_nib_dimension(self):
+        horizontal = [('line', ((0, 0), (100, 0)), (165, 140, 0, 0),
+                       (165, 140, 0, 0))]
+        round_end = outline_curves(horizontal, cap_end='round')[0]
+        ellipse_end = outline_curves(horizontal, cap_end='ellipse')[0]
+        self.assertEqual([kind for kind, _ in round_end],
+                         [kind for kind, _ in ellipse_end])
+        self.assertAlmostEqual(max(points[-1][0] for _, points in round_end), 170)
+        self.assertAlmostEqual(max(points[-1][0] for _, points in ellipse_end), 182.5)
+        vertical = [('line', ((0, 0), (0, 100)), (165, 140, 0, 0),
+                     (165, 140, 0, 0))]
+        vertical_end = outline_curves(vertical, cap_end='ellipse')[0]
+        self.assertAlmostEqual(max(points[-1][1] for _, points in vertical_end), 170)
+
+    def test_rotated_ellipse_cap_follows_the_previewed_nib(self):
+        from variable_stroke_core import cubic, ellipse_nib_edges
+        nib = (165, 70, 0.2, 30)
+        contour = outline_curves([('line', ((0, 0), (100, 0)), nib, nib)],
+                                 cap_end='ellipse')[0]
+        left, right = ellipse_nib_edges((100, 0), (1, 0), nib)
+        self.assertEqual(contour[0][1][-1], left)
+        self.assertEqual(contour[1][1][0], left)
+        self.assertEqual(contour[2][1][-1], right)
+        self.assertEqual(contour[3][1][0], right)
+        center = tuple((a+b)/2 for a, b in zip(left, right))
+        angle = math.radians(nib[3])
+        u = (math.cos(angle), math.sin(angle))
+        v = (-u[1], u[0])
+        for piece in contour[1:3]:
+            for index in range(33):
+                delta = sub(cubic(*piece[1], index/32), center)
+                x = sum(a*b for a, b in zip(delta, u)) / (nib[0]/2)
+                y = sum(a*b for a, b in zip(delta, v)) / (nib[1]/2)
+                self.assertAlmostEqual(x*x + y*y, 1, delta=0.001)
+
     def test_corner_handles_sit_on_the_outline_corner(self):
         segments = [('line', ((0, 0), (300, 0)), (40, 40, 0), (40, 40, 0)),
                     ('line', ((300, 0), (300, 300)), (100, 100, 0), (100, 100, 0))]
@@ -321,6 +434,22 @@ class GeometryTests(unittest.TestCase):
         self.assertAlmostEqual(right[0], 350.0)
         self.assertAlmostEqual(right[1], -20.0)
         self.assertEqual(sorted(edges), [0, 1, 2])
+
+    def test_corner_midpoint_moves_linearly_with_tension(self):
+        segments = [('line', ((0, 0), (200, 0)), 40, 40),
+                    ('line', ((200, 0), (200, 200)), 40, 40)]
+        reports = []
+        for tension in (100, 150):
+            report = []
+            outline_curves(segments, corner_radii=[None,
+                {'outer': 40, 'inner': 40, 'tension': tension, 'ratio': 100}],
+                report=report)
+            reports.append(report)
+        for first, second in zip(*reports):
+            predicted = tuple(first['middle'][axis] +
+                              first['middle_slope'][axis] * 50 for axis in (0, 1))
+            self.assertAlmostEqual(predicted[0], second['middle'][0])
+            self.assertAlmostEqual(predicted[1], second['middle'][1])
 
     def test_custom_angle_cut(self):
         seg = [('line', ((0, 0), (0, 300)), 60, 60)]

@@ -2,7 +2,7 @@
 from __future__ import division
 import math
 
-CAPS = ('flat', 'round', 'square', 'horizontal', 'vertical', 'angle')
+CAPS = ('flat', 'round', 'ellipse', 'square', 'horizontal', 'vertical', 'angle')
 CUTS = ('horizontal', 'vertical', 'angle')
 EPS = 1e-9
 
@@ -85,7 +85,7 @@ def _cap(center, width, tangent, style, at_end):
         extension = mul(tangent, width/2 if at_end else -width/2)
         c = add(center, extension)
         return (add(c, mul(n, width/2)), sub(c, mul(n, width/2)), [])
-    if style == 'round':
+    if style in ('round', 'ellipse'):
         steps = max(8, min(64, int(math.ceil(width/4.0))))
         if at_end:
             arc = [add(center, mul(add(mul(n, math.cos(math.pi*i/steps)),
@@ -175,31 +175,72 @@ def _fit_side(points, tolerance=0.35):
     return fit(0, last)
 
 
-def _round_cap(center, radius, tangent, start, section=None):
-    """Two exact-quarter-circle cubic approximations, in contour order."""
+def _round_cap(center, radius, tangent, start, section=None, axial_radius=None):
+    """Two quarter-ellipse cubics; equal radii retain the circular round cap."""
     outward = mul(tangent, -1 if start else 1)
     n = unit(section) if section is not None else normal(tangent)
     left = add(center, mul(n, radius))
     right = sub(center, mul(n, radius))
-    tip = add(center, mul(outward, radius))
-    k = 0.5522847498307936*radius
+    axial = radius if axial_radius is None else axial_radius
+    tip = add(center, mul(outward, axial))
+    k_side = 0.5522847498307936*radius
+    k_axial = 0.5522847498307936*axial
     if start:
         # right -> outward tip -> left
-        return [('cubic', (right, add(right, mul(outward, k)), sub(tip, mul(n, k)), tip)),
-                ('cubic', (tip, add(tip, mul(n, k)), add(left, mul(outward, k)), left))]
-    return [('cubic', (left, add(left, mul(outward, k)), add(tip, mul(n, k)), tip)),
-            ('cubic', (tip, sub(tip, mul(n, k)), add(right, mul(outward, k)), right))]
+        return [('cubic', (right, add(right, mul(outward, k_axial)),
+                            sub(tip, mul(n, k_side)), tip)),
+                ('cubic', (tip, add(tip, mul(n, k_side)),
+                            add(left, mul(outward, k_axial)), left))]
+    return [('cubic', (left, add(left, mul(outward, k_axial)),
+                        add(tip, mul(n, k_side)), tip)),
+            ('cubic', (tip, sub(tip, mul(n, k_side)),
+                        add(right, mul(outward, k_axial)), right))]
 
 
 def _cap_segments(center, width, tangent, style, at_end, left, right, nib=None, slant=0.0):
-    if style == 'round':
+    if style in ('round', 'ellipse'):
         if nib is None:
             return _round_cap(center, width/2, tangent, not at_end)
         # Use the actual rotated section endpoints, including its offset.
         middle = mul(add(left, right), 0.5)
+        if style == 'ellipse':
+            return _ellipse_cap(middle, nib, tangent, not at_end, left, right)
         section = mul(sub(left, right), 0.5)
         return _round_cap(middle, length(section), tangent, not at_end, section)
     return [('line', (left, right))] if at_end else [('line', (right, left))]
+
+
+def _ellipse_cap(center, nib, tangent, start, left, right):
+    """The outward half of the nib ellipse, in the nib's page angle."""
+    width, height, _, angle = _nib(nib)
+    radians = math.radians(angle)
+    u = (math.cos(radians), math.sin(radians))
+    v = (-u[1], u[0])
+    rx, ry = width/2.0, height/2.0
+    first, last = (right, left) if start else (left, right)
+    delta = sub(first, center)
+    theta = math.atan2((delta[0]*v[0] + delta[1]*v[1])/ry,
+                       (delta[0]*u[0] + delta[1]*u[1])/rx)
+    outward = mul(unit(tangent), -1 if start else 1)
+
+    def point(a):
+        return add(center, add(mul(u, rx*math.cos(a)), mul(v, ry*math.sin(a))))
+
+    def derivative(a):
+        return add(mul(u, -rx*math.sin(a)), mul(v, ry*math.cos(a)))
+
+    direction = 1 if sum(x*y for x, y in zip(sub(point(theta+math.pi/2), center), outward)) > 0 else -1
+    step = direction * math.pi/2
+    k = 0.5522847498307936 * direction
+    pieces = []
+    for index in range(2):
+        a = theta + index*step
+        b = a + step
+        p0 = first if index == 0 else point(a)
+        p3 = last if index == 1 else point(b)
+        pieces.append(('cubic', (p0, add(p0, mul(derivative(a), k)),
+                                 sub(p3, mul(derivative(b), k)), p3)))
+    return pieces
 
 
 FIT_TOLERANCE = 1.0
@@ -213,7 +254,7 @@ def _nib(value):
     `value` is a width, or (width, height[, offset]). Height None means round
     (height = width). Offset is -1..1: 0 keeps the centerline in the middle,
     1 puts the whole stroke on the left of the path direction, -1 on the right.
-    Rotation turns the width section around the centerline node, in degrees.
+    Rotation turns the width and height axes of the ellipse on the page.
     """
     if isinstance(value, (tuple, list)):
         w = float(value[0])
@@ -226,17 +267,66 @@ def _nib(value):
         rotation = 0.0
     if w <= 0 or h <= 0:
         raise ValueError('Width must be positive')
-    return (w, h, max(-1.0, min(1.0, o)), max(-75.0, min(75.0, rotation)))
+    return (w, h, max(-1.0, min(1.0, o)), rotation % 180.0)
 
 
-def _section_normal(tangent, rotation):
-    n = normal(unit(tangent))
-    angle = math.radians(rotation)
-    c, s = math.cos(angle), math.sin(angle)
-    # Keep the nominal thickness measured across the path while tilting the
-    # section. Thus rotation changes where its two ends sit along the path.
-    c = max(c, 1e-3)
-    return ((n[0]*c-n[1]*s)/c, (n[0]*s+n[1]*c)/c)
+def ellipse_support(direction, width, height, angle):
+    """Projected half-width of a rotated ellipse along `direction`."""
+    radians = math.radians(angle)
+    u = (math.cos(radians), math.sin(radians))
+    v = (-u[1], u[0])
+    direction = unit(direction)
+    a = direction[0]*u[0] + direction[1]*u[1]
+    b = direction[0]*v[0] + direction[1]*v[1]
+    rx, ry = width/2.0, height/2.0
+    radius = math.hypot(rx*a, ry*b)
+    return mul(direction, radius)
+
+
+def ellipse_contact(direction, width, height, angle):
+    """Actual contact point of the rotated nib ellipse in `direction`."""
+    radians = math.radians(angle)
+    u = (math.cos(radians), math.sin(radians))
+    v = (-u[1], u[0])
+    direction = unit(direction)
+    a = direction[0]*u[0] + direction[1]*u[1]
+    b = direction[0]*v[0] + direction[1]*v[1]
+    rx, ry = width/2.0, height/2.0
+    radius = math.hypot(rx*a, ry*b)
+    return add(mul(u, rx*rx*a/radius), mul(v, ry*ry*b/radius))
+
+
+def ellipse_nib_edges(point, tangent, nib):
+    """The nib ellipse's contact points on both sides of a path end."""
+    w, h, o, angle = _nib(nib)
+    support = ellipse_contact(normal(unit(tangent)), w, h, angle)
+    return add(point, mul(support, 1+o)), sub(point, mul(support, 1-o))
+
+
+def _place_ellipse_cap(left_side, right_side, point, tangent, nib, at_end):
+    """Move only the terminal outline handles onto the nib ellipse."""
+    left, right = ellipse_nib_edges(point, tangent, nib)
+    direction = unit(tangent)
+    for side, target in ((left_side, left), (right_side, right)):
+        piece = side.override_piece or side.piece()
+        if side.kind == 'cubic':
+            p0, p1, p2, p3 = piece[1]
+            if at_end:
+                handle = length(sub(p3, p2))
+                side.end = target
+                side.override_piece = ('cubic', (p0, p1,
+                                                  sub(target, mul(direction, handle)), target))
+            else:
+                handle = length(sub(p1, p0))
+                side.start = target
+                side.override_piece = ('cubic', (target,
+                                                  add(target, mul(direction, handle)), p2, p3))
+        elif at_end:
+            side.end = target
+            side.override_piece = ('line', (side.start, target))
+        else:
+            side.start = target
+            side.override_piece = ('line', (target, side.end))
 
 
 def _half_thickness(n, w, h, slant):
@@ -253,9 +343,8 @@ def nib_edges(point, tangent, nib, italic_angle=0.0):
     """Left and right outline points of the stroke at a centerline point."""
     w, h, o, rotation = _nib(nib)
     n = normal(unit(tangent))
-    half = _half_thickness(n, w, h, math.tan(math.radians(italic_angle or 0.0)))
-    n = _section_normal(tangent, rotation)
-    return add(point, mul(n, half*(1+o))), sub(point, mul(n, half*(1-o)))
+    support = ellipse_support(n, w, h, rotation)
+    return add(point, mul(support, 1+o)), sub(point, mul(support, 1-o))
 
 
 def node_edges(segments, closed=False, italic_angle=0.0):
@@ -332,9 +421,15 @@ class _Side(object):
         self.start, self.end = self.at(0.0), self.at(1.0)
         self.override_piece = None
         self.join_extension_ratio = 0.0
+        self.smooth_start = self.smooth_end = False
 
     def nib(self, t):
-        return tuple(x*(1-t) + y*t for x, y in zip(self.n0, self.n1))
+        values = [x*(1-t) + y*t for x, y in zip(self.n0[:3], self.n1[:3])]
+        # The two axes describe the same ellipse after a 180-degree turn.
+        # Interpolating normalized end angles directly (e.g. 179 -> 1)
+        # would rotate through 90 degrees and make the outline swell midway.
+        turn = (self.n1[3] - self.n0[3] + 90.0) % 180.0 - 90.0
+        return tuple(values + [self.n0[3] + turn*t])
 
     def extent(self, t):
         w, h, _, _ = self.nib(t)
@@ -343,12 +438,8 @@ class _Side(object):
     def at(self, t):
         pts = self.pts
         p = add(mul(pts[0], 1-t), mul(pts[1], t)) if self.kind == 'line' else cubic(*pts, t)
-        w, h, o, rotation = self.nib(t)
-        n = normal(self.tangent(t))
-        half = _half_thickness(n, w, h, self.slant)
-        n = _section_normal(self.tangent(t), rotation)
-        # Edges sit on the normal; o slides the stroke sideways across the centerline.
-        return add(p, mul(n, half*(1+o))) if self.sign > 0 else sub(p, mul(n, half*(1-o)))
+        left, right = nib_edges(p, self.tangent(t), self.nib(t))
+        return left if self.sign > 0 else right
 
     def tangent(self, t):
         # The centerline's own direction: both sides and both neighbours of a smooth
@@ -432,7 +523,11 @@ class _Side(object):
         # A true normal offset can cancel a gentle centerline's bend entirely.
         # For display outlines, retain some of that bend rather than producing
         # an almost straight edge beside a visibly curved centerline.
-        if gentle and abs(ta) < EPS and abs(tb-1) < EPS and source_chord > EPS:
+        hull_ratio = source_hull / source_chord if source_chord > EPS else float('inf')
+        optical_weight = min(1.0, max(0.0, (1.55 - hull_ratio) / 0.30))
+        optical_weight = optical_weight*optical_weight*(3.0 - 2.0*optical_weight)
+        if (optical_weight > 0 and abs(ta) < EPS and abs(tb-1) < EPS and
+                source_chord > EPS and center0[0]*center1[0] + center0[1]*center1[1] > 0.7):
             bend_normal = normal(unit(sub(self.pts[-1], self.pts[0])))
             source_mid = cubic(*self.pts, 0.5)
             source_bend = sum((source_mid[i] - (self.pts[0][i]+self.pts[-1][i])*0.5)
@@ -454,6 +549,7 @@ class _Side(object):
                     if abs(difference) > EPS:
                         weight = min(1.0, max(0.0,
                             (0.7*source_bend-fitted_bend)/difference))
+                        weight *= optical_weight
                         q1 = add(mul(controls[1], 1-weight), mul(shape[1], weight))
                         q2 = add(mul(controls[2], 1-weight), mul(shape[2], weight))
                         # Keep the control polygon moving along the edge chord.
@@ -469,10 +565,10 @@ class _Side(object):
         # different tilt gradients; using their offset derivatives here makes
         # an otherwise smooth centerline acquire a visible kink.
         p0, p1, p2, p3 = controls
-        if abs(ta) < EPS and abs(self.n0[3]) > EPS:
+        if abs(ta) < EPS and (self.smooth_start or abs(self.n0[3]) > EPS):
             handle = min(max(length(sub(p1, p0)), 0.05*chord), 0.75*chord)
             p1 = add(p0, mul(center0, handle))
-        if abs(tb-1) < EPS and abs(self.n1[3]) > EPS:
+        if abs(tb-1) < EPS and (self.smooth_end or abs(self.n1[3]) > EPS):
             handle = min(max(length(sub(p3, p2)), 0.05*chord), 0.75*chord)
             p2 = sub(p3, mul(center1, handle))
         return ('cubic', (p0, p1, p2, p3))
@@ -602,7 +698,30 @@ def _join(a, b, width):
         MITER_LIMIT half-widths from the node.
     The corner is a single node per side either way.
     """
-    if length(sub(a.end, b.start)) < 0.05:
+    incoming, outgoing = a.tangent(a.tb), b.tangent(b.ta)
+    aligned = incoming[0]*outgoing[0] + incoming[1]*outgoing[1] > 0.995
+    gap = length(sub(a.end, b.start))
+    if aligned and gap < max(0.05, width*0.01):
+        a_piece = a.override_piece or a.piece()
+        b_piece = b.override_piece or b.piece()
+        point = mul(add(a.end, b.start), 0.5)
+        direction = unit(add(incoming, outgoing))
+        a.end = b.start = point
+        if a.kind == 'cubic':
+            p0, p1, p2, p3 = a_piece[1]
+            handle = length(sub(p3, p2))
+            a.override_piece = ('cubic', (p0, p1, sub(point, mul(direction, handle)), point))
+        else:
+            a.override_piece = ('line', (a.start, point))
+        if b.kind == 'cubic':
+            p0, p1, p2, p3 = b_piece[1]
+            handle = length(sub(p1, p0))
+            b.override_piece = ('cubic', (point, add(point, mul(direction, handle)), p2, p3))
+        else:
+            b.override_piece = ('line', (point, b.end))
+        a.smooth_end = b.smooth_start = True
+        return
+    if gap < 0.05:
         b.start = a.end
         return
     reach = MITER_LIMIT * width / 2.0
@@ -1100,11 +1219,19 @@ def _corner_spec(value):
         value = {'outer': value}
     outer = max(float(value.get('outer') or 0.0), 0.0)
     inner = value.get('inner')
+    tension = max(float(value.get('tension') if value.get('tension') is not None
+                        else 100.0), 0.0) / 100.0
+    ratio = max(float(value.get('ratio') if value.get('ratio') is not None
+                      else 100.0), 1.0) / 100.0
+    inner_tension = value.get('inner_tension')
+    inner_ratio = value.get('inner_ratio')
     return {'outer': outer, 'inner': outer if inner is None else max(float(inner), 0.0),
-            'tension': max(float(value.get('tension') if value.get('tension') is not None
-                                 else 100.0), 0.0) / 100.0,
-            'ratio': max(float(value.get('ratio') if value.get('ratio') is not None
-                               else 100.0), 1.0) / 100.0}
+            'tension': tension,
+            'inner_tension': tension if inner_tension is None else
+                             max(float(inner_tension), 0.0) / 100.0,
+            'ratio': ratio,
+            'inner_ratio': ratio if inner_ratio is None else
+                           max(float(inner_ratio), 1.0) / 100.0}
 
 
 def _round_contour(contour, vertices, report=None):
@@ -1136,7 +1263,10 @@ def _round_contour(contour, vertices, report=None):
         dot = t_in[0]*t_out[0] + t_in[1]*t_out[1]
         turn = math.atan2(abs(cross), dot)  # 0 straight .. pi hairpin
         reach = radius * math.tan(min(turn, math.pi - 1e-3) / 2.0)
-        ratio = 1.0 if vertex.get('cap') else math.sqrt(corner['ratio'])
+        inner_side = vertex['which'] == 'inner'
+        ratio_value = corner['inner_ratio'] if inner_side else corner['ratio']
+        tension_value = corner['inner_tension'] if inner_side else corner['tension']
+        ratio = math.sqrt(ratio_value)
         # Path-direction sides: before the node gets reach*ratio, after reach/ratio.
         first, second = reach * ratio, reach / ratio
         if vertex.get('flip'):
@@ -1144,7 +1274,7 @@ def _round_contour(contour, vertices, report=None):
         first = min(first, lengths[i-1] / 2.0)
         second = min(second, lengths[i] / 2.0)
         trim_end[i-1], trim_start[i] = first, second
-        arcs[i] = (turn, first, second, corner['tension'], vertex, t_in, t_out)
+        arcs[i] = (turn, first, second, tension_value, vertex, t_in, t_out)
     trimmed = []
     for i, piece in enumerate(contour):
         t0 = _t_at_length(samples[i], trim_start[i]) if trim_start[i] > 0 else 0.0
@@ -1169,6 +1299,8 @@ def _round_contour(contour, vertices, report=None):
                                'corner': contour[i][1][0], 'middle': cubic(*arc[1], 0.5),
                                'p1': p1, 'c1': c1, 'c2': c2, 'p2': p2, 'turn': turn,
                                'first': first, 'second': second, 'arc_factor': k,
+                               'middle_slope': mul(sub(mul(d1, first), mul(d2, second)),
+                                                   3.0*k/800.0),
                                'flip': bool(vertex.get('flip')), 'cap': bool(vertex.get('cap')),
                                'in': t_in, 'out': t_out})
         result.append(piece)
@@ -1201,13 +1333,13 @@ def _open_vertices(lefts, indices, cap_pieces_end, cap_pieces_start,
             ('outer' if left_turn else 'inner')
         return at(indices[k], which, flip)
 
-    start = at(start_node, 'outer', cap=True) if cap_start != 'round' else None
-    end = at(end_node, 'outer', cap=True) if cap_end != 'round' else None
+    start = at(start_node, 'outer', cap=True) if cap_start not in ('round', 'ellipse') else None
+    end = at(end_node, 'outer', cap=True) if cap_end not in ('round', 'ellipse') else None
     vertices = [start] + [interior(k, False) for k in range(1, n)]
     vertices += [end] + [None] * (cap_pieces_end - 1)
-    vertices += [dict(end, flip=True) if end else None]
+    vertices += [dict(end, flip=True, which='inner') if end else None]
     vertices += [interior(n-j, True) for j in range(1, n)]
-    vertices += [dict(start, flip=True) if start else None] + [None] * (cap_pieces_start - 1)
+    vertices += [dict(start, flip=True, which='inner') if start else None] + [None] * (cap_pieces_start - 1)
     return vertices
 
 
@@ -1292,6 +1424,12 @@ def outline_curves(segments, closed=False, cap_start='flat', cap_end='flat',
                                start_angle)
     cap_end = apply_cap_pair(True, end_center, end_tangent, cap_end, last.n1,
                              end_angle)
+    if cap_start == 'ellipse':
+        _place_ellipse_cap(lefts[0], rights[0], start_center, start_tangent,
+                           first.n0, False)
+    if cap_end == 'ellipse':
+        _place_ellipse_cap(lefts[-1], rights[-1], end_center, end_tangent,
+                           last.n1, True)
     for side in lefts + rights:
         _optical_outer_curve(side)
     left = _side_contour(lefts, widths, False, joined=True)

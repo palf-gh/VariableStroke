@@ -48,6 +48,73 @@ bridge = importlib.import_module('glyphs_bridge')
 
 
 class BridgeTests(unittest.TestCase):
+    def test_selected_bezier_handles_preview_their_owning_nodes(self):
+        start = Node(0, 0)
+        outgoing = Node(30, 20, 'offcurve')
+        incoming = Node(70, 20, 'offcurve')
+        end = Node(100, 0, 'curve')
+        path = Path([start, outgoing, incoming, end])
+        self.assertEqual(bridge.selected_nib_nodes(path, {outgoing}), [start])
+        self.assertEqual(bridge.selected_nib_nodes(path, {incoming}), [end])
+        self.assertEqual(bridge.selected_nib_nodes(path, {outgoing, incoming}),
+                         [start, end])
+
+    def test_closed_path_handle_wraps_to_its_owning_node(self):
+        incoming = Node(0, 20, 'offcurve')
+        end = Node(0, 0, 'curve')
+        outgoing = Node(20, 0, 'offcurve')
+        next_handle = Node(40, 0, 'offcurve')
+        next_node = Node(60, 0, 'curve')
+        closing_outgoing = Node(80, 20, 'offcurve')
+        path = Path([incoming, end, outgoing, next_handle, next_node,
+                     closing_outgoing], True)
+        self.assertEqual(bridge.selected_nib_nodes(path, {incoming}), [end])
+        self.assertEqual(bridge.selected_nib_nodes(path, {outgoing}), [end])
+
+    def test_ellipse_cap_width_handles_follow_rotated_nib_contact(self):
+        from variable_stroke_core import ellipse_nib_edges
+        start, end = Node(0, 0), Node(100, 0)
+        path = Path([start, end])
+        path.attributes[bridge.STROKE_WIDTH_KEY] = 165
+        path.attributes[bridge.STROKE_HEIGHT_KEY] = 70
+        path.attributes[bridge.CAP_END_KEY] = 'ellipse'
+        for node in path.nodes:
+            node.userData.clear()
+            node.userData[bridge.ROTATION_KEY] = 30
+        actual = dict(bridge.edges_for_path(path))[end]
+        expected = ellipse_nib_edges((100, 0), (100, 0), (165, 70, 0, 30))
+        for point, target in zip(actual, expected):
+            self.assertAlmostEqual(point[0], target[0])
+            self.assertAlmostEqual(point[1], target[1])
+
+    def test_ellipse_cap_preview_targets_only_configured_open_ends(self):
+        start, middle, end = Node(0, 0), Node(50, 50), Node(100, 0)
+        path = Path([start, middle, end])
+        self.assertEqual(bridge.ellipse_cap_nodes(path), [])
+        path.attributes[bridge.CAP_END_KEY] = 'ellipse'
+        self.assertEqual(bridge.ellipse_cap_nodes(path), [end])
+        path.attributes[bridge.CAP_START_KEY] = 'ellipse'
+        self.assertEqual(bridge.ellipse_cap_nodes(path), [start, end])
+        path.closed = True
+        self.assertEqual(bridge.ellipse_cap_nodes(path), [])
+
+    def test_nib_axis_handles_keep_the_other_axis_size(self):
+        node = Node(0, 0)
+        node.userData.clear()
+        bridge.set_node_nib_size(node, 'width', 150, 100, 80)
+        self.assertEqual(bridge.scale(node), 150)
+        self.assertEqual(bridge.height_scale(node), 100)
+        bridge.set_node_nib_size(node, 'height', 120, 100, 80)
+        self.assertEqual(bridge.scale(node), 150)
+        self.assertEqual(bridge.height_scale(node), 150)
+
+        other = Node(0, 0)
+        other.userData.clear()
+        other.userData[bridge.SCALE_KEY] = 125
+        bridge.set_node_nib_size(other, 'height', 120, 100, 80)
+        self.assertEqual(bridge.scale(other), 125)
+        self.assertEqual(bridge.height_scale(other), 150)
+
     def test_export_union_follows_glyphs_overlap_checkbox(self):
         from export_settings import remove_overlap_enabled
         class Defaults:
@@ -157,6 +224,46 @@ class BridgeTests(unittest.TestCase):
         segs = bridge.segments_for_path(path)
         self.assertEqual((segs[0][2][0], segs[0][3][0]), (100.0, 50.0))
 
+    def test_node_width_and_height_percentages_share_only_when_unset(self):
+        path = Path([Node(0, 0), Node(100, 0)])
+        for node in path.nodes:
+            node.userData = {}
+        path.attributes[bridge.STROKE_WIDTH_KEY] = 80
+        path.attributes[bridge.STROKE_HEIGHT_KEY] = 120
+        node = path.nodes[0]
+        self.assertEqual(bridge.node_nib(node, path, 80, 120)[:2], (80, 120))
+        node.userData[bridge.SCALE_KEY] = 50
+        self.assertEqual(bridge.node_nib(node, path, 80, 120)[:2], (40, 60))
+        node.userData[bridge.HEIGHT_SCALE_KEY] = 150
+        self.assertEqual(bridge.node_nib(node, path, 80, 120)[:2], (40, 180))
+        del node.userData[bridge.SCALE_KEY]
+        self.assertEqual(bridge.node_nib(node, path, 80, 120)[:2], (120, 180))
+
+    def test_node_percentages_accept_saved_string_values(self):
+        node = Node(0, 0)
+        node.userData = {bridge.SCALE_KEY: '75', bridge.HEIGHT_SCALE_KEY: '125'}
+        self.assertEqual(bridge.scale(node), 75.0)
+        self.assertEqual(bridge.height_scale(node), 125.0)
+
+    def test_interpolation_blends_node_width_and_height_separately(self):
+        def master(width_percent, height_percent):
+            path = Path([Node(0, 0), Node(100, 0)])
+            path.nodes[0].userData = {bridge.SCALE_KEY: width_percent,
+                                      bridge.HEIGHT_SCALE_KEY: height_percent}
+            path.nodes[1].userData = {}
+            path.attributes[bridge.STROKE_WIDTH_KEY] = 80
+            path.attributes[bridge.STROKE_HEIGHT_KEY] = 120
+            return Layer([path])
+        glyph = types.SimpleNamespace(
+            layers={'a': master(50, 100), 'b': master(100, 50)},
+            userData={bridge.GLYPH_KEY: True})
+        target = master(50, 100)
+        bridge.interpolate_layer(target, glyph, {'a': 0.5, 'b': 0.5})
+        node = target.paths[0].nodes[0]
+        self.assertEqual(node.userData[bridge.SCALE_KEY], 75)
+        self.assertEqual(node.userData[bridge.HEIGHT_SCALE_KEY], 75)
+        self.assertEqual(bridge.node_nib(node, target.paths[0], 80, 120)[:2], (60, 90))
+
     def test_legacy_absolute_widths_migrate(self):
         path = Path([Node(0, 0, width=20), Node(100, 0, width=40)])
         before = bridge.segments_for_path(path)
@@ -193,6 +300,20 @@ class BridgeTests(unittest.TestCase):
         target = master(0)
         self.assertTrue(bridge.interpolate_layer(target, glyph, {'a': 0.25, 'b': 0.75}))
         self.assertAlmostEqual(bridge.segments_for_path(target.paths[0])[0][3][3], 15)
+
+    def test_master_angle_applies_without_node_override(self):
+        master = types.SimpleNamespace(userData={bridge.MASTER_ANGLE_KEY: '45'},
+                                       italicAngle=0)
+        defaults = bridge.master_defaults(master)
+        path = Path([Node(0, 0), Node(100, 0)])
+        for node in path.nodes:
+            node.userData = {}
+        self.assertEqual(bridge.segments_for_path(path, defaults)[0][2][3], 45)
+        path.nodes[0].userData[bridge.ROTATION_KEY] = 90
+        self.assertEqual(bridge.segments_for_path(path, defaults)[0][2][3], 90)
+
+    def test_ellipse_angles_interpolate_across_180_boundary(self):
+        self.assertAlmostEqual(bridge._blend_angles([(170, 0.5), (10, 0.5)]), 0)
 
     def test_outline_node_count_is_stable_across_designs(self):
         from variable_stroke_core import outline_curves
@@ -290,6 +411,75 @@ class BridgeTests(unittest.TestCase):
         # 90 degree turn, circular: the arc starts one radius before the corner.
         self.assertAlmostEqual(outer['first'], 30.0, places=3)
         self.assertAlmostEqual(outer['second'], 30.0, places=3)
+
+    def test_corner_sides_default_linked_and_can_be_independent(self):
+        node = Node(0, 0)
+        node.userData = {bridge.CORNER_ON_KEY: True, bridge.CORNER_KEY: 30,
+                         bridge.CORNER_TENSION_KEY: 125,
+                         bridge.CORNER_RATIO_KEY: 140}
+        for kind in ('radius', 'tension', 'ratio'):
+            self.assertTrue(bridge.corner_linked(node, kind))
+            self.assertEqual(bridge.corner_side_key(node, kind, 'inner'),
+                             bridge.corner_side_key(node, kind, 'outer'))
+            bridge.set_corner_linked(node, kind, False)
+            self.assertFalse(bridge.corner_linked(node, kind))
+            self.assertNotEqual(bridge.corner_side_key(node, kind, 'inner'),
+                                bridge.corner_side_key(node, kind, 'outer'))
+        spec = bridge.corner_spec(node)
+        self.assertEqual((spec['inner'], spec['inner_tension'], spec['inner_ratio']),
+                         (30, 125, 140))
+        node.userData[bridge.CORNER_INNER_KEY] = 12
+        node.userData[bridge.CORNER_INNER_TENSION_KEY] = 75
+        node.userData[bridge.CORNER_INNER_RATIO_KEY] = 80
+        spec = bridge.corner_spec(node)
+        self.assertEqual((spec['inner'], spec['inner_tension'], spec['inner_ratio']),
+                         (12, 75, 80))
+        for kind in ('radius', 'tension', 'ratio'):
+            bridge.set_corner_linked(node, kind, True)
+            self.assertTrue(bridge.corner_linked(node, kind))
+        spec = bridge.corner_spec(node)
+        self.assertEqual((spec['inner'], spec['inner_tension'], spec['inner_ratio']),
+                         (30, 125, 140))
+
+    def test_cap_corner_widgets_use_left_and_right_values(self):
+        path = Path([Node(0, 0), Node(150, 0)])
+        for node in path.nodes:
+            node.userData = {}
+        end = path.nodes[-1]
+        end.userData.update({bridge.CORNER_ON_KEY: True, bridge.CORNER_KEY: 30,
+                             bridge.CORNER_INNER_KEY: 12,
+                             bridge.CORNER_TENSION_KEY: 120,
+                             bridge.CORNER_INNER_TENSION_KEY: 65,
+                             bridge.CORNER_RATIO_KEY: 130,
+                             bridge.CORNER_INNER_RATIO_KEY: 75})
+        widgets = [w for w in bridge.corner_widgets(path, 60) if w['node'] is end]
+        self.assertEqual({w['which'] for w in widgets}, {'outer', 'inner'})
+        left = next(w for w in widgets if w['which'] == 'outer')
+        right = next(w for w in widgets if w['which'] == 'inner')
+        self.assertNotEqual(left['first'], right['first'])
+
+    def test_interpolation_keeps_independent_corner_strength_and_ratio(self):
+        def master(inner_tension, inner_ratio):
+            path = Path([Node(0, 0), Node(0, 300), Node(300, 300)])
+            for node in path.nodes:
+                node.userData = {}
+            path.nodes[1].userData.update({bridge.CORNER_ON_KEY: True,
+                                           bridge.CORNER_KEY: 20,
+                                           bridge.CORNER_TENSION_KEY: 100,
+                                           bridge.CORNER_INNER_TENSION_KEY: inner_tension,
+                                           bridge.CORNER_RATIO_KEY: 100,
+                                           bridge.CORNER_INNER_RATIO_KEY: inner_ratio})
+            return Layer([path])
+        glyph = types.SimpleNamespace(layers={'a': master(50, 80),
+                                               'b': master(150, 140)},
+                                      userData={bridge.GLYPH_KEY: True})
+        target = master(100, 100)
+        bridge.interpolate_layer(target, glyph, {'a': 0.5, 'b': 0.5})
+        spec = bridge.corner_spec(target.paths[0].nodes[1])
+        self.assertEqual(spec['inner_tension'], 100)
+        self.assertEqual(spec['inner_ratio'], 110)
+        self.assertEqual(spec['tension'], 100)
+        self.assertEqual(spec['ratio'], 100)
 
     def test_corner_on_in_one_master_keeps_masters_compatible(self):
         def master():

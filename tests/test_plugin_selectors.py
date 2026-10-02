@@ -87,7 +87,9 @@ class SelectorTests(unittest.TestCase):
     def test_panel_has_distinct_on_off_controls(self):
         source = PLUGIN.read_text()
         self.assertIn('InspectorGroup(', source)
-        self.assertIn('PANEL_SIZE = (530, 78)', source)
+        self.assertIn('PANEL_SIZE = (530, 105)', source)
+        for control in ('radiusLink', 'tensionLink', 'ratioLink'):
+            self.assertIn('group.' + control + ' = Button(', source)
         self.assertIn('setTranslatesAutoresizingMaskIntoConstraints_(False)', source)
         self.assertIn("{'title': 'ON'}, {'title': 'OFF'}", source)
         self.assertIn('group.startCap = SegmentedButton(', source)
