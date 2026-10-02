@@ -1059,6 +1059,8 @@ def _cap_on_curve(side, at_end, center, tangent, style, nib, slant, angle=0.0):
             side.end = point
         else:
             side.start = point
+        if side.override_piece is not None:  # set by a smooth join; keep it in step
+            side.override_piece = ('line', (side.start, side.end))
         return True
 
     controls = (side.override_piece or side.piece())[1]

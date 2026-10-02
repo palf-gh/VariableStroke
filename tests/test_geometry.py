@@ -359,6 +359,25 @@ class GeometryTests(unittest.TestCase):
         self.assertEqual(vertical[0][0], 0)
         self.assertEqual(vertical[-1][0], 0)
 
+    def test_cut_line_end_beside_a_smooth_curve_cuts_both_sides(self):
+        # A straight end joined smoothly to a curve: the smooth join stores the
+        # line's piece, and the cut must still move both of its corners.
+        nib = (90, 20, 0, 0)
+        segments = [('line', ((222, 32), (222, 167)), nib, nib),
+                    ('cubic', ((222, 167), (222, 319), (281, 421), (453, 421)), nib, nib),
+                    ('line', ((453, 421), (633, 421)), nib, nib)]
+        for style, angle in (('horizontal', 0.0), ('angle', 18.0)):
+            contour = outline_curves(segments, False, style, style, start_angle=angle,
+                                     end_angle=angle)[0]
+            m = (-math.sin(math.radians(angle)), math.cos(math.radians(angle)))
+            for node in ((222, 32), (633, 421)):
+                on_cut = [point for point in (segment[1][0] for segment in contour)
+                          if abs((point[0]-node[0])*m[0] + (point[1]-node[1])*m[1]) < 1e-6]
+                if style == 'horizontal' and node == (633, 421):
+                    continue  # parallel to the stroke: falls back to flat
+                with self.subTest(style=style, node=node):
+                    self.assertEqual(len(on_cut), 2)
+
     def test_square_and_round_extend(self):
         seg = [('line', ((0, 0), (100, 0)), 20, 20)]
         square = outline(seg, cap_start='square', cap_end='square')[0]
