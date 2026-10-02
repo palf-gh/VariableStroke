@@ -850,18 +850,16 @@ def _join(a, b, width):
         point = mul(add(a.end, b.start), 0.5)
         direction = unit(add(incoming, outgoing))
         a.end = b.start = point
+        # A line side's piece is just start..end. Freezing it here would keep
+        # its far end even after the next corner join moves that end.
         if a.kind == 'cubic':
             p0, p1, p2, p3 = a_piece[1]
             handle = length(sub(p3, p2))
             a.override_piece = ('cubic', (p0, p1, sub(point, mul(direction, handle)), point))
-        else:
-            a.override_piece = ('line', (a.start, point))
         if b.kind == 'cubic':
             p0, p1, p2, p3 = b_piece[1]
             handle = length(sub(p1, p0))
             b.override_piece = ('cubic', (point, add(point, mul(direction, handle)), p2, p3))
-        else:
-            b.override_piece = ('line', (point, b.end))
         a.smooth_end = b.smooth_start = True
         return
     if gap < 0.05:

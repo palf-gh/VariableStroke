@@ -37,6 +37,16 @@ class GeometryTests(unittest.TestCase):
         self.assertLess(side.at(0.5)[1], 25)
         self.assertAlmostEqual(side.at(0.5)[1], 20, delta=0.1)
 
+    def test_line_after_smooth_join_takes_next_corner(self):
+        # J: a curve flowing smoothly into a short stem, then a corner into
+        # the top bar. The stem's sides must end at that corner's join.
+        segments = [('cubic', ((0, 0), (354, 0), (447, 225), (447, 534)), 90, 90),
+                    ('line', ((447, 534), (447, 670)), 90, 90),
+                    ('line', ((447, 670), (98, 670)), 90, 90)]
+        contour = outline_curves(segments)[0]
+        for (_, before), (_, after) in zip(contour, contour[1:] + contour[:1]):
+            self.assertLess(length(sub(before[-1], after[0])), 1e-6)
+
     def test_smooth_centerline_join_preserves_outline_tangent(self):
         nib0, nib1, nib2 = ((165, 140, 0, 0),
                               (165, 140, 0, 0),
