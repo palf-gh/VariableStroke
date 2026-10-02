@@ -6,6 +6,7 @@ import time
 import traceback
 import objc
 from AppKit import (NSBezierPath, NSColor, NSEvent, NSImage, NSMenu, NSMenuItem, NSObject,
+                    NSNotificationCenter,
                     NSThread, NSPasteboard, NSPasteboardTypePDF, NSData,
                     NSEventModifierFlagOption, NSEventModifierFlagShift,
                     NSEventModifierFlagCommand,
@@ -67,6 +68,7 @@ def _inspector_via_callback():
     except Exception:
         return False
 PREPARE_LAYER_CALLBACK = 'GSPrepareLayerCallback'
+STEM_THICKNESS_OUTLINE_REQUEST = 'com.codex.VariableStroke.stemThicknessOutlineRequest'
 PANEL_SIZE = (545, 56)
 TAB_TOP = 32  # the tab row, below the stroke row
 TABS = (('node', 'Node', 'ノード'), ('caps', 'Caps', '線端'), ('corner', 'Corners', '角丸'))
@@ -535,6 +537,21 @@ class VariableStrokeLayerProcessor(NSObject):
 
     def callOrder(self):
         return 0
+
+    def stemThicknessOutlineRequest_(self, notification):
+        """Give the reporter an expanded copy while keeping the editable centerlines."""
+        request = notification.object()
+        try:
+            source = request.objectForKey_('layer')
+            state = _glyph_state(source)
+            if state is False or not any(enabled(path) for path in source.paths) and not state:
+                return
+            defaults = master_defaults(_master_for(source))
+            outline = source.copy()
+            if expand_layer(outline, state, defaults):
+                request.setObject_forKey_(outline, 'outlineLayer')
+        except Exception:
+            print(traceback.format_exc())
 
     @objc.signature(b'Z@:@@o^@')
     def processLayer_extraHandles_error_(self, layer, extraHandles, error):
@@ -1035,6 +1052,9 @@ class VariableStrokeTool(SelectTool):
             GSCallbackHandler.addCallback_forOperation_(self._inspector_provider,
                                                         INSPECTOR_CALLBACK)
         GSCallbackHandler.addCallback_forOperation_(self._layer_processor, PREPARE_LAYER_CALLBACK)
+        NSNotificationCenter.defaultCenter().addObserver_selector_name_object_(
+            self._layer_processor, 'stemThicknessOutlineRequest:',
+            STEM_THICKNESS_OUTLINE_REQUEST, None)
         try:
             _hook_copy()
         except Exception:
