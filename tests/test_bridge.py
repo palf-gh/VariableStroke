@@ -65,6 +65,146 @@ class BridgeTests(unittest.TestCase):
         left, right = nib_edges((0, 0), (0, 1), (20, 20, 1.5, 0))
         self.assertEqual((left, right), ((-25.0, 0.0), (-5.0, 0.0)))
 
+    def test_eyedropper_copies_stroke_settings_across_different_node_counts(self):
+        source = Path([Node(0, 0), Node(0, 100)])
+        target = Path([Node(100, 0), Node(100, 50), Node(100, 100)])
+        for node in source.nodes + target.nodes:
+            node.userData.clear()
+        source.attributes.update({bridge.STROKE_WIDTH_KEY: 40,
+                                  bridge.STROKE_HEIGHT_KEY: 20,
+                                  bridge.CAP_END_KEY: 'horizontal',
+                                  bridge.CAP_END_CURVE_ON_KEY: True,
+                                  bridge.CAP_END_CURVE_KEY: [[0.6, -0.5], [-0.4, 0.2]],
+                                  bridge.VIRTUAL_KEY: [self.virtual_spec(t=0.25)]})
+        source.nodes[0].userData.update({bridge.SCALE_KEY: 100,
+                                         bridge.HEIGHT_SCALE_KEY: 50,
+                                         bridge.OFFSET_KEY: 150,
+                                         bridge.ROTATION_KEY: 20,
+                                         bridge.CORNER_ON_KEY: True,
+                                         bridge.CORNER_KEY: 8})
+        source.nodes[1].userData.update({bridge.SCALE_KEY: 200,
+                                         bridge.HEIGHT_SCALE_KEY: 150,
+                                         bridge.OFFSET_KEY: -50,
+                                         bridge.ROTATION_KEY: 40})
+        positions = [(node.position.x, node.position.y) for node in target.nodes]
+        self.assertTrue(bridge.copy_stroke_settings(source, target))
+        self.assertEqual(positions, [(node.position.x, node.position.y)
+                                     for node in target.nodes])
+        self.assertEqual(bridge.stroke_width(target), 40)
+        self.assertEqual(bridge.stroke_height(target), 20)
+        middle = target.nodes[1].userData
+        self.assertEqual((middle[bridge.SCALE_KEY], middle[bridge.HEIGHT_SCALE_KEY],
+                          middle[bridge.OFFSET_KEY], middle[bridge.ROTATION_KEY]),
+                         (150, 100, 50, 30))
+        self.assertEqual(target.nodes[0].userData[bridge.CORNER_KEY], 8)
+        self.assertEqual(target.attributes[bridge.CAP_END_KEY], 'horizontal')
+        self.assertTrue(bridge.cap_curve_enabled(target, True))
+        self.assertEqual(bridge.cap_curve_of(target, True),
+                         ((0.6, -0.5), (-0.4, 0.2)))
+        virtual = bridge.virtual_nodes(target)[0]
+        self.assertEqual((virtual['segment'], virtual['t']), (0, 0.5))
+        self.assertNotEqual(virtual['id'], bridge.virtual_nodes(source)[0]['id'])
+
+    def test_eyedropper_matches_nodes_by_index_when_structure_matches(self):
+        source = Path([Node(0, 0), Node(0, 50), Node(0, 100)])
+        target = Path([Node(100, 0), Node(100, 20), Node(100, 100)])
+        for node in source.nodes + target.nodes:
+            node.userData.clear()
+        source.nodes[1].userData[bridge.SCALE_KEY] = 180
+        source.nodes[1].userData[bridge.CORNER_KEY] = 7
+        spec = self.virtual_spec(t=0.7)
+        spec['segment'] = 1
+        source.attributes[bridge.VIRTUAL_KEY] = [spec]
+        self.assertTrue(bridge.copy_stroke_settings(source, target))
+        self.assertEqual(target.nodes[1].userData[bridge.SCALE_KEY], 180)
+        self.assertEqual(target.nodes[1].userData[bridge.CORNER_KEY], 7)
+        self.assertEqual((bridge.virtual_nodes(target)[0]['segment'],
+                          bridge.virtual_nodes(target)[0]['t']), (1, 0.7))
+
+    def test_editable_cap_widget_matches_saved_outline_and_survives_rebuild(self):
+        path = Path([Node(0, 0), Node(0, 100)])
+        for node in path.nodes:
+            node.userData.clear()
+        path.attributes[bridge.STROKE_WIDTH_KEY] = 20
+        path.attributes[bridge.CAP_END_KEY] = 'flat'
+        path.attributes[bridge.CAP_END_CURVE_ON_KEY] = True
+        path.attributes[bridge.CAP_END_CURVE_KEY] = [[0.6, -0.5], [-0.4, -0.3]]
+        widget = bridge.cap_curve_widget(path, True)
+        self.assertEqual(widget['points'], bridge.curves_for_path(path)[0][1][1])
+        self.assertIs(widget['node'], path.nodes[-1])
+        path.attributes[bridge.STROKE_WIDTH_KEY] = 40
+        wider = bridge.cap_curve_widget(path, True)
+        self.assertEqual(bridge.cap_curve_of(path, True),
+                         ((0.6, -0.5), (-0.4, -0.3)))
+        self.assertEqual(wider['points'], bridge.curves_for_path(path)[0][1][1])
+        self.assertAlmostEqual(wider['points'][1][1]-100,
+                               2*(widget['points'][1][1]-100))
+        layer = Layer([path])
+        self.assertEqual(bridge.expand_layer(layer, glyph_on=True), 1)
+        outlines = [candidate for candidate in layer.paths if bridge.is_outline(candidate)]
+        self.assertEqual(len(outlines), 1)
+        self.assertEqual(sum(node.type == 'offcurve' for node in outlines[0].nodes), 2)
+
+    def test_editable_cap_coordinates_interpolate_between_masters(self):
+        def master(controls):
+            path = Path([Node(0, 0), Node(0, 100)])
+            path.attributes[bridge.CAP_END_KEY] = 'flat'
+            path.attributes[bridge.CAP_END_CURVE_ON_KEY] = True
+            path.attributes[bridge.CAP_END_CURVE_KEY] = controls
+            return Layer([path])
+        first = master([[0.5, -0.2], [-0.5, -0.2]])
+        second = master([[0.7, -0.8], [-0.3, 0.2]])
+        glyph = types.SimpleNamespace(layers={'a': first, 'b': second},
+                                      userData={bridge.GLYPH_KEY: True})
+        target = master([[0, 0], [0, 0]])
+        self.assertTrue(bridge.interpolate_layer(target, glyph, {'a': 0.5, 'b': 0.5}))
+        self.assertEqual(bridge.cap_curve_of(target.paths[0], True),
+                         ((0.6, -0.5), (-0.4, 0.0)))
+        self.assertEqual(bridge.curves_for_path(target.paths[0])[0][1][0], 'cubic')
+
+    def test_editable_cap_keeps_one_cubic_with_one_sided_virtual_step(self):
+        path = Path([Node(0, 0), Node(0, 100)])
+        for node in path.nodes:
+            node.userData.clear()
+        path.attributes[bridge.STROKE_WIDTH_KEY] = 20
+        path.attributes[bridge.CAP_END_KEY] = 'flat'
+        path.attributes[bridge.CAP_END_CURVE_ON_KEY] = True
+        path.attributes[bridge.VIRTUAL_KEY] = [self.virtual_spec()]
+        contour = bridge.curves_for_path(path)[0]
+        self.assertEqual([kind for kind, _ in contour].count('cubic'), 1)
+        self.assertEqual(contour[1][0], 'cubic')
+        self.assertEqual(contour[1][1], bridge.cap_curve_widget(path, True)['points'])
+
+    def test_curve_mode_disables_on_round_and_ellipse_caps(self):
+        path = Path([Node(0, 0), Node(0, 100)])
+        path.attributes[bridge.CAP_END_CURVE_ON_KEY] = True
+        for style in ('round', 'ellipse'):
+            path.attributes[bridge.CAP_END_KEY] = style
+            self.assertFalse(bridge.cap_curve_enabled(path, True))
+            self.assertIsNone(bridge.cap_curve_widget(path, True))
+            self.assertEqual([kind for kind, _ in bridge.curves_for_path(path)[0]].count('cubic'), 2)
+        path.attributes[bridge.CAP_END_KEY] = 'horizontal'
+        self.assertTrue(bridge.cap_curve_enabled(path, True))
+        self.assertIsNotNone(bridge.cap_curve_widget(path, True))
+
+    def test_curve_handles_follow_the_actual_cut_endpoints(self):
+        path = Path([Node(0, 0), Node(100, 100)])
+        for node in path.nodes:
+            node.userData.clear()
+        path.attributes[bridge.STROKE_WIDTH_KEY] = 20
+        path.attributes[bridge.CAP_END_CURVE_ON_KEY] = True
+        for style in ('square', 'horizontal', 'vertical', 'angle'):
+            with self.subTest(style=style):
+                path.attributes[bridge.CAP_END_KEY] = style
+                widget = bridge.cap_curve_widget(path, True)
+                self.assertEqual(widget['points'], bridge.curves_for_path(path)[0][1][1])
+
+    def test_old_curve_cap_style_still_opens_as_editable_curve(self):
+        path = Path([Node(0, 0), Node(0, 100)])
+        path.attributes[bridge.CAP_END_KEY] = 'curve'
+        self.assertTrue(bridge.cap_curve_enabled(path, True))
+        self.assertIsNotNone(bridge.cap_curve_widget(path, True))
+
     def test_virtual_step_changes_only_right_side_and_keeps_centerline(self):
         path = Path([Node(0, 0), Node(0, 100)])
         for node in path.nodes:
@@ -93,6 +233,37 @@ class BridgeTests(unittest.TestCase):
         self.assertEqual(len(contour), 6)
         self.assertEqual(contour[4], ('line', ((10.0, 100.0), (10.0, 0.0))))
         self.assertIn(('line', ((-10.0, 50.0), (-15.0, 50.0))), contour)
+
+    def test_virtual_node_stays_on_unchanged_segment_after_real_node_deletion(self):
+        path = Path([Node(0, 0), Node(0, 100), Node(0, 200), Node(0, 300)])
+        spec = self.virtual_spec(t=0.25)
+        spec['segment'] = 2
+        path.attributes[bridge.VIRTUAL_KEY] = [spec]
+        original = bridge.virtual_nodes(path)[0]
+        self.assertEqual(original['segment'], 2)
+        self.assertEqual(bridge.virtual_point(bridge.segments_for_path(path)[2], 0.25),
+                         (0.0, 225.0))
+
+        removed = path.nodes.pop(1)
+        shifted = bridge.virtual_nodes(path)[0]
+        self.assertEqual((shifted['segment'], shifted['t']), (1, 0.25))
+        self.assertEqual(bridge.virtual_point(bridge.segments_for_path(path)[1], 0.25),
+                         (0.0, 225.0))
+        self.assertEqual(len(bridge.virtual_widgets(path)), 1)
+        self.assertEqual(path.attributes[bridge.VIRTUAL_KEY][0]['segment'], 1)
+
+        path.nodes.insert(1, removed)  # Undo of the real-node deletion.
+        self.assertEqual(bridge.virtual_nodes(path)[0]['segment'], 2)
+
+    def test_virtual_node_is_hidden_only_when_its_own_segment_disappears(self):
+        path = Path([Node(0, 0), Node(0, 100), Node(0, 200)])
+        path.attributes[bridge.VIRTUAL_KEY] = [self.virtual_spec()]
+        bridge.virtual_nodes(path)  # Bind the saved section to its two real endpoints.
+        removed = path.nodes.pop(1)
+        self.assertEqual(bridge.virtual_nodes(path), [])
+        self.assertEqual(len(path.attributes[bridge.VIRTUAL_KEY]), 1)
+        path.nodes.insert(1, removed)
+        self.assertEqual(len(bridge.virtual_nodes(path)), 1)
 
     def test_virtual_continuous_splits_a_cubic_without_extra_glyphs_nodes(self):
         path = Path([Node(0, 0), Node(0, 80, 'offcurve'),
@@ -706,6 +877,39 @@ class BridgeTests(unittest.TestCase):
         self.assertEqual(counts[0], counts[1])
         self.assertEqual(bridge.corner_specs(light.paths[0])[1], bridge.ZERO_CORNER)
         self.assertIsNone(bridge.corner_specs(light.paths[0])[0])
+
+    def test_cap_curve_in_one_master_reports_masters_incompatible(self):
+        def master(name, y):
+            layer = Layer([Path([Node(0, y), Node(300, y)]), Path([Node(0, 50), Node(0, 250)])])
+            layer.name = name
+            return layer
+        curved, plain = master('Bold', 0), master('Light', 100)
+        glyph = types.SimpleNamespace(layers=[curved, plain],
+                                      userData={bridge.GLYPH_KEY: True})
+        curved.parent = plain.parent = glyph
+        self.assertEqual(bridge.master_incompatibilities(glyph), {})
+        self.assertEqual(bridge.compare_string_suffix(curved),
+                         bridge.compare_string_suffix(plain))
+        curved.paths[0].attributes.update({bridge.CAP_END_KEY: 'angle',
+                                           bridge.CAP_END_CURVE_ON_KEY: 1})
+        # Glyphs' compare strings now differ, so Glyphs reports the masters.
+        self.assertNotEqual(bridge.compare_string_suffix(curved),
+                            bridge.compare_string_suffix(plain))
+        found = bridge.master_incompatibilities(glyph)
+        self.assertEqual(list(found), [0])
+        self.assertEqual(found[0]['reasons'], [('cap curve', 'end')])
+        self.assertIn('cap curve (end)', bridge.describe_incompatibility(found[0]))
+        self.assertIn('キャップカーブ（終点）', bridge.describe_incompatibility(found[0], True))
+
+    def test_compare_string_suffix_is_empty_without_strokes(self):
+        layer = Layer([Path([Node(0, 0), Node(100, 0)])])
+        layer.parent = types.SimpleNamespace(userData={})
+        self.assertEqual(bridge.compare_string_suffix(layer), '')
+        plain = Path([Node(0, 0), Node(100, 0), Node(100, 100)], True)
+        plain.attributes = {}
+        layer = Layer([plain])
+        layer.parent = types.SimpleNamespace(userData={bridge.GLYPH_KEY: True})
+        self.assertEqual(bridge.compare_string_suffix(layer), '')
 
     def test_interpolated_layer_gets_strokes_and_blended_corner(self):
         def master(radius):

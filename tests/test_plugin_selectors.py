@@ -79,6 +79,8 @@ class SelectorTests(unittest.TestCase):
             _last_ui_state = None
             _virtual_adding = False
             _virtual_error = ''
+            _sampling = False
+            _sample_error = ''
             _fields = {}
             infoBoxWindow = types.SimpleNamespace(group=types.SimpleNamespace(
                 virtualTab='virtual', nodeTab='node', capsTab='caps', cornerTab='corner'))
@@ -214,6 +216,149 @@ class SelectorTests(unittest.TestCase):
         self.assertIn('existing_items[0].setTarget_(self._inspector_provider)', source)
         self.assertIn('duplicate.menu().removeItem_(duplicate)', source)
 
+    def test_closed_settings_window_is_recreated_before_reload(self):
+        module = ast.parse(PLUGIN.read_text())
+        plugin = next(node for node in module.body if isinstance(node, ast.ClassDef)
+                      and node.name == 'VariableStrokeTool')
+        method = next(node for node in plugin.body if isinstance(node, ast.FunctionDef)
+                      and node.name == '_show_settings')
+        method = ast.FunctionDef(name=method.name, args=method.args, body=method.body,
+                                 decorator_list=[], returns=None)
+
+        class Settings:
+            def __init__(self):
+                self.visible = False
+                self.opens = 0
+
+            def is_open(self): return self.visible
+
+            def open(self):
+                self.opens += 1
+                self.visible = True
+
+        namespace = {'VariableStrokeSettings': Settings}
+        exec(compile(ast.fix_missing_locations(ast.Module(body=[method], type_ignores=[])),
+                     str(PLUGIN), 'exec'), namespace)
+        owner = types.SimpleNamespace(_settings=None)
+        namespace['_show_settings'](owner)
+        first = owner._settings
+        namespace['_show_settings'](owner)
+        self.assertIs(owner._settings, first)
+        first.visible = False
+        namespace['_show_settings'](owner)
+        self.assertIsNot(owner._settings, first)
+        self.assertEqual((first.opens, owner._settings.opens), (2, 1))
+
+    def test_curve_cap_mode_skips_round_and_ellipse_paths(self):
+        module = ast.parse(PLUGIN.read_text())
+        plugin = next(node for node in module.body if isinstance(node, ast.ClassDef)
+                      and node.name == 'VariableStrokeTool')
+        method = next(node for node in plugin.body if isinstance(node, ast.FunctionDef)
+                      and node.name == '_set_curve_cap')
+        method = ast.FunctionDef(name=method.name, args=method.args, body=method.body,
+                                 decorator_list=[], returns=None)
+        namespace = {'CAP_START_KEY': 'start', 'CAP_END_KEY': 'end',
+                     'CAP_START_CURVE_ON_KEY': 'start_curve',
+                     'CAP_END_CURVE_ON_KEY': 'end_curve',
+                     '_invalidate': lambda layer, paths: None}
+        exec(compile(ast.fix_missing_locations(ast.Module(body=[method], type_ignores=[])),
+                     str(PLUGIN), 'exec'), namespace)
+        paths = [types.SimpleNamespace(attributes={'end': style}, closed=False)
+                 for style in ('flat', 'horizontal', 'round', 'ellipse')]
+
+        class Owner:
+            _last_ui_state = None
+            def _layer(self): return layer
+            def _edit_paths(self, layer): return paths
+            def _refresh_ui(self): pass
+            def _redraw(self): pass
+
+        layer = types.SimpleNamespace(beginChanges=lambda: None, endChanges=lambda: None)
+        namespace['_set_curve_cap'](Owner(), 'end', True)
+        self.assertEqual([path.attributes.get('end_curve') for path in paths],
+                         [True, True, None, None])
+
+    def test_caps_tab_disables_curve_mode_for_round_and_ellipse(self):
+        module = ast.parse(PLUGIN.read_text())
+        plugin = next(node for node in module.body if isinstance(node, ast.ClassDef)
+                      and node.name == 'VariableStrokeTool')
+        method = next(node for node in plugin.body if isinstance(node, ast.FunctionDef)
+                      and node.name == '_show_caps_tab')
+        method = ast.FunctionDef(name=method.name, args=method.args, body=method.body,
+                                 decorator_list=[], returns=None)
+
+        class Control:
+            def __init__(self):
+                self.enabled = None
+                self.value = None
+            def enable(self, value): self.enabled = value
+            def set(self, value): self.value = value
+            def show(self, value): self.value = value
+            def getNSSegmentedButton(self): return self
+            def getNSTextField(self): return self
+            def setSelectedSegment_(self, value): self.value = value
+            def setTextColor_(self, value): pass
+
+        tab = types.SimpleNamespace(**{name: Control() for name in (
+            'curveHint', 'startCap', 'endCap', 'startAngle', 'endAngle',
+            'startCurveMode', 'endCurveMode')})
+        namespace = {'CAP_VALUES': ['flat', 'round', 'ellipse', 'square',
+                                    'horizontal', 'vertical', 'angle'],
+                     'NSColor': types.SimpleNamespace(labelColor=lambda: None,
+                                                      secondaryLabelColor=lambda: None),
+                     '_same': lambda values: len(set(values)) == 1}
+        exec(compile(ast.fix_missing_locations(ast.Module(body=[method], type_ignores=[])),
+                     str(PLUGIN), 'exec'), namespace)
+        namespace['_show_caps_tab'](None, tab, True,
+                                    (('round', 'ellipse', 45, 45, False, False),))
+        self.assertFalse(tab.startCurveMode.enabled)
+        self.assertFalse(tab.endCurveMode.enabled)
+        namespace['_show_caps_tab'](None, tab, True,
+                                    (('flat', 'horizontal', 45, 45, True, False),))
+        self.assertTrue(tab.startCurveMode.enabled)
+        self.assertTrue(tab.endCurveMode.enabled)
+        self.assertEqual((tab.startCurveMode.value, tab.endCurveMode.value), (1, 0))
+
+    def test_eyedropper_applies_clicked_source_to_selected_destination(self):
+        module = ast.parse(PLUGIN.read_text())
+        plugin = next(node for node in module.body if isinstance(node, ast.ClassDef)
+                      and node.name == 'VariableStrokeTool')
+        method = next(node for node in plugin.body if isinstance(node, ast.FunctionDef)
+                      and node.name == '_sample_at')
+        method = ast.FunctionDef(name=method.name, args=method.args, body=method.body,
+                                 decorator_list=[], returns=None)
+        copied = []
+        namespace = {'copy_stroke_settings': lambda source, target:
+                     copied.append((source, target)) or True,
+                     '_invalidate': lambda layer, paths: None,
+                     '_loc': lambda english, japanese: english}
+        exec(compile(ast.fix_missing_locations(ast.Module(body=[method], type_ignores=[])),
+                     str(PLUGIN), 'exec'), namespace)
+        target, source = object(), object()
+        changes = []
+        layer = types.SimpleNamespace(paths=[target, source],
+                                      beginChanges=lambda: changes.append('begin'),
+                                      endChanges=lambda: changes.append('end'))
+
+        class Owner:
+            _sampling = True
+            _sample_targets = (target,)
+            _sample_error = ''
+            _tab = 'node'
+            _last_ui_state = None
+            def _nearest_virtual_position(self, path, point, defaults):
+                return (0, 0, 0.5)
+            def _show_tab(self, tab): pass
+            def _refresh_ui(self): pass
+            def _redraw(self): pass
+
+        owner = Owner()
+        self.assertTrue(namespace['_sample_at'](
+            owner, layer, (0, 0), [(target, None), (source, None)], None, 10))
+        self.assertEqual(copied, [(source, target)])
+        self.assertEqual(changes, ['begin', 'end'])
+        self.assertFalse(owner._sampling)
+
     def test_inspector_uses_glyphs_callback(self):
         source = PLUGIN.read_text()
         module = ast.parse(source)
@@ -266,11 +411,25 @@ class SelectorTests(unittest.TestCase):
         self.assertIn('cap.endCap = SegmentedButton(', source)
         self.assertIn("{'imageObject': _cap_icon(value)", source)
 
+    def test_inspector_builds_every_cap_control_it_uses(self):
+        module = ast.parse(PLUGIN.read_text())
+        plugin = next(node for node in module.body if isinstance(node, ast.ClassDef)
+                      and node.name == 'VariableStrokeTool')
+        method = next(node for node in plugin.body if isinstance(node, ast.FunctionDef)
+                      and node.name == '_build_inspector')
+        attributes = [node for node in ast.walk(method)
+                      if isinstance(node, ast.Attribute) and
+                      isinstance(node.value, ast.Name) and node.value.id == 'cap']
+        assigned = {node.attr for node in attributes if isinstance(node.ctx, ast.Store)}
+        used = {node.attr for node in attributes if isinstance(node.ctx, ast.Load)}
+        self.assertFalse(used - assigned, used - assigned)
+
     def test_panel_shows_one_tab_below_the_stroke_row(self):
         source = PLUGIN.read_text()
         self.assertIn('group.tabs = SegmentedButton(', source)
-        for tab in ('nodeTab', 'capsTab', 'cornerTab'):
+        for tab in ('nodeTab', 'cornerTab'):
             self.assertIn('group.' + tab + ' = Group((0, TAB_TOP, -0, 24))', source)
+        self.assertIn('group.capsTab = Group((0, TAB_TOP, -0, 48))', source)
         self.assertIn('group.virtualTab = Group((0, TAB_TOP, -0, 72))', source)
         self.assertIn("('virtual', 'Virtual', '仮想')", source)
 

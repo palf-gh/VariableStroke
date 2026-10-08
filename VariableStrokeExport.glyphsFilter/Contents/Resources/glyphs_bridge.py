@@ -4,8 +4,9 @@ import contextlib
 import math
 import threading
 import time
+import uuid
 from GlyphsApp import GSPath, GSNode, LINE, CURVE, OFFCURVE
-from variable_stroke_core import outline_curves, ellipse_nib_edges, sub
+from variable_stroke_core import outline_curves, ellipse_nib_edges, sub, DEFAULT_CAP_CURVE
 
 PATH_KEY = 'com.codex.VariableStroke.enabled'
 # Legacy absolute node width; converted to STROKE_WIDTH_KEY x SCALE_KEY on edit.
@@ -16,6 +17,7 @@ HEIGHT_SCALE_KEY = 'com.codex.VariableStroke.heightScale'  # per node, percent o
 STROKE_HEIGHT_KEY = 'com.codex.VariableStroke.strokeHeight'  # per path, font units
 OFFSET_KEY = 'com.codex.VariableStroke.offset'  # per node; values beyond +/-100 move the stroke off the centerline
 VIRTUAL_KEY = 'com.codex.VariableStroke.virtualNodes'  # per path, ordered virtual sections
+VIRTUAL_ANCHOR_KEY = 'com.codex.VariableStroke.virtualAnchor'  # stable on-curve identity
 ROTATION_KEY = 'com.codex.VariableStroke.rotation'  # per node, nib axes angle in page degrees
 # Live corners, per node. The radius key alone (older files) also means ON.
 CORNER_ON_KEY = 'com.codex.VariableStroke.corner'  # bool
@@ -45,6 +47,10 @@ CAP_START_KEY = 'com.codex.VariableStroke.capStart'
 CAP_END_KEY = 'com.codex.VariableStroke.capEnd'
 CAP_START_ANGLE_KEY = 'com.codex.VariableStroke.capStartAngle'  # degrees, 'angle' caps
 CAP_END_ANGLE_KEY = 'com.codex.VariableStroke.capEndAngle'
+CAP_START_CURVE_KEY = 'com.codex.VariableStroke.capStartCurve'
+CAP_END_CURVE_KEY = 'com.codex.VariableStroke.capEndCurve'
+CAP_START_CURVE_ON_KEY = 'com.codex.VariableStroke.capStartCurveOn'
+CAP_END_CURVE_ON_KEY = 'com.codex.VariableStroke.capEndCurveOn'
 DEFAULT_CUT_ANGLE = 45.0
 EXPORT_FILTER = 'VariableStrokeExport'
 DEFAULT_WIDTH = 40.0
@@ -63,7 +69,9 @@ LEGACY_HAIRLINE_KEY = 'com.codex.VariableStroke.hairline'
 
 
 # Path attributes that define the stroke (copied onto interpolated layers).
-_STROKE_ATTRIBUTES = (PATH_KEY, CAP_START_KEY, CAP_END_KEY, CAP_START_ANGLE_KEY, CAP_END_ANGLE_KEY)
+_STROKE_ATTRIBUTES = (PATH_KEY, CAP_START_KEY, CAP_END_KEY, CAP_START_ANGLE_KEY,
+                      CAP_END_ANGLE_KEY, CAP_START_CURVE_KEY, CAP_END_CURVE_KEY,
+                      CAP_START_CURVE_ON_KEY, CAP_END_CURVE_ON_KEY)
 
 # Outline geometry is recomputed constantly (Glyphs' preview, handle drawing,
 # hit tests) for unchanged input, so results are kept by their exact input.
@@ -522,19 +530,43 @@ def segments_for_path(path, defaults=None, items=None):
     return result
 
 
-def virtual_nodes(path, segment_count=None):
-    """Normalized, sorted virtual sections. Malformed saved entries are ignored."""
+def virtual_nodes(path, segment_count=None, items=None):
+    """Normalized sections, following their original segment across node edits."""
     try:
         raw = path.attributes.get(VIRTUAL_KEY) or []
     except (AttributeError, TypeError):
         return []
+    if not raw:
+        return []
     count = len(segments_for_path(path)) if segment_count is None else segment_count
+    on_curve_items = _on_curve(path_nodes(path) if items is None else items,
+                               bool(path.closed))
+    on_curve = [item[0] for item in on_curve_items]
+    pairs = [(on_curve[i], on_curve[(i+1) % len(on_curve)]) for i in range(count)] \
+        if len(on_curve) >= count + (0 if path.closed else 1) and on_curve else []
+    anchor_ids = [item[3].get(VIRTUAL_ANCHOR_KEY) for item in on_curve_items]
+    saved = list(raw)
+    changed = False
     result = []
-    for item in raw:
+    for raw_index, item in enumerate(raw):
         try:
             data = dict(item)
             segment, t = int(data['segment']), float(data['t'])
-            if not (0 <= segment < count and 0.005 <= t <= 0.995 and math.isfinite(t)):
+            if not (0.005 <= t <= 0.995 and math.isfinite(t)):
+                continue
+            start_id, end_id = data.get('anchorStart'), data.get('anchorEnd')
+            if start_id and end_id:
+                matches = [i for i in range(len(pairs))
+                           if anchor_ids[i] == start_id and
+                           anchor_ids[(i+1) % len(on_curve)] == end_id]
+                if matches:
+                    segment = matches[0]
+                elif (start_id in anchor_ids or end_id in anchor_ids or
+                      data.get('anchorCount') != count):
+                    # Its original segment was removed or split. Keep the saved
+                    # entry so undo can restore the virtual node with the path.
+                    continue
+            if not 0 <= segment < count:
                 continue
             mode = data.get('mode', 'continuous')
             side = data.get('side', 'both')
@@ -553,12 +585,31 @@ def virtual_nodes(path, segment_count=None):
             angle = float(data.get('angle', 0.0))
             if not math.isfinite(angle):
                 continue
+            if pairs:
+                start, end = pairs[segment]
+                for index in (segment, (segment+1) % len(on_curve)):
+                    if not anchor_ids[index]:
+                        anchor_ids[index] = uuid.uuid4().hex
+                        on_curve[index].userData[VIRTUAL_ANCHOR_KEY] = anchor_ids[index]
+                start_id = anchor_ids[segment]
+                end_id = anchor_ids[(segment+1) % len(on_curve)]
+                if (data.get('segment') != segment or data.get('anchorStart') != start_id
+                        or data.get('anchorEnd') != end_id or
+                        data.get('anchorCount') != count):
+                    data.update(segment=segment, anchorStart=start_id,
+                                anchorEnd=end_id, anchorCount=count)
+                    saved[raw_index] = data
+                    changed = True
             result.append({'id': str(data.get('id', '')), 'segment': segment, 't': t,
                            'mode': mode, 'side': side, 'direction': direction,
                            'angle': angle, 'linked': bool(data.get('linked', True)),
-                           'before': before, 'after': after})
+                           'before': before, 'after': after,
+                           'anchorStart': start_id, 'anchorEnd': end_id,
+                           'anchorCount': count})
         except (TypeError, ValueError, KeyError):
             continue
+    if changed:
+        path.attributes[VIRTUAL_KEY] = saved
     return sorted(result, key=lambda spec: (spec['segment'], spec['t'], spec['id']))
 
 
@@ -755,7 +806,8 @@ def edges_for_path(path, defaults=None, items=None):
     on_curve = [item[0] for item in _on_curve(items, closed)]
     if not on_curve:
         return []
-    segments, (_, _, edges, _), node_map = _outline(path, defaults, items)
+    segments, cached, node_map = _outline(path, defaults, items)
+    edges = cached[2]
     if node_map is not None:
         original_edges = {}
         for expanded_index, original_index in enumerate(node_map):
@@ -782,6 +834,210 @@ def cut_angle(path, key):
         return float(path.attributes.get(key, DEFAULT_CUT_ANGLE))
     except (TypeError, ValueError):
         return DEFAULT_CUT_ANGLE
+
+
+def cap_curve_of(path, at_end):
+    """Two editable cap controls in the cap's width-relative frame."""
+    key = CAP_END_CURVE_KEY if at_end else CAP_START_CURVE_KEY
+    raw = path.attributes.get(key)
+    try:
+        values = tuple(tuple(float(value) for value in point) for point in raw)
+        if len(values) == 2 and all(len(point) == 2 and
+                                    all(math.isfinite(value) for value in point)
+                                    for point in values):
+            return values
+    except (TypeError, ValueError):
+        pass
+    return DEFAULT_CAP_CURVE
+
+
+def cap_curve_enabled(path, at_end):
+    style = path.attributes.get(CAP_END_KEY if at_end else CAP_START_KEY, 'flat')
+    if style == 'curve':  # paths made by the earlier standalone curve style
+        return True
+    return style not in ('round', 'ellipse') and bool(path.attributes.get(
+        CAP_END_CURVE_ON_KEY if at_end else CAP_START_CURVE_ON_KEY, False))
+
+
+def cap_curve_widget(path, at_end, defaults=None, items=None):
+    """Visible cap controls at the actual outline endpoints."""
+    from variable_stroke_core import _derivative, unit
+    if path.closed or not cap_curve_enabled(path, at_end):
+        return None
+    items = path_nodes(path) if items is None else items
+    segments = segments_for_path(path, defaults, items)
+    nodes = _on_curve(items, False)
+    if not segments or not nodes:
+        return None
+    kind, points, _, _ = segments[-1 if at_end else 0]
+    tangent = unit(_derivative(kind, points, 1.0 if at_end else 0.0))
+    node = nodes[-1 if at_end else 0][0]
+    _, cached, _ = _outline(path, _resolve(defaults, path), items)
+    controls = cached[4].get('end' if at_end else 'start')
+    if controls is None:
+        return None
+    left, right = (controls[0], controls[-1]) if at_end else \
+        (controls[-1], controls[0])
+    return {'node': node, 'left': left, 'right': right,
+            'tangent': tangent, 'points': controls, 'at_end': at_end}
+
+
+def _stroke_length_tables(segments):
+    """Cumulative centerline lengths, with samples for Bézier distance mapping."""
+    from variable_stroke_core import cubic, length
+    tables, totals = [], [0.0]
+    for kind, points, _, _ in segments:
+        samples = [points[0]] + [
+            (points[0][0]*(1-i/32.0)+points[1][0]*i/32.0,
+             points[0][1]*(1-i/32.0)+points[1][1]*i/32.0)
+            if kind == 'line' else cubic(*points, i/32.0)
+            for i in range(1, 33)]
+        distances = [0.0]
+        for before, after in zip(samples, samples[1:]):
+            distances.append(distances[-1] + length(sub(after, before)))
+        tables.append(distances)
+        totals.append(totals[-1] + distances[-1])
+    return tables, totals
+
+
+def _length_at(table, t):
+    position = max(0.0, min(32.0, t*32.0))
+    index = min(31, int(position))
+    fraction = position-index
+    return table[index]*(1-fraction)+table[index+1]*fraction
+
+
+def _t_at_length(table, distance):
+    for index in range(32):
+        if distance <= table[index+1] or index == 31:
+            span = table[index+1]-table[index]
+            return (index + (distance-table[index])/span)/32.0 if span > 1e-9 \
+                else index/32.0
+    return 1.0
+
+
+def _node_progresses(totals, closed):
+    count = len(totals)-1
+    if totals[-1] < 1e-9:
+        return [i/float(max(1, count)) for i in range(count if closed else count+1)]
+    return [distance/totals[-1] for distance in totals[:count if closed else count+1]]
+
+
+def _numeric_at_progress(samples, positions, progress, closed):
+    if len(samples) == 1:
+        return samples[0]
+    if closed:
+        positions = positions + [1.0]
+        samples = samples + [samples[0]]
+        progress %= 1.0
+    for index in range(len(positions)-1):
+        if progress <= positions[index+1] or index == len(positions)-2:
+            span = positions[index+1]-positions[index]
+            fraction = max(0.0, min(1.0, (progress-positions[index])/span)) \
+                if span > 1e-9 else 0.0
+            before, after = samples[index], samples[index+1]
+            angle = _blend_angles(((before[3], 1-fraction), (after[3], fraction)))
+            return tuple(before[i]*(1-fraction)+after[i]*fraction for i in range(3)) + (angle,)
+    return samples[-1]
+
+
+def _nearest_progress_index(positions, progress, closed):
+    return min(range(len(positions)), key=lambda index: min(
+        abs(positions[index]-progress), 1-abs(positions[index]-progress))
+        if closed else abs(positions[index]-progress))
+
+
+def _map_virtual_progress(progress, tables, totals):
+    if totals[-1] < 1e-9:
+        index = min(len(tables)-1, int(progress*len(tables)))
+        return index, max(0.005, min(0.995, progress*len(tables)-index))
+    distance = progress*totals[-1]
+    index = next((i for i in range(len(tables)) if distance <= totals[i+1]),
+                 len(tables)-1)
+    t = _t_at_length(tables[index], distance-totals[index])
+    return index, max(0.005, min(0.995, t))
+
+
+def copy_stroke_settings(source, target):
+    """Copy a stroke's appearance onto another centerline without changing its nodes."""
+    import uuid
+    source_items, target_items = path_nodes(source), path_nodes(target)
+    source_segments = segments_for_path(source, items=source_items)
+    target_segments = segments_for_path(target, items=target_items)
+    source_nodes = _on_curve(source_items, bool(source.closed))
+    target_nodes = _on_curve(target_items, bool(target.closed))
+    if not source_segments or not target_segments or not source_nodes or not target_nodes:
+        return False
+    source_width, source_height = stroke_width(source), stroke_height(source)
+    source_angle = layer_defaults(getattr(source, 'parent', None)).nib_angle
+    source_tables, source_totals = _stroke_length_tables(source_segments)
+    target_tables, target_totals = _stroke_length_tables(target_segments)
+    source_positions = _node_progresses(source_totals, bool(source.closed))
+    target_positions = _node_progresses(target_totals, bool(target.closed))
+    matching_nodes = (len(source_nodes) == len(target_nodes) and
+                      bool(source.closed) == bool(target.closed))
+    matching_segments = (bool(source.closed) == bool(target.closed) and
+                         [(kind, len(points)) for kind, points, _, _ in source_segments] ==
+                         [(kind, len(points)) for kind, points, _, _ in target_segments])
+    samples = [nib_of(item[3], source_width, source_height, source_angle)
+               for item in source_nodes]
+    source_specs = virtual_nodes(source, len(source_segments), source_items)
+    virtuals = []
+    for spec in source_specs:
+        if matching_segments:
+            segment, t = spec['segment'], spec['t']
+        else:
+            distance = source_totals[spec['segment']] + \
+                _length_at(source_tables[spec['segment']], spec['t'])
+            progress = distance/source_totals[-1] if source_totals[-1] > 1e-9 else \
+                (spec['segment']+spec['t'])/len(source_segments)
+            segment, t = _map_virtual_progress(progress, target_tables, target_totals)
+        copied = {key: value for key, value in spec.items()
+                  if not key.startswith('anchor')}
+        copied.update(id=uuid.uuid4().hex, segment=segment, t=round(t, 6),
+                      before=dict(spec['before']), after=dict(spec['after']))
+        virtuals.append(copied)
+    attributes = target.attributes
+    attributes[STROKE_WIDTH_KEY] = source_width
+    attributes[STROKE_HEIGHT_KEY] = source_height
+    for key in (CAP_START_KEY, CAP_END_KEY, CAP_START_ANGLE_KEY, CAP_END_ANGLE_KEY,
+                CAP_START_CURVE_ON_KEY, CAP_END_CURVE_ON_KEY):
+        if key in source.attributes:
+            attributes[key] = source.attributes[key]
+        else:
+            _pop(attributes, key)
+    for at_end, key in ((False, CAP_START_CURVE_KEY), (True, CAP_END_CURVE_KEY)):
+        if key in source.attributes:
+            attributes[key] = [list(point) for point in cap_curve_of(source, at_end)]
+        else:
+            _pop(attributes, key)
+    attributes[VIRTUAL_KEY] = virtuals
+    corner_keys = (CORNER_ON_KEY, CORNER_KEY, CORNER_INNER_KEY,
+                   CORNER_TENSION_KEY, CORNER_INNER_TENSION_KEY,
+                   CORNER_RATIO_KEY, CORNER_INNER_RATIO_KEY)
+    for index, (position, item) in enumerate(zip(target_positions, target_nodes)):
+        node = item[0]
+        width, height, offset_value, rotation_value = samples[index] if matching_nodes else \
+            _numeric_at_progress(samples, source_positions, position, bool(source.closed))
+        data = node.userData
+        _pop(data, WIDTH_KEY)
+        data[SCALE_KEY] = round(width/source_width*100.0, 4)
+        data[HEIGHT_SCALE_KEY] = round(height/source_height*100.0, 4)
+        data[OFFSET_KEY] = round(offset_value*100.0, 4)
+        data[ROTATION_KEY] = round(rotation_value, 4)
+        for key in corner_keys:
+            _pop(data, key)
+        source_index = index if matching_nodes else _nearest_progress_index(
+            source_positions, position, bool(source.closed))
+        source_data = source_nodes[source_index][3]
+        for key in corner_keys:
+            if key in source_data:
+                data[key] = source_data[key]
+    if any(corner_on_of(item[3]) for item in source_nodes):
+        note_corner(target)
+    if virtuals:
+        virtual_nodes(target, len(target_segments), target_items)
+    return True
 
 
 def _sibling_paths(path, count):
@@ -883,7 +1139,9 @@ def _outline(path, defaults, items):
         attributes = path.attributes
         caps = (attributes.get(CAP_START_KEY, 'flat'), attributes.get(CAP_END_KEY, 'flat'))
         angles = (cut_angle(path, CAP_START_ANGLE_KEY), cut_angle(path, CAP_END_ANGLE_KEY))
-        specs = virtual_nodes(path, len(source_segments))
+        cap_curves = (cap_curve_of(path, False) if cap_curve_enabled(path, False) else None,
+                      cap_curve_of(path, True) if cap_curve_enabled(path, True) else None)
+        specs = virtual_nodes(path, len(source_segments), items)
         source_corners = corner_specs(path, items)
         independent = any(spec['side'] != 'both' for spec in specs)
         if independent:
@@ -902,7 +1160,7 @@ def _outline(path, defaults, items):
                 source_segments, specs, source_corners, closed)
             right_segments = right_smooths = right_map = left_map = None
         segments = tuple(segments)
-        key = ('curves', segments, right_segments, closed, caps, angles,
+        key = ('curves', segments, right_segments, closed, caps, angles, cap_curves,
                defaults.italic_angle, tuple(sorted(breaks['left'])),
                tuple(sorted(breaks['right'])), tuple(sorted(smooths)),
                tuple(sorted(right_smooths)) if independent else (),
@@ -911,7 +1169,7 @@ def _outline(path, defaults, items):
                tuple(None if c is None else tuple(sorted(c.items())) for c in corners))
 
     def compute():
-        collected, edges = [], {}
+        collected, edges, cap_points = [], {}, {}
         contours = outline_curves(list(segments), closed, caps[0], caps[1],
                                   italic_angle=defaults.italic_angle,
                                   start_angle=angles[0], end_angle=angles[1],
@@ -920,9 +1178,11 @@ def _outline(path, defaults, items):
                                   right_segments=right_segments,
                                   right_corner_radii=source_corners if independent else None,
                                   left_map=left_map, right_map=right_map,
-                                  right_smooth_virtuals=right_smooths if independent else ())
+                                  right_smooth_virtuals=right_smooths if independent else (),
+                                  cap_start_curve=cap_curves[0],
+                                  cap_end_curve=cap_curves[1], cap_out=cap_points)
         # The last slot keeps the outline as GSPaths once built (see _outline_paths).
-        return [contours, collected, edges, None]
+        return [contours, collected, edges, None, cap_points]
 
     return segments, _cached(key, compute), node_map
 
@@ -930,7 +1190,8 @@ def _outline(path, defaults, items):
 def curves_for_path(path, defaults=None, report=None, items=None):
     defaults = _resolve(defaults, path)
     items = path_nodes(path) if items is None else items
-    _, (contours, collected, _, _), _ = _outline(path, defaults, items)
+    _, cached, _ = _outline(path, defaults, items)
+    contours, collected = cached[:2]
     if report is not None:
         report.extend(dict(widget) for widget in collected)  # callers annotate them
     return contours
@@ -1184,6 +1445,14 @@ def interpolate_layer(layer, glyph, interpolation):
         for key in _STROKE_ATTRIBUTES:
             if template.attributes.get(key) is not None:
                 path.attributes[key] = template.attributes[key]
+        for at_end, curve_key in ((False, CAP_START_CURVE_KEY),
+                                  (True, CAP_END_CURVE_KEY)):
+            if cap_curve_enabled(path, at_end):
+                controls = [cap_curve_of(other, at_end) for _, other, _ in others]
+                path.attributes[curve_key] = [
+                    [sum(factor * controls[j][point][axis]
+                         for j, (_, _, factor) in enumerate(others))
+                     for axis in (0, 1)] for point in (0, 1)]
         virtual_sources = [(virtual_nodes(other), factor) for _, other, factor in others]
         if virtual_sources and all(
                 [(spec['id'], spec['segment'], spec['mode'], spec['side']) for spec in specs] ==
@@ -1321,6 +1590,140 @@ def convert_glyph(glyph, keep_marks=True):
         for layer in layers:
             layer.userData[LAYER_STATE_KEY] = False
     return count
+
+
+def outline_signature(path, defaults=None, items=None):
+    """Segment kinds of a centerline's outline, one string per contour ('l' line,
+    'c' cubic): what has to match between masters for interpolation."""
+    items = path_nodes(path) if items is None else items
+    _, cached, _ = _outline(path, _resolve(defaults, path), items)
+    return tuple(''.join('c' if kind == 'cubic' else 'l' for kind, _ in contour)
+                 for contour in cached[0] if contour)
+
+
+def compare_string_suffix(layer):
+    """Text appended to Glyphs' compare string of a layer (its compatibility
+    check): the outline structure of every stroke, so Glyphs itself reports masters
+    whose outlines differ although their centerlines match. Empty for layers
+    without strokes, which keeps every other glyph exactly as Glyphs sees it."""
+    if not layer_state(layer):
+        return ''
+    defaults = None
+    parts = []
+    for path in list(layer.paths):
+        if generated(path) or is_outline(path) or not enabled(path):
+            parts.append('-')
+            continue
+        items = path_nodes(path)
+        if not items or not _valid_structure(path, [item[1] for item in items]):
+            parts.append('?')
+            continue
+        if defaults is None:
+            defaults = layer_defaults(layer)
+        try:
+            parts.append(','.join(outline_signature(path, defaults, items)))
+        except ValueError:
+            parts.append('?')
+    if all(part in ('-', '?') for part in parts):
+        return ''
+    return '|vs:' + ';'.join(parts)
+
+
+
+def _interpolated_layers(glyph):
+    """Master and brace/bracket layers: the layers Glyphs interpolates."""
+    result = []
+    for layer in list(glyph.layers):
+        try:
+            if not (layer.isMasterLayer or layer.isSpecialLayer):
+                continue
+        except AttributeError:
+            pass  # plain layer objects (tests)
+        result.append(layer)
+    return result
+
+
+def _mismatch_reasons(entries):
+    """Settings that differ between the (path, items) of one path in several layers
+    and change the outline structure."""
+    reasons = []
+    for at_end, end in ((False, 'start'), (True, 'end')):
+        if len({cap_curve_enabled(path, at_end) for path, _ in entries}) > 1:
+            reasons.append(('cap curve', end))
+        key = CAP_END_KEY if at_end else CAP_START_KEY
+        if len({path.attributes.get(key, 'flat') in ('round', 'ellipse')
+                for path, _ in entries}) > 1:
+            reasons.append(('cap shape', end))
+    corners = {tuple(data is not None and corner_on_of(data)
+                     for _, _, _, data in _on_curve(items, bool(path.closed)))
+               for path, items in entries}
+    if len(corners) > 1:
+        reasons.append(('corner', None))
+    return reasons or [('outline', None)]
+
+
+def master_incompatibilities(glyph):
+    """{path index in layer.paths: {'reasons': [(kind, end)], 'layers': [names]}}
+    for strokes whose centerlines are compatible but whose outlines get a different
+    structure in some master, e.g. a cap curve switched on in one master only.
+    `layers` names the masters that differ from the most common outline."""
+    if glyph is None or not glyph_enabled(glyph):
+        return {}
+    layers = _interpolated_layers(glyph)
+    if len(layers) < 2:
+        return {}
+    table = []
+    for layer in layers:
+        defaults = layer_defaults(layer)
+        rows = []
+        for path in list(layer.paths):
+            items = path_nodes(path)
+            kinds = tuple(item[1] for item in items)
+            signature = None
+            if not generated(path) and not is_outline(path) and enabled(path) and \
+                    items and _valid_structure(path, list(kinds)):
+                try:
+                    signature = outline_signature(path, defaults, items)
+                except ValueError:
+                    signature = None
+            rows.append((path, items, (bool(path.closed), kinds), signature))
+        table.append(rows)
+    if len({len(rows) for rows in table}) != 1:
+        return {}  # Glyphs reports differing path counts itself
+    result = {}
+    for index in range(len(table[0])):
+        column = [rows[index] for rows in table]
+        if len({row[2] for row in column}) != 1 or any(row[3] is None for row in column):
+            continue  # different centerlines: Glyphs' own compatibility check shows them
+        signatures = [row[3] for row in column]
+        if len(set(signatures)) == 1:
+            continue
+        common = max(set(signatures), key=signatures.count)
+        result[index] = {
+            'reasons': _mismatch_reasons([(row[0], row[1]) for row in column]),
+            'layers': [getattr(layer, 'name', None) for layer, signature
+                       in zip(layers, signatures) if signature != common]}
+    return result
+
+
+def describe_incompatibility(entry, japanese=False):
+    """One line for the edit view or the export log."""
+    names = {'cap curve': ('cap curve', 'キャップカーブ'),
+             'cap shape': ('round cap', '丸キャップ'),
+             'corner': ('live corner', 'ライブコーナー'),
+             'outline': ('outline structure', '輪郭構成')}
+    ends = {'start': ('start', '始点'), 'end': ('end', '終点'), None: ('', '')}
+    pick = 1 if japanese else 0
+    parts = []
+    for kind, end in entry['reasons']:
+        label = names[kind][pick]
+        if ends[end][pick]:
+            label = ('%s（%s）' if japanese else '%s (%s)') % (label, ends[end][pick])
+        parts.append(label)
+    layers = ', '.join(name for name in entry['layers'] if name)
+    if japanese:
+        return 'マスター非互換：' + '・'.join(parts) + (' ― ' + layers if layers else '')
+    return 'Masters incompatible: ' + ', '.join(parts) + (' - ' + layers if layers else '')
 
 
 def node_contour(path):

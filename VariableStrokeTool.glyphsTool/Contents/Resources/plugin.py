@@ -11,13 +11,18 @@ from AppKit import (NSBezierPath, NSColor, NSEvent, NSImage, NSMenu, NSMenuItem,
                     NSThread, NSPasteboard, NSPasteboardTypePDF, NSData,
                     NSEventModifierFlagOption, NSEventModifierFlagShift,
                     NSEventModifierFlagCommand,
-                    NSRoundLineCapStyle, NSRoundLineJoinStyle)
+                    NSRoundLineCapStyle, NSRoundLineJoinStyle,
+                    NSAttributedString, NSFont, NSFontAttributeName,
+                    NSForegroundColorAttributeName)
 from GlyphsApp import (Glyphs, GSCallbackHandler, GSCustomParameter, GSComponent, OFFCURVE,
                        DOCUMENTOPENED, UPDATEINTERFACE, DRAWBACKGROUND, CONTEXTMENUCALLBACK, WINDOW_MENU)
 from GlyphsApp.plugins import SelectTool
 from vanilla import (Window, FloatingWindow, Group, SegmentedButton, TextBox, EditText, PopUpButton,
                      ImageButton, Button, List, HorizontalLine)
 from glyphs_bridge import (CAP_START_KEY, CAP_END_KEY, CAP_START_ANGLE_KEY, CAP_END_ANGLE_KEY,
+                           CAP_START_CURVE_KEY, CAP_END_CURVE_KEY,
+                           CAP_START_CURVE_ON_KEY, CAP_END_CURVE_ON_KEY,
+                           cap_curve_of, cap_curve_enabled, cap_curve_widget,
                            WIDTH_KEY, HEIGHT_SCALE_KEY, CORNER_KEY, CORNER_ON_KEY, CORNER_INNER_KEY,
                            CORNER_TENSION_KEY, CORNER_RATIO_KEY, DEFAULT_CORNER_RADIUS,
                            CORNER_INNER_TENSION_KEY, CORNER_INNER_RATIO_KEY,
@@ -37,11 +42,14 @@ from glyphs_bridge import (CAP_START_KEY, CAP_END_KEY, CAP_START_ANGLE_KEY, CAP_
                            edges_for_path, selected_nib_nodes, ellipse_cap_nodes,
                            set_node_nib_size, path_nodes, PROFILE, LAYER_STATE_KEY, has_live_corners, nib_of,
                            scale_of, height_scale_of, offset_of, rotation_of,
-                           corner_on_of, corner_spec_of, copied_contours)
+                           corner_on_of, corner_spec_of, copied_contours,
+                           copy_stroke_settings, compare_string_suffix,
+                           master_incompatibilities, describe_incompatibility)
 from glyphs_bridge import (VIRTUAL_KEY, virtual_nodes, virtual_widgets, virtual_point,
                            segments_for_path, _virtual_section_angle)
 from clipboard_export import svg_document, pdf_document
 from variable_stroke_core import (unit, sub, add, length, outline_curves,
+                                  cap_curve_coordinates,
                                   nib_edges, ellipse_nib_edges)
 
 CAP_NAMES = [('flat', 'Flat', 'フラット'), ('round', 'Round', '丸'),
@@ -249,6 +257,49 @@ def _hook_copy():
     _hooked_copy.append(True)
 
 
+_hooked_compare = []
+
+
+def _in_open_document(layer):
+    """True for a layer of a font the user edits (it has a document window).
+    Export works on detached copies, often off the main thread; those keep
+    Glyphs' own compare string."""
+    if not NSThread.isMainThread():
+        return False
+    try:
+        font = layer.parent.parent
+        return font is not None and font.parent is not None
+    except Exception:
+        return False
+
+
+def _hook_compare_string():
+    """Add the strokes' outline structure to -[GSLayer compareString], the text
+    Glyphs compares to decide whether masters are compatible. Masters whose
+    outlines differ (a cap curve or round cap in one master only, ...) then show
+    as incompatible in Glyphs itself although their centerlines match."""
+    if _hooked_compare:
+        return
+    cls = objc.lookUpClass('GSLayer')
+    name = b'compareString'
+    original = cls.instanceMethodForSelector_(name)
+
+    def wrapper(self, original=original):
+        result = original(self)
+        if not _in_open_document(self):
+            return result  # export copies: half converted while Glyphs checks them
+        try:
+            suffix = compare_string_suffix(self)
+        except Exception:
+            print(traceback.format_exc())
+            suffix = ''
+        return (result or '') + suffix if suffix else result
+
+    objc.classAddMethod(cls, name, objc.selector(wrapper, selector=name,
+                                                 signature=original.signature))
+    _hooked_compare.append(True)
+
+
 def _invalidate(layer, paths=None):
     """Tell Glyphs the layer changed so it prepares its preview outline again."""
     for path in (paths if paths is not None else list(layer.paths)):
@@ -296,6 +347,32 @@ def _cap_icon(style):
 
 
 _LINK_ICONS = {}
+
+
+def _eyedropper_icon():
+    try:
+        image = NSImage.imageWithSystemSymbolName_accessibilityDescription_(
+            'eyedropper', 'Copy stroke settings')
+        if image is not None:
+            return image
+    except AttributeError:
+        pass
+
+    def draw(rect):
+        NSColor.labelColor().set()
+        stem = NSBezierPath.bezierPath()
+        stem.moveToPoint_((3, 2))
+        stem.lineToPoint_((9, 8))
+        stem.lineToPoint_((12, 11))
+        stem.setLineWidth_(1.7)
+        stem.stroke()
+        bulb = NSBezierPath.bezierPathWithOvalInRect_(((10, 10), (4, 4)))
+        bulb.fill()
+        return True
+
+    image = NSImage.imageWithSize_flipped_drawingHandler_((16, 16), False, draw)
+    image.setTemplate_(True)
+    return image
 
 
 def _link_icon(linked):
@@ -398,7 +475,8 @@ def _normalize_quietly(layer):
 
 
 _PATH_KEYS = (STROKE_WIDTH_KEY, STROKE_HEIGHT_KEY, CAP_START_KEY, CAP_END_KEY,
-              CAP_START_ANGLE_KEY, CAP_END_ANGLE_KEY, VIRTUAL_KEY)
+              CAP_START_ANGLE_KEY, CAP_END_ANGLE_KEY, CAP_START_CURVE_KEY,
+              CAP_END_CURVE_KEY, CAP_START_CURVE_ON_KEY, CAP_END_CURVE_ON_KEY, VIRTUAL_KEY)
 _NODE_KEYS = (SCALE_KEY, HEIGHT_SCALE_KEY, OFFSET_KEY, ROTATION_KEY, WIDTH_KEY, CORNER_ON_KEY, CORNER_KEY, CORNER_INNER_KEY,
               CORNER_TENSION_KEY, CORNER_INNER_TENSION_KEY,
               CORNER_RATIO_KEY, CORNER_INNER_RATIO_KEY)
@@ -580,6 +658,11 @@ class VariableStrokeLayerProcessor(NSObject):
 
     @objc.signature(b'Z@:@@o^@')
     def processLayer_extraHandles_error_(self, layer, extraHandles, error):
+        # Glyphs prepares export layers on worker threads while holding their
+        # shape read lock. Replacing paths here deadlocks; the export filter
+        # converts those layers later in the export pipeline.
+        if not NSThread.isMainThread():
+            return True, None
         start = time.perf_counter() if PROFILE.enabled else None
         name = 'prepare layer: no strokes'
         try:
@@ -923,11 +1006,17 @@ class VariableStrokeTool(SelectTool):
         self._layer_processor = VariableStrokeLayerProcessor.new()
         self._settings = None
         self._refresh_pending = False
+        self._check_pending = False
+        self._incompatible = (None, {})  # (glyph id, master_incompatibilities)
         self._moving_nodes = False  # a plain node drag is in progress
         self._virtual_selected = None  # (path, stable virtual id)
         self._virtual_adding = False
         self._virtual_click_consumed = False
         self._virtual_error = ''
+        self._sampling = False
+        self._sample_targets = ()
+        self._sample_click_consumed = False
+        self._sample_error = ''
         self._frame_profile, self._frame_last, self._frame_times = False, None, []
         self._normalized = None  # what _normalize_quietly last saw (see _on_update)
         try:
@@ -954,6 +1043,8 @@ class VariableStrokeTool(SelectTool):
         group.heightField = SteppingEditText((174, 4, 42, 19), sizeStyle='small')
         group.widthReset = ImageButton((218, 5, 17, 17), imageNamed='NSRefreshTemplate',
                                        bordered=False, callback=self.resetWidthFromInspector_)
+        group.eyedropper = ImageButton((239, 5, 18, 18), imageObject=_eyedropper_icon(),
+                                       bordered=False, callback=self.sampleFromInspector_)
         group.tabs = SegmentedButton((width_px - 285, 4, 254, 20),
                                      [{'title': _loc(english, japanese)}
                                       for _, english, japanese in TABS],
@@ -961,6 +1052,7 @@ class VariableStrokeTool(SelectTool):
         group.settings = ImageButton((width_px - 23, 5, 17, 17), imageNamed='NSActionTemplate',
                                      bordered=False, callback=self.showSettingsFromInspector_)
         group.divider = HorizontalLine((6, 28, -6, 1))
+        group.sampleStatus = TextBox((6, TAB_TOP+6, -6, 20), '', sizeStyle='small')
 
         node = group.nodeTab = Group((0, TAB_TOP, -0, 24))
         node.scaleLabel = TextBox((6, 4, 24, 14), _loc('W', '幅'), sizeStyle='small')
@@ -977,7 +1069,7 @@ class VariableStrokeTool(SelectTool):
         node.rotationUnit = TextBox((376, 4, 7, 14), '°', sizeStyle='small')
 
         caps = [{'imageObject': _cap_icon(value), 'width': 21} for value in CAP_VALUES]
-        cap = group.capsTab = Group((0, TAB_TOP, -0, 24))
+        cap = group.capsTab = Group((0, TAB_TOP, -0, 48))
         cap.startLabel = TextBox((6, 4, 30, 14), _loc('Start', '始点'), sizeStyle='small')
         cap.startCap = SegmentedButton((36, 0, 147, 20), caps,
                                        callback=self.startCapFromInspector_, sizeStyle='small')
@@ -988,6 +1080,17 @@ class VariableStrokeTool(SelectTool):
                                      callback=self.endCapFromInspector_, sizeStyle='small')
         cap.endAngle = SteppingEditText((435, 0, 36, 19), sizeStyle='small')
         cap.endAngleUnit = TextBox((473, 4, 10, 14), '°', sizeStyle='small')
+        curve_modes = [{'title': _loc('Line', '直線')},
+                       {'title': _loc('Curve', 'カーブ')}]
+        cap.startCurveMode = SegmentedButton((36, 25, 112, 20), curve_modes,
+                                              callback=self.startCurveModeFromInspector_,
+                                              sizeStyle='small')
+        cap.endCurveMode = SegmentedButton((284, 25, 112, 20), curve_modes,
+                                            callback=self.endCurveModeFromInspector_,
+                                            sizeStyle='small')
+        cap.curveHint = TextBox((405, 29, 130, 14),
+                                _loc('Drag purple handles', '紫のハンドルを操作'),
+                                sizeStyle='small')
 
         corner = group.cornerTab = Group((0, TAB_TOP, -0, 24))
         corner.toggle = SegmentedButton((6, 0, 64, 20), [{'title': 'ON'}, {'title': 'OFF'}],
@@ -1050,6 +1153,9 @@ class VariableStrokeTool(SelectTool):
             _loc('Follow the master default width and height', 'マスターの既定の幅・高さに戻す'))
         group.settings.getNSButton().setToolTip_(
             _loc('Variable Stroke Settings…', '可変ストローク設定…'))
+        group.eyedropper.getNSButton().setToolTip_(
+            _loc('Select destination path nodes, then click to pick another stroke.',
+                 'コピー先パスのノードを選び、ここを押してコピー元のストロークを選択します。'))
         group.heightField.getNSTextField().setToolTip_(
             _loc('Stroke height of the path (thickness of horizontal strokes). '
                  'Grey: follows the master default.',
@@ -1084,6 +1190,10 @@ class VariableStrokeTool(SelectTool):
             segmented = control.getNSSegmentedButton()
             for index, (_, english, japanese) in enumerate(CAP_NAMES):
                 segmented.setToolTip_forSegment_(_loc(english, japanese), index)
+        for control in (cap.startCurveMode, cap.endCurveMode):
+            control.getNSSegmentedButton().setToolTip_forSegment_(
+                _loc('Round and ellipse caps do not support editable curves.',
+                     '円と楕円の線端ではカーブを使えません。'), 1)
         for field, english, japanese in (
                 (corner.outerField, 'Radius of the outer corner at the selected nodes (also the '
                  'cap corners at ends). Drag the orange handle on the canvas.',
@@ -1156,6 +1266,10 @@ class VariableStrokeTool(SelectTool):
             _hook_copy()
         except Exception:
             print(traceback.format_exc())
+        try:
+            _hook_compare_string()
+        except Exception:
+            print(traceback.format_exc())
         title = _loc('Variable Stroke Settings…', '可変ストローク設定…')
         menu = Glyphs.menu[WINDOW_MENU]
         existing_items = [item for item in menu.submenu().itemArray()
@@ -1186,6 +1300,11 @@ class VariableStrokeTool(SelectTool):
         self._moving_nodes = False
         self._virtual_adding = False
         self._virtual_click_consumed = False
+        self._sampling = False
+        self._sample_targets = ()
+        self._sample_click_consumed = False
+        self._sample_error = ''
+        self._show_tab(self._tab)
         self._inspector_provider.performSelector_withObject_afterDelay_('reloadInspector:', None, 0.0)
 
     @objc.python_method
@@ -1216,7 +1335,9 @@ class VariableStrokeTool(SelectTool):
 
     @objc.python_method
     def _show_settings(self):
-        if self._settings is None:
+        # Vanilla tears down List callbacks when a window closes. A closed
+        # settings window cannot be reopened with its existing controls.
+        if self._settings is None or not self._settings.is_open():
             self._settings = VariableStrokeSettings()
         self._settings.open()
 
@@ -1228,7 +1349,8 @@ class VariableStrokeTool(SelectTool):
         group = self.infoBoxWindow.group
         for tab, view in (('node', group.nodeTab), ('caps', group.capsTab),
                           ('corner', group.cornerTab), ('virtual', group.virtualTab)):
-            view.show(tab == name)
+            view.show(tab == name and not self._sampling)
+        group.sampleStatus.show(self._sampling)
         group.tabs.set(TAB_NAMES.index(name))
 
     @objc.python_method
@@ -1485,10 +1607,33 @@ class VariableStrokeTool(SelectTool):
                 pass
             finally:
                 self._normalizing = False
+        if not self._check_pending:
+            self._check_pending = True
+            self.performSelector_withObject_afterDelay_('deferredCompatibility:', None, 0.0)
         # Several updates can arrive for one event; refresh the panel once after it.
         if not self._refresh_pending and self._is_current():
             self._refresh_pending = True
             self.performSelector_withObject_afterDelay_('deferredRefresh:', None, 0.0)
+
+    def deferredCompatibility_(self, sender):
+        # Why masters are incompatible (Glyphs only says that they are): checked
+        # once per edit for the glyph in the edit view, drawn by _draw_centerlines.
+        self._check_pending = False
+        result = (None, {})
+        try:
+            layer = Glyphs.font.currentTab.activeLayer() if Glyphs.font and \
+                Glyphs.font.currentTab else None
+            glyph = layer.parent if layer is not None else None
+            if glyph is not None and glyph_enabled(glyph):
+                result = (objc.pyobjc_id(glyph), master_incompatibilities(glyph))
+        except Exception:
+            print(traceback.format_exc())
+        if result != self._incompatible:
+            self._incompatible = result
+            try:
+                Glyphs.font.currentTab.redraw()
+            except Exception:
+                pass
 
     def deferredRefresh_(self, sender):
         self._refresh_pending = False
@@ -1542,7 +1687,10 @@ class VariableStrokeTool(SelectTool):
             scale = max(0.05, float(options['Scale']))
         except Exception:
             scale = self._scale()
-        for source in layer.paths:
+        glyph_id, incompatible = self._incompatible
+        if glyph_id != objc.pyobjc_id(layer.parent):
+            incompatible = {}
+        for index, source in enumerate(layer.paths):
             if not enabled(source) or generated(source):
                 continue
             try:
@@ -1559,8 +1707,28 @@ class VariableStrokeTool(SelectTool):
             line.setLineWidth_(3.0 / scale)
             line.setLineCapStyle_(NSRoundLineCapStyle)
             line.setLineJoinStyle_(NSRoundLineJoinStyle)
-            NSColor.colorWithCalibratedRed_green_blue_alpha_(0.45, 0.62, 0.86, 0.55).set()
+            if index in incompatible:
+                NSColor.colorWithCalibratedRed_green_blue_alpha_(0.9, 0.15, 0.1, 0.85).set()
+            elif self._sampling and any(source == target for target in self._sample_targets):
+                NSColor.colorWithCalibratedRed_green_blue_alpha_(0.13, 0.67, 0.39, 0.85).set()
+            else:
+                NSColor.colorWithCalibratedRed_green_blue_alpha_(0.45, 0.62, 0.86, 0.55).set()
             line.stroke()
+            if index in incompatible:
+                self._draw_incompatibility(source, incompatible[index], scale)
+
+    @objc.python_method
+    def _draw_incompatibility(self, source, entry, scale):
+        node = next((node for node in source.nodes if node.type != OFFCURVE), None)
+        if node is None:
+            return
+        text = describe_incompatibility(entry, _loc('en', 'ja') == 'ja')
+        attributes = {NSFontAttributeName: NSFont.systemFontOfSize_(11.0 / scale),
+                      NSForegroundColorAttributeName:
+                          NSColor.colorWithCalibratedRed_green_blue_alpha_(0.85, 0.1, 0.05, 1.0)}
+        label = NSAttributedString.alloc().initWithString_attributes_(text, attributes)
+        position = node.position
+        label.drawAtPoint_((position.x + 6.0 / scale, position.y + 6.0 / scale))
 
     @objc.python_method
     def _font_has_strokes(self, font):
@@ -1678,7 +1846,9 @@ class VariableStrokeTool(SelectTool):
             details = tuple((path.attributes.get(CAP_START_KEY, 'flat'),
                              path.attributes.get(CAP_END_KEY, 'flat'),
                              cut_angle(path, CAP_START_ANGLE_KEY),
-                             cut_angle(path, CAP_END_ANGLE_KEY)) for path in open_paths)
+                             cut_angle(path, CAP_END_ANGLE_KEY),
+                             cap_curve_enabled(path, False),
+                             cap_curve_enabled(path, True)) for path in open_paths)
         else:
             entries = self._target_entries(paths, selected) if paths else []
             if tab == 'node':
@@ -1699,7 +1869,10 @@ class VariableStrokeTool(SelectTool):
                                   CORNER_INNER_RATIO_KEY not in data)
                                  for _, data, _ in entries),
                            bool(entries) and all(end for _, _, end in entries))
-        ui_state = (tab, stroke, details)
+        selected_targets = any(enabled(path) for path in
+                               self._selected_paths(layer, selected)) if layer else False
+        ui_state = (tab, stroke, details, selected_targets,
+                    self._sampling, self._sample_error)
         if ui_state == self._last_ui_state:
             return
         self._last_ui_state = ui_state
@@ -1730,6 +1903,13 @@ class VariableStrokeTool(SelectTool):
         group.widthField.set(('%g' % bases[0]) if _same(bases) else '')
         group.heightField.set(('%g' % round(heights[0], 2)) if _same(heights) else '')
         group.widthReset.enable(any(overridden) or any(height_overridden))
+        group.eyedropper.enable(self._sampling or
+                                (active and layer is not None and
+                                 any(enabled(path) for path in self._selected_paths(layer))))
+        group.eyedropper.getNSButton().setState_(1 if self._sampling else 0)
+        group.sampleStatus.set(self._sample_error or _loc(
+            'Click the source stroke centerline. Esc cancels.',
+            'コピー元の中心線をクリック。Escで中止。'))
         for field, flags in ((group.widthField, overridden),
                              (group.heightField, height_overridden)):
             field.getNSTextField().setTextColor_(
@@ -1785,9 +1965,12 @@ class VariableStrokeTool(SelectTool):
 
     @objc.python_method
     def _show_caps_tab(self, tab, open_paths, details):
-        for index, (control, field) in enumerate(((tab.startCap, tab.startAngle),
-                                                  (tab.endCap, tab.endAngle))):
-            styles = {item[index] for item in details}
+        tab.curveHint.show(any(item[4] or item[5] for item in details))
+        for index, (control, field, mode) in enumerate((
+                (tab.startCap, tab.startAngle, tab.startCurveMode),
+                (tab.endCap, tab.endAngle, tab.endCurveMode))):
+            styles = {'flat' if item[index] == 'curve' else item[index]
+                      for item in details}
             angles = [item[2 + index] for item in details]
             control.enable(open_paths)
             if len(styles) == 1 and next(iter(styles)) in CAP_VALUES:
@@ -1798,6 +1981,14 @@ class VariableStrokeTool(SelectTool):
             field.set(('%g' % angles[0]) if _same(angles) else '')
             field.getNSTextField().setTextColor_(
                 NSColor.labelColor() if 'angle' in styles else NSColor.secondaryLabelColor())
+            eligible = [item for item in details
+                        if item[index] not in ('round', 'ellipse')]
+            mode.enable(bool(eligible))
+            states = [item[4 + index] for item in eligible]
+            if states and all(state == states[0] for state in states):
+                mode.set(1 if states[0] else 0)
+            else:
+                mode.getNSSegmentedButton().setSelectedSegment_(-1)
 
     @objc.python_method
     def _show_corner_tab(self, tab, editable, details, cap_mode):
@@ -1869,17 +2060,90 @@ class VariableStrokeTool(SelectTool):
         self._refresh_ui()
         Glyphs.redraw()
 
+    def sampleFromInspector_(self, sender):
+        if self._sampling:
+            self._sampling = False
+            self._sample_targets = ()
+            self._sample_error = ''
+        else:
+            layer = self._layer()
+            targets = [path for path in self._selected_paths(layer)
+                       if enabled(path)] if layer is not None else []
+            if not targets:
+                self._sample_error = _loc('Select destination path nodes first',
+                                          '先にコピー先パスのノードを選択してください')
+                self._last_ui_state = None
+                self._refresh_ui()
+                return
+            self._virtual_adding = False
+            self._virtual_error = ''
+            self._sampling = True
+            self._sample_targets = tuple(targets)
+            self._sample_error = ''
+        self._show_tab(self._tab)
+        self._last_ui_state = None
+        self._refresh_ui()
+        self._redraw()
+
+    @objc.python_method
+    def _sample_at(self, layer, point, strokes, defaults, threshold):
+        candidates = []
+        for path, _ in strokes:
+            if any(path == target for target in self._sample_targets):
+                continue
+            try:
+                nearest = self._nearest_virtual_position(path, point, defaults)
+            except ValueError:
+                continue
+            if nearest is not None and nearest[0] <= threshold:
+                candidates.append((nearest[0], path))
+        if not candidates:
+            self._sample_error = _loc('Click another stroke centerline',
+                                      '別のストロークの中心線をクリックしてください')
+            self._last_ui_state = None
+            self._refresh_ui()
+            return False
+        source = min(candidates, key=lambda item: item[0])[1]
+        targets = [path for path in self._sample_targets
+                   if any(path == current for current in layer.paths)]
+        changed = []
+        layer.beginChanges()
+        try:
+            for target in targets:
+                if copy_stroke_settings(source, target):
+                    changed.append(target)
+        finally:
+            layer.endChanges()
+        if not changed:
+            self._sample_error = _loc('The destination path cannot use these settings',
+                                      'コピー先のパスへ設定を適用できません')
+            self._last_ui_state = None
+            self._refresh_ui()
+            return False
+        _invalidate(layer, changed)
+        self._sampling = False
+        self._sample_targets = ()
+        self._sample_error = ''
+        self._show_tab(self._tab)
+        self._last_ui_state = None
+        self._refresh_ui()
+        self._redraw()
+        return True
+
     @objc.python_method
     def _set_cap(self, side, style):
         layer = self._layer()
         if layer is None:
             return
         key = CAP_START_KEY if side == 'start' else CAP_END_KEY
+        curve_key = CAP_START_CURVE_ON_KEY if side == 'start' else CAP_END_CURVE_ON_KEY
         layer.beginChanges()
         changed = []
         try:
             for path in self._target_paths(layer):
                 if enabled(path) and glyph_enabled(layer.parent) and not path.closed:
+                    if path.attributes.get(key) == 'curve':
+                        path.attributes[curve_key] = True
                     path.attributes[key] = style
                     changed.append(path)
         finally:
@@ -1895,6 +2159,38 @@ class VariableStrokeTool(SelectTool):
     def endCapFromInspector_(self, sender):
         if not self._updating_ui and 0 <= sender.get() < len(CAP_VALUES):
             self._set_cap('end', CAP_VALUES[sender.get()])
+
+    @objc.python_method
+    def _set_curve_cap(self, side, on):
+        layer = self._layer()
+        if layer is None:
+            return
+        style_key = CAP_START_KEY if side == 'start' else CAP_END_KEY
+        mode_key = CAP_START_CURVE_ON_KEY if side == 'start' else CAP_END_CURVE_ON_KEY
+        changed = []
+        layer.beginChanges()
+        try:
+            for path in self._edit_paths(layer):
+                if path.closed or path.attributes.get(style_key) in ('round', 'ellipse'):
+                    continue
+                if path.attributes.get(style_key) == 'curve':
+                    path.attributes[style_key] = 'flat'
+                path.attributes[mode_key] = bool(on)
+                changed.append(path)
+        finally:
+            layer.endChanges()
+        _invalidate(layer, changed)
+        self._last_ui_state = None
+        self._refresh_ui()
+        self._redraw()
+
+    def startCurveModeFromInspector_(self, sender):
+        if not self._updating_ui and sender.get() in (0, 1):
+            self._set_curve_cap('start', sender.get() == 1)
+
+    def endCurveModeFromInspector_(self, sender):
+        if not self._updating_ui and sender.get() in (0, 1):
+            self._set_curve_cap('end', sender.get() == 1)
 
     @objc.python_method
     def _edit_paths(self, layer):
@@ -2268,6 +2564,17 @@ class VariableStrokeTool(SelectTool):
                 yield axis, path, node, middle, direction, tip
 
     @objc.python_method
+    def _curve_cap_handles(self, strokes, defaults):
+        for path, items in strokes:
+            for at_end in (False, True):
+                try:
+                    widget = cap_curve_widget(path, at_end, defaults, items)
+                except ValueError:
+                    continue
+                if widget is not None:
+                    yield path, widget
+
+    @objc.python_method
     @_timed('draw handles (foreground)')
     def foreground(self, layer):
         if layer is None:
@@ -2293,6 +2600,7 @@ class VariableStrokeTool(SelectTool):
         if not strokes:
             return
         self._draw_virtual_handles(strokes, defaults, scale)
+        self._draw_curve_caps(strokes, defaults, scale)
         selected = set(layer.selection)
         handles = list(self._handles(strokes, defaults))
         selected_nibs = list(self._selected_nibs(strokes, defaults, selected))
@@ -2403,6 +2711,23 @@ class VariableStrokeTool(SelectTool):
             x, y = knob
             NSBezierPath.bezierPathWithOvalInRect_(
                 ((x-small, y-small), (small*2, small*2))).fill()
+
+    @objc.python_method
+    def _draw_curve_caps(self, strokes, defaults, scale):
+        color = NSColor.colorWithCalibratedRed_green_blue_alpha_(0.62, 0.24, 0.72, 1.0)
+        radius = 4.0 / scale
+        for _, widget in self._curve_cap_handles(strokes, defaults):
+            first, control1, control2, last = widget['points']
+            for anchor, control in ((first, control1), (last, control2)):
+                line = NSBezierPath.bezierPath()
+                line.moveToPoint_(anchor)
+                line.lineToPoint_(control)
+                line.setLineWidth_(1.0 / scale)
+                color.colorWithAlphaComponent_(0.65).set()
+                line.stroke()
+                color.set()
+                NSBezierPath.bezierPathWithOvalInRect_(
+                    ((control[0]-radius, control[1]-radius), (2*radius, 2*radius))).fill()
 
     @objc.python_method
     def _draw_virtual_handles(self, strokes, defaults, scale):
@@ -2558,6 +2883,10 @@ class VariableStrokeTool(SelectTool):
             point = (loc.x, loc.y)
             threshold = 8.0 / self._scale()
             defaults, strokes = self._strokes(layer)
+            if self._sampling:
+                self._sample_click_consumed = True
+                self._sample_at(layer, point, strokes, defaults, 10.0/self._scale())
+                return
             if self._virtual_adding:
                 self._virtual_click_consumed = True
                 self._add_virtual_at(layer, point, strokes, defaults, threshold)
@@ -2610,6 +2939,20 @@ class VariableStrokeTool(SelectTool):
                             self._last_ui_state = None
                             self._refresh_ui()
                             return
+            cap_hits = [(length(sub(point, control)), path, widget, index)
+                        for path, widget in self._curve_cap_handles(strokes, defaults)
+                        for index, control in enumerate(widget['points'][1:3])]
+            if cap_hits:
+                distance, path, widget, index = min(cap_hits, key=lambda hit: hit[0])
+                if distance <= threshold:
+                    self._select_node(layer, widget['node'])
+                    layer.beginChanges()
+                    self._drag = {'kind': 'cap-curve', 'layer': layer, 'path': path,
+                                  'widget': widget, 'control': index}
+                    self._select_tab('caps')
+                    self._last_ui_state = None
+                    self._refresh_ui()
+                    return
             selected = set(layer.selection)
             handles = list(self._handles(strokes, defaults))
             selected_nibs = list(self._selected_nibs(strokes, defaults, selected))
@@ -2688,6 +3031,16 @@ class VariableStrokeTool(SelectTool):
         objc.super(VariableStrokeTool, self).mouseDown_(event)
 
     def keyDown_(self, event):
+        if self._sampling and (event.keyCode() == 53 or
+                               str(event.charactersIgnoringModifiers()) == '\x1b'):
+            self._sampling = False
+            self._sample_targets = ()
+            self._sample_error = ''
+            self._show_tab(self._tab)
+            self._last_ui_state = None
+            self._refresh_ui()
+            self._redraw()
+            return
         if self._virtual_adding and (event.keyCode() == 53 or
                                      str(event.charactersIgnoringModifiers()) == '\x1b'):
             self._virtual_adding = False
@@ -2752,7 +3105,7 @@ class VariableStrokeTool(SelectTool):
         node.userData[CORNER_ON_KEY] = True
 
     def mouseDragged_(self, event):
-        if self._virtual_click_consumed:
+        if self._virtual_click_consumed or self._sample_click_consumed:
             return
         if PROFILE.enabled:
             now = time.perf_counter()
@@ -2776,6 +3129,20 @@ class VariableStrokeTool(SelectTool):
             return
         drag = self._drag
         loc = self.editViewController().graphicView().getActiveLocation_(event)
+        if drag.get('kind') == 'cap-curve':
+            widget = drag['widget']
+            coordinates = cap_curve_coordinates(
+                widget['left'], widget['right'], widget['tangent'],
+                widget['at_end'], (loc.x, loc.y))
+            if coordinates is not None:
+                path = drag['path']
+                values = [list(point) for point in cap_curve_of(path, widget['at_end'])]
+                values[drag['control']] = [round(value, 3) for value in coordinates]
+                path.attributes[CAP_END_CURVE_KEY if widget['at_end']
+                                else CAP_START_CURVE_KEY] = values
+                _invalidate(drag['layer'], [path])
+                self._redraw()
+            return
         if drag.get('kind') == 'virtual-position':
             nearest = self._nearest_virtual_position(
                 drag['path'], (loc.x, loc.y), segment_index=drag['segment'])
@@ -2880,6 +3247,9 @@ class VariableStrokeTool(SelectTool):
 
     @objc.python_method
     def _mouse_up(self, event):
+        if self._sample_click_consumed:
+            self._sample_click_consumed = False
+            return
         if self._virtual_click_consumed:
             self._virtual_click_consumed = False
             return

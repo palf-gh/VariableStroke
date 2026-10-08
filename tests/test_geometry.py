@@ -4,10 +4,53 @@ import unittest
 from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from variable_stroke_core import (outline, outline_curves, node_edges, nib_edges,
+                                  cap_curve_geometry, cap_curve_coordinates,
                                   _Side, _join, sub, unit, length, cubic)
 
 
 class GeometryTests(unittest.TestCase):
+    def test_editable_cubic_caps_keep_endpoints_and_allow_concave_shape(self):
+        segments = [('line', ((0, 0), (0, 100)), 20, 20)]
+        settings = ((0.6, -0.5), (-0.4, -0.3))
+        contour = outline_curves(segments, cap_start='curve', cap_end='curve',
+                                 cap_end_curve=settings)[0]
+        self.assertEqual([piece[0] for piece in contour],
+                         ['line', 'cubic', 'line', 'cubic'])
+        self.assertEqual(contour[1][1][0], (-10.0, 100.0))
+        self.assertEqual(contour[1][1][-1], (10.0, 100.0))
+        self.assertLess(contour[1][1][1][1], 100.0)
+        self.assertLess(contour[1][1][2][1], 100.0)
+        for before, after in zip(contour, contour[1:] + contour[:1]):
+            self.assertEqual(before[1][-1], after[1][0])
+
+    def test_cap_control_coordinates_follow_width_and_tangent(self):
+        values = ((0.7, -0.2), (-0.6, 0.4))
+        for left, right, tangent, at_end in (
+                ((-10, 100), (10, 100), (0, 1), True),
+                ((-20, 100), (20, 100), (0, 1), True),
+                ((0, 10), (0, -10), (1, 0), False)):
+            points, _ = cap_curve_geometry(left, right, tangent, at_end, values)
+            for value, point in zip(values, points[1:3]):
+                measured = cap_curve_coordinates(left, right, tangent, at_end, point)
+                self.assertAlmostEqual(measured[0], value[0])
+                self.assertAlmostEqual(measured[1], value[1])
+
+    def test_curve_mode_preserves_each_cap_cut_and_ignores_round_and_ellipse(self):
+        segments = [('line', ((0, 0), (100, 100)), 20, 20)]
+        settings = ((0.6, -0.5), (-0.4, -0.3))
+        for style in ('flat', 'square', 'horizontal', 'vertical', 'angle'):
+            with self.subTest(style=style):
+                straight = outline_curves(segments, cap_end=style)[0]
+                curved = outline_curves(segments, cap_end=style,
+                                        cap_end_curve=settings)[0]
+                self.assertEqual(curved[1][0], 'cubic')
+                self.assertEqual((curved[1][1][0], curved[1][1][-1]),
+                                 (straight[1][1][0], straight[1][1][-1]))
+        for style in ('round', 'ellipse'):
+            self.assertEqual(outline_curves(segments, cap_end=style),
+                             outline_curves(segments, cap_end=style,
+                                            cap_end_curve=settings))
+
     def test_nib_angle_rotates_width_and_height_axes(self):
         left, right = nib_edges((0, 0), (1, 0), (165, 140, 0, 30))
         expected = math.hypot(165*math.sin(math.radians(30)),

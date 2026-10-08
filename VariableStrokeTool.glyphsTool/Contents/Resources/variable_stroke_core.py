@@ -2,9 +2,10 @@
 from __future__ import division
 import math
 
-CAPS = ('flat', 'round', 'ellipse', 'square', 'horizontal', 'vertical', 'angle')
+CAPS = ('flat', 'round', 'ellipse', 'square', 'horizontal', 'vertical', 'angle', 'curve')
 CUTS = ('horizontal', 'vertical', 'angle')
 EPS = 1e-9
+DEFAULT_CAP_CURVE = ((1.0/3.0, 0.35), (-1.0/3.0, 0.35))
 
 
 def add(a, b): return (a[0] + b[0], a[1] + b[1])
@@ -102,6 +103,10 @@ def _cap(center, width, tangent, style, at_end):
         return (arc[0], arc[-1], arc[1:-1])
     if style == 'flat':
         return (add(center, mul(n, width/2)), sub(center, mul(n, width/2)), [])
+    if style == 'curve':
+        left, right = add(center, mul(n, width/2)), sub(center, mul(n, width/2))
+        points, _ = cap_curve_geometry(left, right, tangent, at_end)
+        return (points[0], points[-1], [cubic(*points, i/16.0) for i in range(1, 16)])
     raise ValueError('Unknown cap: ' + str(style))
 
 
@@ -201,7 +206,34 @@ def _round_cap(center, radius, tangent, start, section=None, axial_radius=None):
                         add(right, mul(outward, k_axial)), right))]
 
 
-def _cap_segments(center, width, tangent, style, at_end, left, right, nib=None, slant=0.0):
+def cap_curve_geometry(left, right, tangent, at_end, controls=None):
+    """Cubic cap and its local frame; controls use half-width units."""
+    first, last = (left, right) if at_end else (right, left)
+    middle = mul(add(first, last), 0.5)
+    lateral = mul(sub(first, last), 0.5)
+    outward = mul(unit(tangent), length(lateral) * (1 if at_end else -1))
+    values = controls if controls is not None else DEFAULT_CAP_CURVE
+    points = tuple(add(middle, add(mul(lateral, float(s)), mul(outward, float(d))))
+                   for s, d in values)
+    return (first, points[0], points[1], last), (middle, lateral, outward)
+
+
+def cap_curve_coordinates(left, right, tangent, at_end, point):
+    """Return a dragged control point in the same local frame."""
+    _, (middle, lateral, outward) = cap_curve_geometry(
+        left, right, tangent, at_end)
+    determinant = lateral[0]*outward[1] - lateral[1]*outward[0]
+    if abs(determinant) < EPS:
+        return None
+    delta = sub(point, middle)
+    return ((delta[0]*outward[1] - delta[1]*outward[0])/determinant,
+            (lateral[0]*delta[1] - lateral[1]*delta[0])/determinant)
+
+
+def _cap_segments(center, width, tangent, style, at_end, left, right, nib=None,
+                  slant=0.0, curve=None):
+    if style == 'curve' or (curve is not None and style not in ('round', 'ellipse')):
+        return [('cubic', cap_curve_geometry(left, right, tangent, at_end, curve)[0])]
     if style in ('round', 'ellipse'):
         if nib is None:
             return _round_cap(center, width/2, tangent, not at_end)
@@ -410,7 +442,7 @@ def _cut_direction(style, slant, angle=0.0):
 #   * every centerline segment gives exactly one piece per side (line -> line,
 #     cubic -> one cubic), so each side has one node per centerline node;
 #   * corners collapse to a single node per side (miter point or trim point);
-#   * every cap is a single line, except round caps which add two quarter arcs.
+#   * each editable curve cap is one cubic; round caps add two quarter arcs.
 # Only the coordinates change with the design, never the node count.
 
 
@@ -1494,7 +1526,7 @@ def _turns_left(before, after):
 
 
 def _open_vertices(lefts, indices, cap_pieces_end, cap_pieces_start,
-                   corner_of, cap_end, cap_start):
+                   corner_of, cap_end, cap_start, curve_start=False, curve_end=False):
     """Vertex descriptions for an open contour: left sides, end cap, reversed right
     sides, start cap. Round caps are already smooth and keep their joins."""
     n = len(indices)
@@ -1512,8 +1544,10 @@ def _open_vertices(lefts, indices, cap_pieces_end, cap_pieces_start,
             ('outer' if left_turn else 'inner')
         return at(indices[k], which, flip)
 
-    start = at(start_node, 'outer', cap=True) if cap_start not in ('round', 'ellipse') else None
-    end = at(end_node, 'outer', cap=True) if cap_end not in ('round', 'ellipse') else None
+    start = at(start_node, 'outer', cap=True) if not curve_start and \
+        cap_start not in ('round', 'ellipse', 'curve') else None
+    end = at(end_node, 'outer', cap=True) if not curve_end and \
+        cap_end not in ('round', 'ellipse', 'curve') else None
     vertices = [start] + [interior(k, False) for k in range(1, n)]
     vertices += [end] + [None] * (cap_pieces_end - 1)
     vertices += [dict(end, flip=True, which='inner') if end else None]
@@ -1526,7 +1560,7 @@ def _independent_outline_curves(left_segments, right_segments, closed, cap_start
                                 cap_end, italic_angle, start_angle, end_angle,
                                 corners, left_map, right_map, left_breaks,
                                 right_breaks, left_smooths, right_smooths,
-                                report, edges):
+                                report, edges, cap_start_curve, cap_end_curve, cap_out):
     """Build each side from only the virtual nodes that affect that side."""
     slant = math.tan(math.radians(italic_angle or 0.0))
 
@@ -1638,17 +1672,26 @@ def _independent_outline_curves(left_segments, right_segments, closed, cap_start
     left = _side_contour(lefts, left_widths, False, joined=True, breaks=left_breaks)
     right = _side_contour(rights, right_widths, False, joined=True, breaks=right_breaks)
     end_cap = _cap_segments(end_center, lefts[-1].w1, end_tangent, cap_end, True,
-                            lefts[-1].end, rights[-1].end, lefts[-1].n1, slant)
+                            lefts[-1].end, rights[-1].end, lefts[-1].n1, slant,
+                            cap_end_curve)
     start_cap = _cap_segments(start_center, lefts[0].w0, start_tangent, cap_start, False,
-                              lefts[0].start, rights[0].start, lefts[0].n0, slant)
+                              lefts[0].start, rights[0].start, lefts[0].n0, slant,
+                              cap_start_curve)
+    if cap_out is not None:
+        if cap_end == 'curve' or (cap_end_curve is not None and
+                                  cap_end not in ('round', 'ellipse')):
+            cap_out['end'] = end_cap[0][1]
+        if cap_start == 'curve' or (cap_start_curve is not None and
+                                    cap_start not in ('round', 'ellipse')):
+            cap_out['start'] = start_cap[0][1]
     contour = left + end_cap + _reverse(right) + start_cap
     if not corners:
         return [contour]
 
     start = vertex(left_map[0], 'outer', cap=True) \
-        if cap_start not in ('round', 'ellipse') else None
+        if cap_start_curve is None and cap_start not in ('round', 'ellipse', 'curve') else None
     end = vertex(left_map[-1], 'outer', cap=True) \
-        if cap_end not in ('round', 'ellipse') else None
+        if cap_end_curve is None and cap_end not in ('round', 'ellipse', 'curve') else None
     left_vertices = [start]
     for k in range(1, len(lefts)):
         inside = _turns_left(lefts[k-1], lefts[k])
@@ -1674,7 +1717,8 @@ def outline_curves(segments, closed=False, cap_start='flat', cap_end='flat',
                    tolerance=FIT_TOLERANCE, italic_angle=0.0, start_angle=0.0, end_angle=0.0,
                    corner_radii=None, report=None, edges=None, breaks=(), smooth_virtuals=(),
                    right_segments=None, right_corner_radii=None, left_map=None, right_map=None,
-                   right_smooth_virtuals=()):
+                   right_smooth_virtuals=(), cap_start_curve=None, cap_end_curve=None,
+                   cap_out=None):
     """Return closed contours of ('line'|'cubic', control points) segments.
 
     Each segment is (kind, points, start, end) where start/end is a width or a
@@ -1698,7 +1742,8 @@ def outline_curves(segments, closed=False, cap_start='flat', cap_end='flat',
             else corner_radii, left_map, right_map,
             breaks.get('left', ()) if isinstance(breaks, dict) else breaks,
             breaks.get('right', ()) if isinstance(breaks, dict) else breaks,
-            smooth_virtuals, right_smooth_virtuals, report, edges)
+            smooth_virtuals, right_smooth_virtuals, report, edges,
+            cap_start_curve, cap_end_curve, cap_out)
     slant = math.tan(math.radians(italic_angle or 0.0))
     if isinstance(breaks, dict):
         left_breaks = set(breaks.get('left', ()))
@@ -1799,14 +1844,24 @@ def outline_curves(segments, closed=False, cap_start='flat', cap_end='flat',
     left = _side_contour(lefts, widths, False, joined=True, breaks=left_breaks)
     right = _side_contour(rights, widths, False, joined=True, breaks=right_breaks)
     end_cap = _cap_segments(end_center, last.w1, end_tangent, cap_end, True,
-                            lefts[-1].end, rights[-1].end, last.n1, slant)
+                            lefts[-1].end, rights[-1].end, last.n1, slant,
+                            cap_end_curve)
     start_cap = _cap_segments(start_center, first.w0, start_tangent, cap_start, False,
-                              lefts[0].start, rights[0].start, first.n0, slant)
+                              lefts[0].start, rights[0].start, first.n0, slant,
+                              cap_start_curve)
+    if cap_out is not None:
+        if cap_end == 'curve' or (cap_end_curve is not None and
+                                  cap_end not in ('round', 'ellipse')):
+            cap_out['end'] = end_cap[0][1]
+        if cap_start == 'curve' or (cap_start_curve is not None and
+                                    cap_start not in ('round', 'ellipse')):
+            cap_out['start'] = start_cap[0][1]
     contour = left + end_cap + _reverse(right) + start_cap
     if corner_radii:
         vertices = _open_vertices(
             lefts, indices, len(end_cap), len(start_cap), corner_of,
-            cap_end, cap_start)
+            cap_end, cap_start, cap_start_curve is not None,
+            cap_end_curve is not None)
         n, e = len(lefts), len(end_cap)
         insertion_points = [k+1 for k in left_breaks] + \
                            [n+e+n-1-k for k in right_breaks]
