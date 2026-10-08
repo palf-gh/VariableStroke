@@ -48,6 +48,138 @@ bridge = importlib.import_module('glyphs_bridge')
 
 
 class BridgeTests(unittest.TestCase):
+    @staticmethod
+    def virtual_spec(mode='step', t=0.5, before=100, after=150,
+                     direction='horizontal'):
+        return {'id': 'section-a', 'segment': 0, 't': t, 'mode': mode,
+                'side': 'right', 'linked': False, 'direction': direction, 'angle': 0.0,
+                'before': {'left': 100.0, 'right': before},
+                'after': {'left': 100.0, 'right': after}}
+
+    def test_position_can_move_entire_stroke_past_centerline(self):
+        from variable_stroke_core import nib_edges
+        node = Node(0, 0)
+        node.userData = {bridge.OFFSET_KEY: 150}
+        self.assertEqual(bridge.offset(node), 150)
+        self.assertEqual(bridge.nib_of(node.userData, 20, 20, 0)[2], 1.5)
+        left, right = nib_edges((0, 0), (0, 1), (20, 20, 1.5, 0))
+        self.assertEqual((left, right), ((-25.0, 0.0), (-5.0, 0.0)))
+
+    def test_virtual_step_changes_only_right_side_and_keeps_centerline(self):
+        path = Path([Node(0, 0), Node(0, 100)])
+        for node in path.nodes:
+            node.userData.clear()
+        path.attributes[bridge.STROKE_WIDTH_KEY] = 20
+        path.attributes[bridge.VIRTUAL_KEY] = [self.virtual_spec()]
+        self.assertEqual(len(path.nodes), 2)
+        contour = bridge.curves_for_path(path)[0]
+        self.assertEqual(len(contour), 6)
+        self.assertEqual(contour[0], ('line', ((-10.0, 0.0), (-10.0, 100.0))))
+        self.assertIn(('line', ((15.0, 50.0), (10.0, 50.0))), contour)
+        self.assertNotIn(('line', ((-10.0, 50.0), (-10.0, 50.0))), contour)
+        for before, after in zip(contour, contour[1:] + contour[:1]):
+            self.assertEqual(before[1][-1], after[1][0])
+
+    def test_virtual_step_changes_only_left_side(self):
+        path = Path([Node(0, 0), Node(0, 100)])
+        for node in path.nodes:
+            node.userData.clear()
+        path.attributes[bridge.STROKE_WIDTH_KEY] = 20
+        spec = self.virtual_spec()
+        spec['side'] = 'left'
+        spec['after'] = {'left': 150.0, 'right': 100.0}
+        path.attributes[bridge.VIRTUAL_KEY] = [spec]
+        contour = bridge.curves_for_path(path)[0]
+        self.assertEqual(len(contour), 6)
+        self.assertEqual(contour[4], ('line', ((10.0, 100.0), (10.0, 0.0))))
+        self.assertIn(('line', ((-10.0, 50.0), (-15.0, 50.0))), contour)
+
+    def test_virtual_continuous_splits_a_cubic_without_extra_glyphs_nodes(self):
+        path = Path([Node(0, 0), Node(0, 80, 'offcurve'),
+                     Node(100, 80, 'offcurve'), Node(100, 0, 'curve')])
+        for node in path.nodes:
+            node.userData.clear()
+        path.attributes[bridge.VIRTUAL_KEY] = [self.virtual_spec('continuous', before=160)]
+        contour = bridge.curves_for_path(path)[0]
+        self.assertEqual(len(path.nodes), 4)
+        self.assertEqual(len(contour), 5)
+        self.assertEqual([kind for kind, _ in contour],
+                         ['cubic', 'line', 'cubic', 'cubic', 'line'])
+        self.assertEqual(len(bridge.virtual_widgets(path)), 1)
+
+    def test_virtual_continuous_line_has_matching_tangents(self):
+        from variable_stroke_core import sub, unit
+        path = Path([Node(0, 0), Node(0, 100)])
+        for node in path.nodes:
+            node.userData.clear()
+        path.attributes[bridge.STROKE_WIDTH_KEY] = 20
+        path.attributes[bridge.VIRTUAL_KEY] = [self.virtual_spec('continuous', before=150)]
+        contour = bridge.curves_for_path(path)[0]
+        self.assertEqual(contour[0][0], 'line')
+        self.assertEqual(contour[2][0], 'cubic')
+        self.assertEqual(contour[3][0], 'cubic')
+        incoming = unit(sub(contour[2][1][3], contour[2][1][2]))
+        outgoing = unit(sub(contour[3][1][1], contour[3][1][0]))
+        self.assertAlmostEqual(sum(a*b for a, b in zip(incoming, outgoing)), 1.0)
+
+    def test_virtual_direction_rejects_parallel_section(self):
+        path = Path([Node(0, 0), Node(0, 100)])
+        spec = self.virtual_spec(direction='vertical')
+        path.attributes[bridge.VIRTUAL_KEY] = [spec]
+        self.assertIsNone(bridge._virtual_section_angle(spec, (0, 1)))
+
+    def test_virtual_angle_axis_and_closed_corner_structure(self):
+        path = Path([Node(0, 0), Node(100, 0), Node(100, 100), Node(0, 100)], True)
+        for node in path.nodes:
+            node.userData = {bridge.CORNER_ON_KEY: True, bridge.CORNER_KEY: 5}
+        path.attributes[bridge.STROKE_WIDTH_KEY] = 20
+        first = self.virtual_spec(direction='angle')
+        first['angle'] = 60
+        second = dict(self.virtual_spec(t=0.5, after=175, direction='vertical'))
+        second['id'] = 'section-b'
+        second['segment'] = 2
+        path.attributes[bridge.VIRTUAL_KEY] = [first, second]
+        contours = bridge.curves_for_path(path)
+        self.assertEqual(len(contours), 2)
+        self.assertEqual([len(contour) for contour in contours], [8, 12])
+        for contour in contours:
+            for before, after in zip(contour, contour[1:] + contour[:1]):
+                self.assertAlmostEqual(before[1][-1][0], after[1][0][0])
+                self.assertAlmostEqual(before[1][-1][1], after[1][0][1])
+        widget = bridge.virtual_widgets(path)[0]
+        self.assertGreater(abs(widget['axis'][0]), 0.4)
+        self.assertGreater(abs(widget['axis'][1]), 0.4)
+
+    def test_interpolated_virtual_sections_blend_values_and_keep_piece_count(self):
+        def master(t, after):
+            path = Path([Node(0, 0), Node(0, 100)])
+            for node in path.nodes:
+                node.userData.clear()
+            path.attributes[bridge.VIRTUAL_KEY] = [self.virtual_spec(t=t, after=after)]
+            return Layer([path])
+        first, second = master(0.4, 120), master(0.6, 180)
+        glyph = types.SimpleNamespace(layers={'a': first, 'b': second},
+                                      userData={bridge.GLYPH_KEY: True})
+        target = master(0.4, 120)
+        self.assertTrue(bridge.interpolate_layer(target, glyph, {'a': 0.5, 'b': 0.5}))
+        spec = bridge.virtual_nodes(target.paths[0])[0]
+        self.assertAlmostEqual(spec['t'], 0.5)
+        self.assertAlmostEqual(spec['after']['right'], 150)
+        self.assertEqual(len(bridge.curves_for_path(target.paths[0])[0]),
+                         len(bridge.curves_for_path(first.paths[0])[0]))
+
+    def test_layer_expansion_uses_virtual_step_without_editing_source_nodes(self):
+        path = Path([Node(0, 0), Node(0, 100)])
+        for node in path.nodes:
+            node.userData.clear()
+        path.attributes[bridge.VIRTUAL_KEY] = [self.virtual_spec()]
+        layer = Layer([path])
+        self.assertEqual(bridge.expand_layer(layer, glyph_on=True), 1)
+        self.assertEqual(len(path.nodes), 2)
+        outlines = [candidate for candidate in layer.paths if bridge.is_outline(candidate)]
+        self.assertEqual(len(outlines), 1)
+        self.assertEqual(len(outlines[0].nodes), 6)
+
     def test_selected_bezier_handles_preview_their_owning_nodes(self):
         start = Node(0, 0)
         outgoing = Node(30, 20, 'offcurve')

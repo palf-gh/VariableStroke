@@ -4,6 +4,7 @@ import functools
 import math
 import time
 import traceback
+import uuid
 import objc
 from AppKit import (NSBezierPath, NSColor, NSEvent, NSImage, NSMenu, NSMenuItem, NSObject,
                     NSNotificationCenter,
@@ -14,7 +15,7 @@ from AppKit import (NSBezierPath, NSColor, NSEvent, NSImage, NSMenu, NSMenuItem,
 from GlyphsApp import (Glyphs, GSCallbackHandler, GSCustomParameter, GSComponent, OFFCURVE,
                        DOCUMENTOPENED, UPDATEINTERFACE, DRAWBACKGROUND, CONTEXTMENUCALLBACK, WINDOW_MENU)
 from GlyphsApp.plugins import SelectTool
-from vanilla import (Window, FloatingWindow, Group, SegmentedButton, TextBox, EditText,
+from vanilla import (Window, FloatingWindow, Group, SegmentedButton, TextBox, EditText, PopUpButton,
                      ImageButton, Button, List, HorizontalLine)
 from glyphs_bridge import (CAP_START_KEY, CAP_END_KEY, CAP_START_ANGLE_KEY, CAP_END_ANGLE_KEY,
                            WIDTH_KEY, HEIGHT_SCALE_KEY, CORNER_KEY, CORNER_ON_KEY, CORNER_INNER_KEY,
@@ -37,6 +38,8 @@ from glyphs_bridge import (CAP_START_KEY, CAP_END_KEY, CAP_START_ANGLE_KEY, CAP_
                            set_node_nib_size, path_nodes, PROFILE, LAYER_STATE_KEY, has_live_corners, nib_of,
                            scale_of, height_scale_of, offset_of, rotation_of,
                            corner_on_of, corner_spec_of, copied_contours)
+from glyphs_bridge import (VIRTUAL_KEY, virtual_nodes, virtual_widgets, virtual_point,
+                           segments_for_path, _virtual_section_angle)
 from clipboard_export import svg_document, pdf_document
 from variable_stroke_core import (unit, sub, add, length, outline_curves,
                                   nib_edges, ellipse_nib_edges)
@@ -69,11 +72,17 @@ def _inspector_via_callback():
         return False
 PREPARE_LAYER_CALLBACK = 'GSPrepareLayerCallback'
 STEM_THICKNESS_OUTLINE_REQUEST = 'com.codex.VariableStroke.stemThicknessOutlineRequest'
-PANEL_SIZE = (545, 56)
+PANEL_SIZE = (545, 105)
 TAB_TOP = 32  # the tab row, below the stroke row
-TABS = (('node', 'Node', 'ノード'), ('caps', 'Caps', '線端'), ('corner', 'Corners', '角丸'))
+TABS = (('node', 'Node', 'ノード'), ('caps', 'Caps', '線端'),
+        ('corner', 'Corners', '角丸'), ('virtual', 'Virtual', '仮想'))
 TAB_NAMES = [item[0] for item in TABS]
 TAB_DEFAULTS_KEY = 'com.codex.VariableStroke.inspectorTab'
+# Must be an NSObject, not a Python str. Glyphs already stores GSGlyph / GSAnchor
+# on menu items; comparing that object with a str becomes -[glyph isEqual:str],
+# which sends -name to the string (OC_BuiltinPythonUnicode).
+class VariableStrokeMenuMarker(NSObject):
+    pass
 
 
 def _timed(name):
@@ -89,6 +98,18 @@ def _timed(name):
 
 def _loc(english, japanese):
     return Glyphs.localize({'en': english, 'jp': japanese, 'ja': japanese})
+
+
+def _one_sided_drag_values(reach, near, far, pct, offset, sign):
+    """Move one edge along its handle axis while keeping the other edge fixed."""
+    near_share = (1 + sign*offset) * pct
+    far_share = (1 - sign*offset) * pct
+    near_new = (reach / max(far, 1e-6) * far_share if near < 1e-6
+                else near_share * reach / near)
+    total = near_new + far_share
+    if total < 1e-6:
+        return None
+    return max(1.0, round(total / 2.0, 1)), round(sign * (near_new - far_share) / total * 100.0, 1)
 
 
 # Fonts known to use strokes, by id(font). Filled lazily by one scan per font and
@@ -377,7 +398,7 @@ def _normalize_quietly(layer):
 
 
 _PATH_KEYS = (STROKE_WIDTH_KEY, STROKE_HEIGHT_KEY, CAP_START_KEY, CAP_END_KEY,
-              CAP_START_ANGLE_KEY, CAP_END_ANGLE_KEY)
+              CAP_START_ANGLE_KEY, CAP_END_ANGLE_KEY, VIRTUAL_KEY)
 _NODE_KEYS = (SCALE_KEY, HEIGHT_SCALE_KEY, OFFSET_KEY, ROTATION_KEY, WIDTH_KEY, CORNER_ON_KEY, CORNER_KEY, CORNER_INNER_KEY,
               CORNER_TENSION_KEY, CORNER_INNER_TENSION_KEY,
               CORNER_RATIO_KEY, CORNER_INNER_RATIO_KEY)
@@ -407,7 +428,11 @@ def _parse_field(name, text):
     except (TypeError, ValueError):
         return None
     if name == 'offset':
-        return max(-100.0, min(100.0, value))
+        return value if math.isfinite(value) else None
+    if name.startswith('virtual'):
+        if name == 'virtualAngle':
+            return value if math.isfinite(value) else None
+        return value if math.isfinite(value) and 0 < value < 10000 else None
     if name == 'rotation':
         return value % 180.0
     if name in ('startAngle', 'endAngle'):
@@ -602,7 +627,35 @@ class VariableStrokeLayerProcessor(NSObject):
 
 
 class VariableStrokeContextMenu(NSObject):
+    def init(self):
+        self = objc.super(VariableStrokeContextMenu, self).init()
+        if self is None:
+            return None
+        self._menu_marker = VariableStrokeMenuMarker.new()
+        return self
+
+    def name(self):
+        return 'Variable Stroke'
+
+    @objc.python_method
+    def _already_has_menu(self, menu):
+        marker = self._menu_marker
+        marker_class = type(marker)
+        for item in menu.itemArray():
+            obj = item.representedObject()
+            if obj is None:
+                continue
+            # Identity / class only. Never == : GSGlyph.isEqual_ may send -name
+            # to whatever it is compared with.
+            if obj is marker or obj.__class__ is marker_class:
+                return True
+        return False
+
     def contextMenuCallback_forSelectedLayers_event_(self, menu, layers, event):
+        # Glyphs can register a tool callback again when another font opens.
+        # Each callback receives the same menu, so only the first one adds items.
+        if self._already_has_menu(menu):
+            return
         glyphs = []
         for layer in layers or []:
             glyph = getattr(layer, 'parent', None)
@@ -632,6 +685,7 @@ class VariableStrokeContextMenu(NSObject):
                 item.setState_(1 if glyphs and all(not glyph_enabled(g) for g in glyphs) else 0)
             submenu.addItem_(item)
         parent = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(_loc('Variable Stroke', '可変ストローク'), None, '')
+        parent.setRepresentedObject_(self._menu_marker)
         parent.setSubmenu_(submenu)
         menu.addItem_(NSMenuItem.separatorItem())
         menu.addItem_(parent)
@@ -870,6 +924,10 @@ class VariableStrokeTool(SelectTool):
         self._settings = None
         self._refresh_pending = False
         self._moving_nodes = False  # a plain node drag is in progress
+        self._virtual_selected = None  # (path, stable virtual id)
+        self._virtual_adding = False
+        self._virtual_click_consumed = False
+        self._virtual_error = ''
         self._frame_profile, self._frame_last, self._frame_times = False, None, []
         self._normalized = None  # what _normalize_quietly last saw (see _on_update)
         try:
@@ -896,7 +954,7 @@ class VariableStrokeTool(SelectTool):
         group.heightField = SteppingEditText((174, 4, 42, 19), sizeStyle='small')
         group.widthReset = ImageButton((218, 5, 17, 17), imageNamed='NSRefreshTemplate',
                                        bordered=False, callback=self.resetWidthFromInspector_)
-        group.tabs = SegmentedButton((width_px - 241, 4, 210, 20),
+        group.tabs = SegmentedButton((width_px - 285, 4, 254, 20),
                                      [{'title': _loc(english, japanese)}
                                       for _, english, japanese in TABS],
                                      callback=self.tabFromInspector_, sizeStyle='small')
@@ -953,6 +1011,40 @@ class VariableStrokeTool(SelectTool):
         corner.innerRatioField = SteppingEditText((482, 0, 36, 19), sizeStyle='small')
         corner.ratioLink = ImageButton((519, 0, 18, 19), imageObject=_link_icon(True),
                                        bordered=False, callback=self.ratioLinkFromInspector_)
+
+        virtual = group.virtualTab = Group((0, TAB_TOP, -0, 72))
+        virtual.add = Button((6, 0, 55, 20), _loc('Add', '追加'),
+                             callback=self.virtualAddFromInspector_, sizeStyle='small')
+        virtual.delete = Button((65, 0, 55, 20), _loc('Delete', '削除'),
+                                callback=self.virtualDeleteFromInspector_, sizeStyle='small')
+        virtual.mode = SegmentedButton((126, 0, 125, 20),
+                                       [{'title': _loc('Smooth', '連続')},
+                                        {'title': _loc('Step', '段差')}],
+                                       callback=self.virtualModeFromInspector_, sizeStyle='small')
+        virtual.side = SegmentedButton((257, 0, 169, 20),
+                                       [{'title': _loc('Left', '左')},
+                                        {'title': _loc('Right', '右')},
+                                        {'title': _loc('Both', '両方')}],
+                                       callback=self.virtualSideFromInspector_, sizeStyle='small')
+        virtual.link = Button((432, 0, 105, 20), _loc('Linked', '左右連動'),
+                              callback=self.virtualLinkFromInspector_, sizeStyle='small')
+        virtual.directionLabel = TextBox((6, 29, 32, 14), _loc('Axis', '方向'), sizeStyle='small')
+        virtual.direction = PopUpButton((40, 23, 100, 20),
+                                        [_loc('Normal', '線方向'), _loc('Horizontal', '水平'),
+                                         _loc('Vertical', '垂直'), _loc('Angle', '角度')],
+                                        callback=self.virtualDirectionFromInspector_,
+                                        sizeStyle='small')
+        virtual.angleField = SteppingEditText((145, 23, 43, 19), sizeStyle='small')
+        virtual.angleUnit = TextBox((190, 28, 10, 14), '°', sizeStyle='small')
+        virtual.beforeLabel = TextBox((210, 29, 46, 14), _loc('Before', '手前'), sizeStyle='small')
+        virtual.beforeLeft = SteppingEditText((260, 23, 48, 19), sizeStyle='small')
+        virtual.beforeRight = SteppingEditText((314, 23, 48, 19), sizeStyle='small')
+        virtual.beforeUnit = TextBox((365, 29, 90, 14), _loc('% L / R', '% 左 / 右'), sizeStyle='small')
+        virtual.afterLabel = TextBox((210, 53, 46, 14), _loc('After', '先'), sizeStyle='small')
+        virtual.afterLeft = SteppingEditText((260, 47, 48, 19), sizeStyle='small')
+        virtual.afterRight = SteppingEditText((314, 47, 48, 19), sizeStyle='small')
+        virtual.afterUnit = TextBox((365, 53, 90, 14), _loc('% L / R', '% 左 / 右'), sizeStyle='small')
+        virtual.message = TextBox((6, 51, 198, 17), '', sizeStyle='small')
 
         group.widthReset.getNSButton().setToolTip_(
             _loc('Follow the master default width and height', 'マスターの既定の幅・高さに戻す'))
@@ -1020,7 +1112,12 @@ class VariableStrokeTool(SelectTool):
                   ('startAngle', cap.startAngle), ('endAngle', cap.endAngle),
                   ('radius', corner.outerField), ('innerRadius', corner.innerField),
                   ('tension', corner.tensionField), ('innerTension', corner.innerTensionField),
-                  ('ratio', corner.ratioField), ('innerRatio', corner.innerRatioField)]
+                  ('ratio', corner.ratioField), ('innerRatio', corner.innerRatioField),
+                  ('virtualAngle', virtual.angleField),
+                  ('virtualBeforeLeft', virtual.beforeLeft),
+                  ('virtualBeforeRight', virtual.beforeRight),
+                  ('virtualAfterLeft', virtual.afterLeft),
+                  ('virtualAfterRight', virtual.afterRight)]
         self._fields = dict(fields)
         for name, field in fields:
             delegate = VariableStrokeFieldDelegate.alloc().initWithTool_name_(self, name)
@@ -1059,10 +1156,19 @@ class VariableStrokeTool(SelectTool):
             _hook_copy()
         except Exception:
             print(traceback.format_exc())
-        item = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
-            _loc('Variable Stroke Settings…', '可変ストローク設定…'), 'showSettings:', '')
-        item.setTarget_(self._inspector_provider)
-        Glyphs.menu[WINDOW_MENU].append(item)
+        title = _loc('Variable Stroke Settings…', '可変ストローク設定…')
+        menu = Glyphs.menu[WINDOW_MENU]
+        existing_items = [item for item in menu.submenu().itemArray()
+                          if item.title() == title]
+        if existing_items:
+            existing_items[0].setTarget_(self._inspector_provider)
+            for duplicate in existing_items[1:]:
+                duplicate.menu().removeItem_(duplicate)
+        else:
+            item = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
+                title, 'showSettings:', '')
+            item.setTarget_(self._inspector_provider)
+            menu.append(item)
         for font in Glyphs.fonts:
             self._cleanup_font(font)
         self._sync_export()
@@ -1078,6 +1184,8 @@ class VariableStrokeTool(SelectTool):
     def deactivate(self):
         self._is_active = False
         self._moving_nodes = False
+        self._virtual_adding = False
+        self._virtual_click_consumed = False
         self._inspector_provider.performSelector_withObject_afterDelay_('reloadInspector:', None, 0.0)
 
     @objc.python_method
@@ -1119,7 +1227,7 @@ class VariableStrokeTool(SelectTool):
     def _show_tab(self, name):
         group = self.infoBoxWindow.group
         for tab, view in (('node', group.nodeTab), ('caps', group.capsTab),
-                          ('corner', group.cornerTab)):
+                          ('corner', group.cornerTab), ('virtual', group.virtualTab)):
             view.show(tab == name)
         group.tabs.set(TAB_NAMES.index(name))
 
@@ -1140,6 +1248,186 @@ class VariableStrokeTool(SelectTool):
     def tabFromInspector_(self, sender):
         if 0 <= sender.get() < len(TAB_NAMES):
             self._select_tab(TAB_NAMES[sender.get()])
+
+    @objc.python_method
+    def _virtual_current(self, layer=None):
+        layer = self._layer() if layer is None else layer
+        selected = self._virtual_selected
+        if layer is None or selected is None:
+            return None, None
+        path, identifier = selected
+        if not any(path == candidate for candidate in layer.paths):
+            return None, None
+        spec = next((item for item in virtual_nodes(path) if item['id'] == identifier), None)
+        return path, spec
+
+    @objc.python_method
+    def _virtual_siblings(self, path):
+        """Current path and corresponding paths whose segment structure matches.
+
+        Other layers are optional: an incompatible master must not prevent editing
+        the current one.
+        """
+        layer = path.parent
+        glyph = layer.parent
+        index = next((i for i, candidate in enumerate(layer.paths) if candidate == path), None)
+        if index is None:
+            return [(layer, path)]
+        structure = [(kind, len(points)) for kind, points, _, _ in segments_for_path(path)]
+        result = [(layer, path)]
+        for other_layer in glyph.layers:
+            if other_layer is layer or other_layer == layer:
+                continue
+            paths = list(other_layer.paths)
+            if index >= len(paths):
+                continue
+            other = paths[index]
+            try:
+                other_structure = [(kind, len(points)) for kind, points, _, _ in
+                                   segments_for_path(other)]
+            except ValueError:
+                continue
+            if other_structure != structure or bool(other.closed) != bool(path.closed):
+                continue
+            result.append((other_layer, other))
+        return result
+
+    @objc.python_method
+    def _virtual_change(self, path, spec, message=None):
+        """Replace one virtual section, validating geometry before keeping it."""
+        if _virtual_section_angle(spec, self._virtual_tangent(path, spec)) is None:
+            self._virtual_error = _loc('Direction nearly follows the stroke',
+                                        '方向が中心線に近すぎます')
+            return False
+        before = path.attributes.get(VIRTUAL_KEY)
+        specs = virtual_nodes(path)
+        replaced = False
+        for i, old in enumerate(specs):
+            if old['id'] == spec['id']:
+                specs[i] = spec
+                replaced = True
+                break
+        if not replaced:
+            return False
+        path.attributes[VIRTUAL_KEY] = specs
+        try:
+            virtual_widgets(path)
+        except (ValueError, ZeroDivisionError):
+            if before is None:
+                del path.attributes[VIRTUAL_KEY]
+            else:
+                path.attributes[VIRTUAL_KEY] = before
+            self._virtual_error = message or _loc('Invalid width or direction',
+                                                    '幅または方向が無効です')
+            return False
+        self._virtual_error = ''
+        return True
+
+    @objc.python_method
+    def _virtual_set_common(self, key, value):
+        path, spec = self._virtual_current()
+        if spec is None:
+            return
+        siblings = self._virtual_siblings(path)
+        old_values = []
+        for layer, other in siblings:
+            match = next((entry for entry in virtual_nodes(other)
+                          if entry['id'] == spec['id']), None)
+            if match is None:
+                continue
+            changed = dict(match)
+            changed[key] = value
+            if key == 'side' and value != 'both':
+                inactive = 'right' if value == 'left' else 'left'
+                for end in ('before', 'after'):
+                    changed[end] = dict(changed[end])
+                    changed[end][inactive] = 100.0
+            if key == 'side' and value == 'both' and changed['linked']:
+                for end in ('before', 'after'):
+                    changed[end] = dict(changed[end])
+                    changed[end]['right'] = changed[end]['left']
+            if key == 'linked' and value:
+                for end in ('before', 'after'):
+                    changed[end] = dict(changed[end])
+                    changed[end]['right'] = changed[end]['left']
+            old_values.append((layer, other, changed, other.attributes.get(VIRTUAL_KEY)))
+        failed = False
+        for layer, _, _, _ in old_values:
+            layer.beginChanges()
+        try:
+            for layer, other, changed, _ in old_values:
+                if not self._virtual_change(other, changed):
+                    failed = True
+                    break
+                _invalidate(layer, [other])
+            if failed:
+                for layer, other, _, original in old_values:
+                    if original is None:
+                        if VIRTUAL_KEY in other.attributes:
+                            del other.attributes[VIRTUAL_KEY]
+                    else:
+                        other.attributes[VIRTUAL_KEY] = original
+                    _invalidate(layer, [other])
+        finally:
+            for layer, _, _, _ in reversed(old_values):
+                layer.endChanges()
+        self._last_ui_state = None
+        self._refresh_ui()
+        self._redraw()
+
+    def virtualAddFromInspector_(self, sender):
+        self._virtual_adding = not self._virtual_adding
+        self._virtual_error = ''
+        self._last_ui_state = None
+        self._refresh_ui()
+        self._redraw()
+
+    def virtualDeleteFromInspector_(self, sender):
+        path, spec = self._virtual_current()
+        if spec is None:
+            return
+        siblings = [(layer, other) for layer, other in self._virtual_siblings(path)
+                    if any(item['id'] == spec['id'] for item in virtual_nodes(other))]
+        for layer, _ in siblings:
+            layer.beginChanges()
+        try:
+            for layer, other in siblings:
+                other.attributes[VIRTUAL_KEY] = [item for item in virtual_nodes(other)
+                                                 if item['id'] != spec['id']]
+                _invalidate(layer, [other])
+        finally:
+            for layer, _ in reversed(siblings):
+                layer.endChanges()
+        self._virtual_selected = None
+        self._last_ui_state = None
+        self._refresh_ui()
+        self._redraw()
+
+    def virtualModeFromInspector_(self, sender):
+        if not self._updating_ui and sender.get() in (0, 1):
+            self._virtual_set_common('mode', ('continuous', 'step')[sender.get()])
+
+    def virtualSideFromInspector_(self, sender):
+        if not self._updating_ui and sender.get() in (0, 1, 2):
+            self._virtual_set_common('side', ('left', 'right', 'both')[sender.get()])
+
+    def virtualLinkFromInspector_(self, sender):
+        _, spec = self._virtual_current()
+        if spec is not None:
+            self._virtual_set_common('linked', not spec['linked'])
+
+    def virtualDirectionFromInspector_(self, sender):
+        _, spec = self._virtual_current()
+        if spec is None or self._updating_ui:
+            return
+        direction = ('normal', 'horizontal', 'vertical', 'angle')[sender.get()]
+        self._virtual_set_common('direction', direction)
+
+    @objc.python_method
+    def _virtual_tangent(self, path, spec):
+        from variable_stroke_core import _derivative
+        kind, points = segments_for_path(path)[spec['segment']][:2]
+        return unit(_derivative(kind, points, spec['t']))
 
     @objc.python_method
     def _frame_tick(self):
@@ -1378,7 +1666,14 @@ class VariableStrokeTool(SelectTool):
                   tuple(stroke_height(path) for path in paths),
                   tuple(has_width_override(path) for path in paths),
                   tuple(has_height_override(path) for path in paths))
-        if tab == 'caps':
+        if tab == 'virtual':
+            virtual_path, virtual_spec = self._virtual_current(layer)
+            details = (id(virtual_path) if virtual_path is not None else None,
+                       tuple(sorted((key, tuple(sorted(value.items())) if isinstance(value, dict)
+                                     else value) for key, value in virtual_spec.items()))
+                       if virtual_spec is not None else None,
+                       self._virtual_adding, self._virtual_error)
+        elif tab == 'caps':
             open_paths = [path for path in paths if not path.closed]
             details = tuple((path.attributes.get(CAP_START_KEY, 'flat'),
                              path.attributes.get(CAP_END_KEY, 'flat'),
@@ -1412,7 +1707,9 @@ class VariableStrokeTool(SelectTool):
         self._updating_ui = True
         try:
             self._show_stroke_row(group, layer, active, editable, stroke)
-            if tab == 'node':
+            if tab == 'virtual':
+                self._show_virtual_tab(group.virtualTab, editable, virtual_spec)
+            elif tab == 'node':
                 self._show_node_tab(group.nodeTab, editable, details)
             elif tab == 'caps':
                 self._show_caps_tab(group.capsTab, bool(details), details)
@@ -1450,6 +1747,41 @@ class VariableStrokeTool(SelectTool):
         tab.rotationField.set(('%g' % rotations[0]) if _same(rotations) else '')
         tab.rotationField.getNSTextField().setTextColor_(
             NSColor.labelColor() if any(rotation_overridden) else NSColor.secondaryLabelColor())
+
+    @objc.python_method
+    def _show_virtual_tab(self, tab, editable, spec):
+        selected = editable and spec is not None
+        tab.add.enable(editable)
+        tab.add.setTitle(_loc('Cancel', '中止') if self._virtual_adding else _loc('Add', '追加'))
+        tab.delete.enable(selected)
+        for control in (tab.mode, tab.side, tab.link, tab.direction):
+            control.enable(selected)
+        tab.message.set(self._virtual_error or
+                        (_loc('Click the centerline', '中心線をクリック') if self._virtual_adding
+                         else ''))
+        if spec is None:
+            for field in (tab.angleField, tab.beforeLeft, tab.beforeRight,
+                          tab.afterLeft, tab.afterRight):
+                field.enable(False)
+                field.set('')
+            return
+        tab.mode.set(0 if spec['mode'] == 'continuous' else 1)
+        tab.side.set({'left': 0, 'right': 1, 'both': 2}[spec['side']])
+        tab.link.setTitle(_loc('Linked', '左右連動') if spec['linked'] else
+                          _loc('Unlinked', '左右別々'))
+        tab.link.enable(selected and spec['side'] == 'both')
+        tab.direction.set({'normal': 0, 'horizontal': 1, 'vertical': 2,
+                           'angle': 3}[spec['direction']])
+        tab.angleField.enable(selected and spec['direction'] == 'angle')
+        tab.angleField.set('%g' % spec['angle'])
+        for end in ('before', 'after'):
+            for side in ('left', 'right'):
+                field = getattr(tab, end + side.title())
+                field.enable(selected and (end == 'before' or spec['mode'] == 'step')
+                             and (spec['side'] == side or spec['side'] == 'both')
+                             and (not spec['linked'] or side == 'left'
+                                  or spec['side'] != 'both'))
+                field.set('%g' % spec[end][side])
 
     @objc.python_method
     def _show_caps_tab(self, tab, open_paths, details):
@@ -1606,6 +1938,9 @@ class VariableStrokeTool(SelectTool):
         pre-edit state and applies the final value once, as one undo step."""
         if self._updating_ui:
             return
+        if name.startswith('virtual'):
+            self._virtual_field_edit(name, text, commit)
+            return
         layer = self._layer()
         live = self._live
         if live is not None and (live['name'] != name or live['layer'] != layer):
@@ -1650,6 +1985,75 @@ class VariableStrokeTool(SelectTool):
             finally:
                 layer.endChanges()
         _invalidate(layer, paths)
+        self._last_ui_state = None
+        self._refresh_ui()
+        self._redraw()
+
+    @objc.python_method
+    def _virtual_field_edit(self, name, text, commit):
+        path, spec = self._virtual_current()
+        if spec is None:
+            return
+        layer = path.parent
+        value = _parse_field(name, text)
+        live = self._live
+        if live is not None and (live['name'] != name or live['layer'] != layer):
+            self._quietly(live['layer'], lambda: _restore(live['snapshot']))
+            _invalidate(live['layer'], live['paths'])
+            self._live = live = None
+        if commit and str(text) == self._shown.get(name):
+            if live is not None:
+                self._quietly(layer, lambda: _restore(live['snapshot']))
+                self._live = None
+                _invalidate(layer, [path])
+                self._redraw()
+            return
+
+        def apply():
+            current = next((item for item in virtual_nodes(path)
+                            if item['id'] == spec['id']), None)
+            if current is None:
+                return False
+            changed = dict(current)
+            if name == 'virtualAngle':
+                changed['angle'] = value
+                if _virtual_section_angle(changed, self._virtual_tangent(path, changed)) is None:
+                    self._virtual_error = _loc('Direction nearly follows the stroke',
+                                                '方向が中心線に近すぎます')
+                    return False
+            else:
+                end = 'before' if 'Before' in name else 'after'
+                side = 'left' if name.endswith('Left') else 'right'
+                changed[end] = dict(changed[end])
+                changed[end][side] = value
+                if changed['side'] == 'both' and changed['linked']:
+                    changed[end]['left'] = changed[end]['right'] = value
+                if changed['mode'] == 'continuous':
+                    changed['after'] = dict(changed['before'])
+            return self._virtual_change(path, changed)
+
+        if not commit:
+            if live is None:
+                live = self._live = {'name': name, 'layer': layer, 'paths': [path],
+                                     'snapshot': _snapshot([path])}
+            def preview():
+                _restore(live['snapshot'])
+                if value is not None:
+                    apply()
+            self._quietly(layer, preview)
+            _invalidate(layer, [path])
+            self._redraw()
+            return
+        if live is not None:
+            self._quietly(layer, lambda: _restore(live['snapshot']))
+            self._live = None
+        if value is not None:
+            layer.beginChanges()
+            try:
+                apply()
+            finally:
+                layer.endChanges()
+        _invalidate(layer, [path])
         self._last_ui_state = None
         self._refresh_ui()
         self._redraw()
@@ -1888,6 +2292,7 @@ class VariableStrokeTool(SelectTool):
         defaults, strokes = self._strokes(layer)
         if not strokes:
             return
+        self._draw_virtual_handles(strokes, defaults, scale)
         selected = set(layer.selection)
         handles = list(self._handles(strokes, defaults))
         selected_nibs = list(self._selected_nibs(strokes, defaults, selected))
@@ -2000,6 +2405,128 @@ class VariableStrokeTool(SelectTool):
                 ((x-small, y-small), (small*2, small*2))).fill()
 
     @objc.python_method
+    def _draw_virtual_handles(self, strokes, defaults, scale):
+        color = NSColor.colorWithCalibratedRed_green_blue_alpha_(0.58, 0.24, 0.78, 1.0)
+        radius = 4.0 / scale
+        for path, _ in strokes:
+            try:
+                widgets = virtual_widgets(path, defaults)
+            except ValueError:
+                continue
+            for widget in widgets:
+                center = widget['center']
+                selected = self._virtual_selected == (path, widget['spec']['id'])
+                x, y = center
+                diamond = NSBezierPath.bezierPath()
+                diamond.moveToPoint_((x, y+radius))
+                diamond.lineToPoint_((x+radius, y))
+                diamond.lineToPoint_((x, y-radius))
+                diamond.lineToPoint_((x-radius, y))
+                diamond.closePath()
+                color.set()
+                if selected:
+                    diamond.fill()
+                else:
+                    diamond.setLineWidth_(1.3/scale)
+                    diamond.stroke()
+                if not selected:
+                    continue
+                for end in (('before', 'after') if widget['spec']['mode'] == 'step'
+                            else ('before',)):
+                    shift = (-5.0 if end == 'before' else 5.0) / scale \
+                        if widget['spec']['mode'] == 'step' else 0.0
+                    shift_vector = (widget['tangent'][0]*shift, widget['tangent'][1]*shift)
+                    shifted_center = add(center, shift_vector)
+                    for side, point in zip(('left', 'right'), widget[end]):
+                        if widget['spec']['side'] not in (side, 'both'):
+                            continue
+                        tip = add(point, shift_vector)
+                        line = NSBezierPath.bezierPath()
+                        line.moveToPoint_(shifted_center)
+                        line.lineToPoint_(tip)
+                        line.setLineWidth_(1.0/scale)
+                        color.colorWithAlphaComponent_(0.55).set()
+                        line.stroke()
+                        color.set()
+                        NSBezierPath.bezierPathWithOvalInRect_(
+                            ((tip[0]-radius, tip[1]-radius), (2*radius, 2*radius))).fill()
+
+    @objc.python_method
+    def _nearest_virtual_position(self, path, point, defaults=None, segment_index=None):
+        segments = segments_for_path(path, defaults)
+        best = None
+        for index, segment in enumerate(segments):
+            if segment_index is not None and index != segment_index:
+                continue
+            for sample in range(65):
+                t = sample/64.0
+                candidate = virtual_point(segment, t)
+                distance = length(sub(point, candidate))
+                if best is None or distance < best[0]:
+                    best = (distance, index, t)
+        if best is None:
+            return None
+        _, index, t = best
+        lo, hi = max(0.005, t-1/64.0), min(0.995, t+1/64.0)
+        segment = segments[index]
+        for _ in range(22):
+            a, b = lo+(hi-lo)/3.0, hi-(hi-lo)/3.0
+            if length(sub(point, virtual_point(segment, a))) < \
+                    length(sub(point, virtual_point(segment, b))):
+                hi = b
+            else:
+                lo = a
+        t = (lo+hi)/2.0
+        return length(sub(point, virtual_point(segment, t))), index, t
+
+    @objc.python_method
+    def _add_virtual_at(self, layer, point, strokes, defaults, threshold):
+        candidates = []
+        for path, _ in strokes:
+            nearest = self._nearest_virtual_position(path, point, defaults)
+            if nearest is not None and nearest[0] <= threshold:
+                candidates.append((nearest[0], path, nearest[1], nearest[2]))
+        if not candidates:
+            self._virtual_error = _loc('Click a centerline', '中心線をクリックしてください')
+            return False
+        _, path, segment, t = min(candidates, key=lambda item: item[0])
+        if not 0.005 < t < 0.995:
+            self._virtual_error = _loc('Use the real endpoint here',
+                                        '端点付近は実ノードを使用してください')
+            return False
+        siblings = self._virtual_siblings(path)
+        if any(item['segment'] == segment and abs(item['t']-t) < 0.002
+               for item in virtual_nodes(path)):
+            self._virtual_error = _loc('Too close to another virtual node',
+                                        '別の仮想ノードに近すぎます')
+            return False
+        siblings = [(other_layer, other) for other_layer, other in siblings
+                    if not any(item['segment'] == segment and abs(item['t']-t) < 0.002
+                               for item in virtual_nodes(other))]
+        identifier = uuid.uuid4().hex
+        spec = {'id': identifier, 'segment': segment, 't': t, 'mode': 'continuous',
+                'side': 'both', 'linked': True, 'direction': 'normal', 'angle': 0.0,
+                'before': {'left': 100.0, 'right': 100.0},
+                'after': {'left': 100.0, 'right': 100.0}}
+        for other_layer, _ in siblings:
+            other_layer.beginChanges()
+        try:
+            for other_layer, other in siblings:
+                other.attributes[VIRTUAL_KEY] = virtual_nodes(other) + [dict(spec)]
+                _invalidate(other_layer, [other])
+        finally:
+            for other_layer, _ in reversed(siblings):
+                other_layer.endChanges()
+        self._virtual_selected = (path, identifier)
+        self._virtual_adding = False
+        self._virtual_error = ''
+        self._select_tab('virtual')
+        self._last_ui_state = None
+        self._refresh_ui()
+        self._redraw()
+        return True
+
+    @objc.python_method
     def _select_node(self, layer, node):
         """Grabbing a handle selects its node (Shift adds it), so the panel shows it."""
         if not NSEvent.modifierFlags() & NSEventModifierFlagShift:
@@ -2031,6 +2558,58 @@ class VariableStrokeTool(SelectTool):
             point = (loc.x, loc.y)
             threshold = 8.0 / self._scale()
             defaults, strokes = self._strokes(layer)
+            if self._virtual_adding:
+                self._virtual_click_consumed = True
+                self._add_virtual_at(layer, point, strokes, defaults, threshold)
+                self._last_ui_state = None
+                self._refresh_ui()
+                self._redraw()
+                return
+            for path, _ in strokes:
+                try:
+                    widgets = virtual_widgets(path, defaults)
+                except ValueError:
+                    continue
+                for widget in widgets:
+                    spec = widget['spec']
+                    if length(sub(point, widget['center'])) <= 4.0/self._scale():
+                        self._virtual_selected = (path, spec['id'])
+                        layer.beginChanges()
+                        self._drag = {'kind': 'virtual-position', 'layer': layer,
+                                      'path': path, 'id': spec['id'],
+                                      'segment': spec['segment']}
+                        self._select_tab('virtual')
+                        self._last_ui_state = None
+                        self._refresh_ui()
+                        return
+                    if self._virtual_selected is None or \
+                            not (self._virtual_selected[0] == path and
+                                 self._virtual_selected[1] == spec['id']):
+                        continue
+                    for end in (('before', 'after') if spec['mode'] == 'step'
+                                else ('before',)):
+                        shift = (-5.0 if end == 'before' else 5.0) / self._scale() \
+                            if spec['mode'] == 'step' else 0.0
+                        translation = (widget['tangent'][0]*shift,
+                                       widget['tangent'][1]*shift)
+                        for side, tip in zip(('left', 'right'), widget[end]):
+                            if spec['side'] not in (side, 'both') or \
+                                    length(sub(point, add(tip, translation))) > threshold:
+                                continue
+                            self._virtual_selected = (path, spec['id'])
+                            layer.beginChanges()
+                            sign = 1 if side == 'left' else -1
+                            initial = sign * sum((tip[i]-widget['center'][i]) *
+                                                 widget['axis'][i] for i in (0, 1))
+                            self._drag = {'kind': 'virtual-width', 'layer': layer,
+                                          'path': path, 'id': spec['id'], 'end': end,
+                                          'side': side, 'widget': widget,
+                                          'translation': translation,
+                                          'base_distance': initial*100.0/spec[end][side]}
+                            self._select_tab('virtual')
+                            self._last_ui_state = None
+                            self._refresh_ui()
+                            return
             selected = set(layer.selection)
             handles = list(self._handles(strokes, defaults))
             selected_nibs = list(self._selected_nibs(strokes, defaults, selected))
@@ -2108,6 +2687,17 @@ class VariableStrokeTool(SelectTool):
                     return
         objc.super(VariableStrokeTool, self).mouseDown_(event)
 
+    def keyDown_(self, event):
+        if self._virtual_adding and (event.keyCode() == 53 or
+                                     str(event.charactersIgnoringModifiers()) == '\x1b'):
+            self._virtual_adding = False
+            self._virtual_error = ''
+            self._last_ui_state = None
+            self._refresh_ui()
+            self._redraw()
+            return
+        objc.super(VariableStrokeTool, self).keyDown_(event)
+
     @objc.python_method
     def _drag_corner(self, drag, mouse):
         widget, node = drag['widget'], drag['node']
@@ -2162,6 +2752,8 @@ class VariableStrokeTool(SelectTool):
         node.userData[CORNER_ON_KEY] = True
 
     def mouseDragged_(self, event):
+        if self._virtual_click_consumed:
+            return
         if PROFILE.enabled:
             now = time.perf_counter()
             if getattr(self, '_last_drag_event', None) is not None:
@@ -2184,6 +2776,47 @@ class VariableStrokeTool(SelectTool):
             return
         drag = self._drag
         loc = self.editViewController().graphicView().getActiveLocation_(event)
+        if drag.get('kind') == 'virtual-position':
+            nearest = self._nearest_virtual_position(
+                drag['path'], (loc.x, loc.y), segment_index=drag['segment'])
+            if nearest is not None:
+                spec = next((item for item in virtual_nodes(drag['path'])
+                             if item['id'] == drag['id']), None)
+                if spec is not None:
+                    others = [item['t'] for item in virtual_nodes(drag['path'])
+                              if item['segment'] == spec['segment'] and item['id'] != spec['id']]
+                    limits = [0.005] + [t+0.002 for t in others if t < spec['t']]
+                    upper = [0.995] + [t-0.002 for t in others if t > spec['t']]
+                    changed = dict(spec, t=min(max(nearest[2], max(limits)), min(upper)))
+                    if self._virtual_change(drag['path'], changed):
+                        _invalidate(drag['layer'], [drag['path']])
+                        self._redraw()
+            return
+        if drag.get('kind') == 'virtual-width':
+            spec = next((item for item in virtual_nodes(drag['path'])
+                         if item['id'] == drag['id']), None)
+            if spec is not None:
+                widget = drag['widget']
+                side, end = drag['side'], drag['end']
+                sign = 1 if side == 'left' else -1
+                axis = widget['axis']
+                center = add(widget['center'], drag['translation'])
+                base_distance = drag['base_distance']
+                if abs(base_distance) > 1e-6:
+                    delta = sub((loc.x, loc.y), center)
+                    distance = sign*(delta[0]*axis[0]+delta[1]*axis[1])
+                    pct = max(0.1, min(9999.0, distance/base_distance*100.0))
+                    changed = dict(spec)
+                    changed[end] = dict(changed[end])
+                    changed[end][side] = round(pct, 1)
+                    if changed['side'] == 'both' and changed['linked']:
+                        changed[end]['left'] = changed[end]['right'] = round(pct, 1)
+                    if changed['mode'] == 'continuous':
+                        changed['after'] = dict(changed['before'])
+                    if self._virtual_change(drag['path'], changed):
+                        _invalidate(drag['layer'], [drag['path']])
+                        self._redraw()
+            return
         if drag.get('kind', '').startswith('corner-'):
             self._drag_corner(drag, (loc.x, loc.y))
             _invalidate(drag['layer'], [drag['path']])
@@ -2224,23 +2857,16 @@ class VariableStrokeTool(SelectTool):
             return
         # The handle slides on the line from the node through its outline point
         # (across the stroke, or towards the corner at corners).
-        reach = max(0.0, delta[0]*drag['direction'][0] + delta[1]*drag['direction'][1])
+        reach = delta[0]*drag['direction'][0] + delta[1]*drag['direction'][1]
         node, sign, o, pct = drag['node'], drag['sign'], drag['offset'], drag['scale']
-        # Each side's reach is proportional to (1 ± offset) x scale.
-        near_share, far_share = (1 + sign*o) * pct, (1 - sign*o) * pct
         if NSEvent.modifierFlags() & NSEventModifierFlagOption or drag['near'] < 1e-6:
             # Option: keep the opposite edge where it is and move this one only.
-            if drag['near'] < 1e-6:
-                near_new = reach / max(drag['far'], 1e-6) * far_share
-            else:
-                near_new = near_share * reach / drag['near']
-            total = near_new + far_share
-            if total < 1e-6:
+            values = _one_sided_drag_values(reach, drag['near'], drag['far'], pct, o, sign)
+            if values is None:
                 return
-            node.userData[drag['scale_key']] = max(1.0, round(total / 2.0, 1))
-            node.userData[OFFSET_KEY] = round(sign * (near_new - far_share) / total * 100.0, 1)
+            node.userData[drag['scale_key']], node.userData[OFFSET_KEY] = values
         else:
-            node.userData[drag['scale_key']] = max(1.0, round(pct * reach / drag['near'], 1))
+            node.userData[drag['scale_key']] = max(1.0, round(pct * max(0.0, reach) / drag['near'], 1))
         _invalidate(drag['layer'], [drag['path']])
         self._redraw()
 
@@ -2254,6 +2880,9 @@ class VariableStrokeTool(SelectTool):
 
     @objc.python_method
     def _mouse_up(self, event):
+        if self._virtual_click_consumed:
+            self._virtual_click_consumed = False
+            return
         if self._drag is not None:
             layer, path = self._drag['layer'], self._drag['path']
             self._drag = None

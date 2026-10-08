@@ -1,6 +1,7 @@
 """Glyphs 3 adapters shared by the editing tool and the export filter."""
 import collections
 import contextlib
+import math
 import threading
 import time
 from GlyphsApp import GSPath, GSNode, LINE, CURVE, OFFCURVE
@@ -13,7 +14,8 @@ STROKE_WIDTH_KEY = 'com.codex.VariableStroke.strokeWidth'  # per path, font unit
 SCALE_KEY = 'com.codex.VariableStroke.scale'  # per node, percent of the path width
 HEIGHT_SCALE_KEY = 'com.codex.VariableStroke.heightScale'  # per node, percent of path height
 STROKE_HEIGHT_KEY = 'com.codex.VariableStroke.strokeHeight'  # per path, font units
-OFFSET_KEY = 'com.codex.VariableStroke.offset'  # per node, -100 (right) .. 100 (left)
+OFFSET_KEY = 'com.codex.VariableStroke.offset'  # per node; values beyond +/-100 move the stroke off the centerline
+VIRTUAL_KEY = 'com.codex.VariableStroke.virtualNodes'  # per path, ordered virtual sections
 ROTATION_KEY = 'com.codex.VariableStroke.rotation'  # per node, nib axes angle in page degrees
 # Live corners, per node. The radius key alone (older files) also means ON.
 CORNER_ON_KEY = 'com.codex.VariableStroke.corner'  # bool
@@ -336,7 +338,7 @@ def offset_of(data):
         value = float(data.get(OFFSET_KEY, 0.0))
     except (TypeError, ValueError):
         return 0.0
-    return max(-100.0, min(100.0, value))
+    return value if math.isfinite(value) else 0.0
 
 
 def offset(node):
@@ -520,6 +522,174 @@ def segments_for_path(path, defaults=None, items=None):
     return result
 
 
+def virtual_nodes(path, segment_count=None):
+    """Normalized, sorted virtual sections. Malformed saved entries are ignored."""
+    try:
+        raw = path.attributes.get(VIRTUAL_KEY) or []
+    except (AttributeError, TypeError):
+        return []
+    count = len(segments_for_path(path)) if segment_count is None else segment_count
+    result = []
+    for item in raw:
+        try:
+            data = dict(item)
+            segment, t = int(data['segment']), float(data['t'])
+            if not (0 <= segment < count and 0.005 <= t <= 0.995 and math.isfinite(t)):
+                continue
+            mode = data.get('mode', 'continuous')
+            side = data.get('side', 'both')
+            direction = data.get('direction', 'normal')
+            if mode not in ('continuous', 'step') or side not in ('left', 'right', 'both') \
+                    or direction not in ('normal', 'horizontal', 'vertical', 'angle'):
+                continue
+            before = dict(data.get('before') or {})
+            after = dict(data.get('after') or before)
+            for values in (before, after):
+                for key in ('left', 'right'):
+                    value = float(values.get(key, 100.0))
+                    if not (0 < value < 10000 and math.isfinite(value)):
+                        raise ValueError('Invalid virtual width')
+                    values[key] = value
+            angle = float(data.get('angle', 0.0))
+            if not math.isfinite(angle):
+                continue
+            result.append({'id': str(data.get('id', '')), 'segment': segment, 't': t,
+                           'mode': mode, 'side': side, 'direction': direction,
+                           'angle': angle, 'linked': bool(data.get('linked', True)),
+                           'before': before, 'after': after})
+        except (TypeError, ValueError, KeyError):
+            continue
+    return sorted(result, key=lambda spec: (spec['segment'], spec['t'], spec['id']))
+
+
+def virtual_point(segment, t):
+    kind, pts = segment[:2]
+    if kind == 'line':
+        return (pts[0][0]*(1-t)+pts[1][0]*t, pts[0][1]*(1-t)+pts[1][1]*t)
+    from variable_stroke_core import cubic
+    return cubic(*pts, t)
+
+
+def _split_segment(kind, pts, t):
+    if kind == 'line':
+        middle = virtual_point((kind, pts), t)
+        return (pts[0], middle), (middle, pts[1])
+    from variable_stroke_core import add, mul
+    a, b, c = (add(mul(pts[i], 1-t), mul(pts[i+1], t)) for i in range(3))
+    d, e = add(mul(a, 1-t), mul(b, t)), add(mul(b, 1-t), mul(c, t))
+    middle = add(mul(d, 1-t), mul(e, t))
+    return (pts[0], a, d, middle), (middle, e, c, pts[3])
+
+
+def _virtual_section_angle(spec, tangent):
+    direction = spec['direction']
+    if direction == 'normal':
+        return 0.0
+    target = 0.0 if direction == 'horizontal' else 90.0 if direction == 'vertical' \
+        else spec['angle']
+    normal_angle = math.degrees(math.atan2(tangent[0], -tangent[1]))
+    delta = (target-normal_angle+90.0) % 180.0-90.0
+    return delta if abs(math.cos(math.radians(delta))) >= 0.25 else None
+
+
+def _virtual_nib(base, percentages, section_angle):
+    w, h, o, angle = base[:4]
+    left = (1+o)*percentages['left']/100.0
+    right = (1-o)*percentages['right']/100.0
+    total = left+right
+    if total <= 0.0001:
+        raise ValueError('Virtual section reverses the outline')
+    return (w*total/2.0, h*total/2.0, (left-right)/total, angle, section_angle)
+
+
+def expanded_virtual_segments(segments, specs, corners=None, closed=False):
+    """Split source segments without changing the Glyphs path; return pieces,
+    step breaks, expanded corner list, and original-node index for each vertex."""
+    from variable_stroke_core import _nib, _derivative, unit
+    by_segment = collections.defaultdict(list)
+    for spec in specs:
+        by_segment[spec['segment']].append(spec)
+    result = []
+    breaks = {'left': set(), 'right': set()}
+    smooths, expanded_corners, node_map = set(), [], []
+    for index, (kind, pts, e0, e1) in enumerate(segments):
+        current_pts, start_t, current_nib = pts, 0.0, e0
+        source_specs = sorted(by_segment[index], key=lambda item: item['t'])
+        for spec in source_specs:
+            t = spec['t']
+            if t <= start_t + 0.001:
+                continue
+            first, current_pts = _split_segment(kind, current_pts,
+                                                 (t-start_t)/(1-start_t))
+            base0, base1 = _nib(e0), _nib(e1)
+            values = [base0[j]*(1-t)+base1[j]*t for j in range(3)]
+            turn = (base1[3]-base0[3]+90.0) % 180.0-90.0
+            base = tuple(values + [base0[3]+turn*t])
+            axis = _virtual_section_angle(spec, unit(_derivative(kind, pts, t)))
+            if axis is None:
+                axis = 0.0  # defensive fallback for an invalid saved direction
+            before = _virtual_nib(base, spec['before'], axis)
+            after = _virtual_nib(base, spec['after'] if spec['mode'] == 'step'
+                                 else spec['before'], axis)
+            result.append((kind, first, current_nib, before))
+            expanded_corners.append(corners[index] if corners and start_t == 0 else None)
+            node_map.append(index if start_t == 0 else None)
+            if spec['mode'] == 'step':
+                for side in ('left', 'right'):
+                    if spec['side'] in (side, 'both'):
+                        breaks[side].add(len(result)-1)
+            else:
+                smooths.add(len(result)-1)
+            current_nib, start_t = after, t
+        result.append((kind, current_pts, current_nib, e1))
+        expanded_corners.append(corners[index] if corners and start_t == 0 else None)
+        node_map.append(index if start_t == 0 else None)
+    if not closed:
+        expanded_corners.append(corners[-1] if corners else None)
+        node_map.append(len(segments))
+    return result, breaks, smooths, expanded_corners, node_map
+
+
+def virtual_widgets(path, defaults=None):
+    """Canvas positions for virtual sections, using the same nibs as expansion."""
+    from variable_stroke_core import _nib, _derivative, unit, nib_edges, normal
+    segments = segments_for_path(path, defaults)
+    widgets = []
+    for spec in virtual_nodes(path, len(segments)):
+        kind, pts, e0, e1 = segments[spec['segment']]
+        t = spec['t']
+        center = virtual_point((kind, pts), t)
+        tangent = unit(_derivative(kind, pts, t))
+        n0, n1 = _nib(e0), _nib(e1)
+        values = [n0[j]*(1-t)+n1[j]*t for j in range(3)]
+        turn = (n1[3]-n0[3]+90.0) % 180.0-90.0
+        base = tuple(values + [n0[3]+turn*t])
+        angle = _virtual_section_angle(spec, tangent)
+        if angle is None:
+            angle = 0.0
+        before = _virtual_nib(base, spec['before'], angle)
+        after = _virtual_nib(base, spec['after'] if spec['mode'] == 'step'
+                             else spec['before'], angle)
+        baseline = nib_edges(center, tangent, base)
+        before_edges = nib_edges(center, tangent, before)
+        after_edges = nib_edges(center, tangent, after)
+        if spec['side'] == 'left':
+            before_edges = (before_edges[0], baseline[1])
+            after_edges = (after_edges[0], baseline[1])
+        elif spec['side'] == 'right':
+            before_edges = (baseline[0], before_edges[1])
+            after_edges = (baseline[0], after_edges[1])
+        axis = normal(tangent)
+        radians = math.radians(angle)
+        axis = (axis[0]*math.cos(radians)-axis[1]*math.sin(radians),
+                axis[0]*math.sin(radians)+axis[1]*math.cos(radians))
+        widgets.append({'spec': spec, 'center': center, 'tangent': tangent,
+                        'axis': axis, 'before': before_edges,
+                        'after': after_edges,
+                        'base': base})
+    return widgets
+
+
 def _on_curve_nodes(path):
     """On-curve nodes in segment order (segment i starts at node i)."""
     return [item[0] for item in _on_curve(path_nodes(path), bool(path.closed))]
@@ -585,7 +755,13 @@ def edges_for_path(path, defaults=None, items=None):
     on_curve = [item[0] for item in _on_curve(items, closed)]
     if not on_curve:
         return []
-    segments, (_, _, edges, _) = _outline(path, defaults, items)
+    segments, (_, _, edges, _), node_map = _outline(path, defaults, items)
+    if node_map is not None:
+        original_edges = {}
+        for expanded_index, original_index in enumerate(node_map):
+            if original_index is not None and expanded_index in edges:
+                original_edges[original_index] = edges[expanded_index]
+        edges = original_edges
     if segments and not closed:
         first_cap = path.attributes.get(CAP_START_KEY, 'flat')
         last_cap = path.attributes.get(CAP_END_KEY, 'flat')
@@ -689,21 +865,49 @@ def corner_widgets(path, defaults=None, items=None):
     on_curve = [item[0] for item in _on_curve(items, bool(path.closed))]
     if not on_curve:
         return []
+    _, _, node_map = _outline(path, _resolve(defaults, path), items)
     for widget in report:
-        widget['node'] = on_curve[widget['node'] % len(on_curve)]
+        original = (node_map[widget['node'] % len(node_map)]
+                    if node_map is not None else widget['node'])
+        if original is not None:
+            widget['node'] = on_curve[original % len(on_curve)]
+    report = [widget for widget in report if not isinstance(widget['node'], int)]
     return report
 
 
 def _outline(path, defaults, items):
-    """(segments, (contours, corner report, node edges)) of a path, cached by input."""
+    """(segments, cached geometry, original-node map) of a path."""
     with PROFILE.section('outline inputs (segments, corners)'):
-        segments = tuple(segments_for_path(path, defaults, items))
+        source_segments = segments_for_path(path, defaults, items)
         closed = bool(path.closed)
         attributes = path.attributes
         caps = (attributes.get(CAP_START_KEY, 'flat'), attributes.get(CAP_END_KEY, 'flat'))
         angles = (cut_angle(path, CAP_START_ANGLE_KEY), cut_angle(path, CAP_END_ANGLE_KEY))
-        corners = corner_specs(path, items)
-        key = ('curves', segments, closed, caps, angles, defaults.italic_angle,
+        specs = virtual_nodes(path, len(source_segments))
+        source_corners = corner_specs(path, items)
+        independent = any(spec['side'] != 'both' for spec in specs)
+        if independent:
+            left_specs = [spec for spec in specs if spec['side'] in ('left', 'both')]
+            right_specs = [spec for spec in specs if spec['side'] in ('right', 'both')]
+            segments, left_breaks, left_smooths, corners, left_map = \
+                expanded_virtual_segments(source_segments, left_specs, source_corners, closed)
+            right_segments, right_breaks, right_smooths, _, right_map = \
+                expanded_virtual_segments(source_segments, right_specs, source_corners, closed)
+            breaks = {'left': left_breaks['left'], 'right': right_breaks['right']}
+            smooths = left_smooths
+            node_map = None
+            right_segments = tuple(right_segments)
+        else:
+            segments, breaks, smooths, corners, node_map = expanded_virtual_segments(
+                source_segments, specs, source_corners, closed)
+            right_segments = right_smooths = right_map = left_map = None
+        segments = tuple(segments)
+        key = ('curves', segments, right_segments, closed, caps, angles,
+               defaults.italic_angle, tuple(sorted(breaks['left'])),
+               tuple(sorted(breaks['right'])), tuple(sorted(smooths)),
+               tuple(sorted(right_smooths)) if independent else (),
+               tuple(left_map) if independent else (),
+               tuple(right_map) if independent else (),
                tuple(None if c is None else tuple(sorted(c.items())) for c in corners))
 
     def compute():
@@ -711,17 +915,22 @@ def _outline(path, defaults, items):
         contours = outline_curves(list(segments), closed, caps[0], caps[1],
                                   italic_angle=defaults.italic_angle,
                                   start_angle=angles[0], end_angle=angles[1],
-                                  corner_radii=corners, report=collected, edges=edges)
+                                  corner_radii=corners, report=collected, edges=edges,
+                                  breaks=breaks, smooth_virtuals=smooths,
+                                  right_segments=right_segments,
+                                  right_corner_radii=source_corners if independent else None,
+                                  left_map=left_map, right_map=right_map,
+                                  right_smooth_virtuals=right_smooths if independent else ())
         # The last slot keeps the outline as GSPaths once built (see _outline_paths).
         return [contours, collected, edges, None]
 
-    return segments, _cached(key, compute)
+    return segments, _cached(key, compute), node_map
 
 
 def curves_for_path(path, defaults=None, report=None, items=None):
     defaults = _resolve(defaults, path)
     items = path_nodes(path) if items is None else items
-    _, (contours, collected, _, _) = _outline(path, defaults, items)
+    _, (contours, collected, _, _), _ = _outline(path, defaults, items)
     if report is not None:
         report.extend(dict(widget) for widget in collected)  # callers annotate them
     return contours
@@ -732,7 +941,7 @@ def _outline_paths(path, defaults, items):
     for every mouse event while a node moves, so the outline of each unchanged
     stroke is built once and handed out as copies (one call instead of one
     GSNode per point)."""
-    _, cached = _outline(path, _resolve(defaults, path), items)
+    _, cached, _ = _outline(path, _resolve(defaults, path), items)
     templates = cached[3]
     if templates is None:
         with PROFILE.section('build outline GSPaths'):
@@ -975,6 +1184,24 @@ def interpolate_layer(layer, glyph, interpolation):
         for key in _STROKE_ATTRIBUTES:
             if template.attributes.get(key) is not None:
                 path.attributes[key] = template.attributes[key]
+        virtual_sources = [(virtual_nodes(other), factor) for _, other, factor in others]
+        if virtual_sources and all(
+                [(spec['id'], spec['segment'], spec['mode'], spec['side']) for spec in specs] ==
+                [(spec['id'], spec['segment'], spec['mode'], spec['side'])
+                 for spec in virtual_sources[0][0]] for specs, _ in virtual_sources):
+            blended = []
+            for position, template_spec in enumerate(virtual_sources[0][0]):
+                spec = dict(template_spec)
+                spec['t'] = sum(factor * specs[position]['t']
+                                for specs, factor in virtual_sources)
+                spec['angle'] = sum(factor * specs[position]['angle']
+                                    for specs, factor in virtual_sources)
+                for end in ('before', 'after'):
+                    spec[end] = {side: sum(factor * specs[position][end][side]
+                                           for specs, factor in virtual_sources)
+                                 for side in ('left', 'right')}
+                blended.append(spec)
+            path.attributes[VIRTUAL_KEY] = blended
         path.attributes['fill'] = False
         base_w = sum(factor * stroke_width(other) for _, other, factor in others)
         base_h = sum(factor * stroke_height(other) for _, other, factor in others)
