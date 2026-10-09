@@ -1791,8 +1791,14 @@ class VariableStrokeTool(SelectTool):
                       NSForegroundColorAttributeName:
                           NSColor.colorWithCalibratedRed_green_blue_alpha_(0.85, 0.1, 0.05, 1.0)}
         label = NSAttributedString.alloc().initWithString_attributes_(text, attributes)
-        position = node.position
-        label.drawAtPoint_((position.x + 6.0 / scale, position.y + 6.0 / scale))
+        # One line per setting: a light backing keeps it readable over outlines.
+        size = label.size()
+        origin = (node.position.x + 6.0 / scale, node.position.y + 6.0 / scale)
+        pad = 3.0 / scale
+        NSColor.colorWithCalibratedWhite_alpha_(1.0, 0.85).set()
+        NSBezierPath.fillRect_(((origin[0] - pad, origin[1] - pad),
+                                (size.width + 2 * pad, size.height + 2 * pad)))
+        label.drawAtPoint_(origin)
 
     @objc.python_method
     def _font_has_strokes(self, font):

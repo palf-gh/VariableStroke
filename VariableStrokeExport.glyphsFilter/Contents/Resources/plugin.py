@@ -24,7 +24,8 @@ def _convert_masters(glyph):
     try:
         for index, entry in sorted(master_incompatibilities(glyph).items()):
             print('Variable Stroke: %s path %d: %s' % (
-                glyph.name, index + 1, describe_incompatibility(entry)))
+                glyph.name, index + 1,
+                describe_incompatibility(entry).replace('\n', '\n    ')))
     except Exception:
         pass
     convert_glyph(glyph)

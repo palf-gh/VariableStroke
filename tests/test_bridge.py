@@ -953,9 +953,32 @@ class BridgeTests(unittest.TestCase):
                             bridge.compare_string_suffix(plain))
         found = bridge.master_incompatibilities(glyph)
         self.assertEqual(list(found), [0])
-        self.assertEqual(found[0]['reasons'], [('cap curve', 'end')])
-        self.assertIn('cap curve (end)', bridge.describe_incompatibility(found[0]))
-        self.assertIn('キャップカーブ（終点）', bridge.describe_incompatibility(found[0], True))
+        self.assertEqual(found[0]['reasons'],
+                         [('cap curve', 'end', [(True, ['Bold']), (False, ['Light'])])])
+        self.assertIn('Cap curve (end) – ON: Bold; OFF: Light',
+                      bridge.describe_incompatibility(found[0]))
+        self.assertIn('キャップカーブ（終点）：ON: Bold／OFF: Light',
+                      bridge.describe_incompatibility(found[0], True))
+
+    def test_incompatibility_names_cap_shape_and_virtual_nodes_per_master(self):
+        def master(name, y):
+            layer = Layer([Path([Node(0, y), Node(300, y), Node(300, 300)])])
+            layer.name = name
+            return layer
+        layers = [master('Light', 0), master('Regular', 10), master('Bold', 20)]
+        glyph = types.SimpleNamespace(layers=layers, userData={bridge.GLYPH_KEY: True})
+        for layer in layers:
+            layer.parent = glyph
+        layers[2].paths[0].attributes[bridge.CAP_START_KEY] = 'round'
+        layers[2].paths[0].attributes[bridge.VIRTUAL_KEY] = [self.virtual_spec()]
+        found = bridge.master_incompatibilities(glyph)
+        self.assertEqual(found[0]['layers'], ['Bold'])
+        self.assertEqual(found[0]['reasons'], [
+            ('cap shape', 'start', [('flat', ['Light', 'Regular']), ('round', ['Bold'])]),
+            ('virtual', 1, [((), ['Light', 'Regular']), ((('step', 'right'),), ['Bold'])])])
+        text = bridge.describe_incompatibility(found[0], True)
+        self.assertIn('線端の形（始点）：フラット: Light, Regular／丸: Bold', text)
+        self.assertIn('仮想ノード（区間 1）：なし: Light, Regular／段差・右: Bold', text)
 
     def test_compare_string_suffix_is_empty_without_strokes(self):
         layer = Layer([Path([Node(0, 0), Node(100, 0)])])

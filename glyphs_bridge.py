@@ -2179,35 +2179,73 @@ def _interpolated_layers(glyph):
     return result
 
 
-def _mismatch_reasons(entries):
+def _groups(values, names):
+    """[(value, [layer names])] in order of first appearance."""
+    groups = {}
+    for value, name in zip(values, names):
+        groups.setdefault(value, []).append(name)
+    return list(groups.items())
+
+
+def _virtual_layout(path, items):
+    """Per centerline segment, the (mode, side) of its virtual nodes in order."""
+    count = max(0, len(_on_curve(items, bool(path.closed))) - (0 if path.closed else 1))
+    layout = [[] for _ in range(count)]
+    for spec in sorted(virtual_nodes(path, count, items), key=lambda s: s['t']):
+        if 0 <= spec['segment'] < count:
+            layout[spec['segment']].append((spec['mode'], spec['side']))
+    return [tuple(specs) for specs in layout]
+
+
+def _mismatch_reasons(entries, names):
     """Settings that differ between the (path, items) of one path in several layers
-    and change the outline structure."""
+    and change the outline structure: [(kind, where, [(value, [layer names])])].
+    `where` is 'start'/'end' for caps, node numbers for corners and the segment
+    number for virtual nodes."""
     reasons = []
     for at_end, end in ((False, 'start'), (True, 'end')):
-        if len({cap_curve_enabled(path, at_end) for path, _ in entries}) > 1:
-            reasons.append(('cap curve', end))
         key = CAP_END_KEY if at_end else CAP_START_KEY
-        if len({path.attributes.get(key, 'flat') in ('round', 'ellipse')
-                for path, _ in entries}) > 1:
-            reasons.append(('cap shape', end))
-    corners = {tuple(data is not None and corner_on_of(data)
-                     for _, _, _, data in _on_curve(items, bool(path.closed)))
-               for path, items in entries}
-    if len(corners) > 1:
-        reasons.append(('corner', None))
-    return reasons or [('outline', None)]
+        styles = [path.attributes.get(key, 'flat') for path, _ in entries]
+        if len({style in ('round', 'ellipse') for style in styles}) > 1:
+            reasons.append(('cap shape', end, _groups(styles, names)))
+            continue  # a round cap has no cap curve
+        curves = [cap_curve_enabled(path, at_end) for path, _ in entries]
+        if len(set(curves)) > 1:
+            reasons.append(('cap curve', end, _groups(curves, names)))
+    layouts = [_virtual_layout(path, items) for path, items in entries]
+    if len({len(layout) for layout in layouts}) == 1:
+        for segment in range(len(layouts[0])):
+            values = [layout[segment] for layout in layouts]
+            if len(set(values)) > 1:
+                reasons.append(('virtual', segment + 1, _groups(values, names)))
+    if not reasons:
+        # A live corner in one master only usually gets a zero-size twin in the
+        # others, so it is named only when nothing else explains the difference.
+        corners = [[data is not None and bool(corner_on_of(data))
+                    for _, _, _, data in _on_curve(items, bool(path.closed))]
+                   for path, items in entries]
+        patterns = {}
+        if len({len(row) for row in corners}) == 1:
+            for index, pattern in enumerate(zip(*corners)):
+                if len(set(pattern)) > 1:
+                    patterns.setdefault(pattern, []).append(index + 1)
+        for pattern, nodes in patterns.items():
+            reasons.append(('corner', tuple(nodes), _groups(pattern, names)))
+    return reasons
 
 
 def master_incompatibilities(glyph):
-    """{path index in layer.paths: {'reasons': [(kind, end)], 'layers': [names]}}
-    for strokes whose centerlines are compatible but whose outlines get a different
-    structure in some master, e.g. a cap curve switched on in one master only.
-    `layers` names the masters that differ from the most common outline."""
+    """{path index in layer.paths: {'reasons': [(kind, where, [(value, [names])])],
+    'layers': [names]}} for strokes whose centerlines are compatible but whose
+    outlines get a different structure in some master, e.g. a cap curve switched
+    on in one master only. `layers` names the masters that differ from the most
+    common outline."""
     if glyph is None or not glyph_enabled(glyph):
         return {}
     layers = _interpolated_layers(glyph)
     if len(layers) < 2:
         return {}
+    names = [getattr(layer, 'name', None) or '?' for layer in layers]
     table = []
     for layer in layers:
         defaults = layer_defaults(layer)
@@ -2235,31 +2273,64 @@ def master_incompatibilities(glyph):
         if len(set(signatures)) == 1:
             continue
         common = max(set(signatures), key=signatures.count)
+        reasons = _mismatch_reasons([(row[0], row[1]) for row in column], names) or \
+            [('outline', None, _groups(signatures, names))]
         result[index] = {
-            'reasons': _mismatch_reasons([(row[0], row[1]) for row in column]),
-            'layers': [getattr(layer, 'name', None) for layer, signature
-                       in zip(layers, signatures) if signature != common]}
+            'reasons': reasons,
+            'layers': [name for name, signature in zip(names, signatures)
+                       if signature != common]}
     return result
 
 
+_CAP_LABELS = {'flat': ('flat', 'フラット'), 'round': ('round', '丸'),
+               'ellipse': ('ellipse', '楕円'), 'square': ('square', '四角'),
+               'horizontal': ('horizontal cut', '水平カット'),
+               'vertical': ('vertical cut', '垂直カット'),
+               'angle': ('angle cut', '角度カット'), 'curve': ('curve', 'カーブ')}
+
+
+def _describe_value(kind, value, pick):
+    if kind in ('cap curve', 'corner'):
+        return 'ON' if value else 'OFF'
+    if kind == 'cap shape':
+        return _CAP_LABELS.get(value, (value, value))[pick]
+    if kind == 'virtual':
+        if not value:
+            return ('none', 'なし')[pick]
+        modes = {'continuous': ('smooth', '連続'), 'step': ('step', '段差')}
+        sides = {'left': ('left', '左'), 'right': ('right', '右'), 'both': ('both', '両方')}
+        return ', '.join(('%s/%s', '%s・%s')[pick] % (modes[mode][pick], sides[side][pick])
+                         for mode, side in value)
+    # outline: segments per contour
+    counts = '+'.join(str(len(contour)) for contour in value)
+    return ('%s segments' % counts, '%s区間' % counts)[pick]
+
+
 def describe_incompatibility(entry, japanese=False):
-    """One line for the edit view or the export log."""
-    names = {'cap curve': ('cap curve', 'キャップカーブ'),
-             'cap shape': ('round cap', '丸キャップ'),
-             'corner': ('live corner', 'ライブコーナー'),
-             'outline': ('outline structure', '輪郭構成')}
-    ends = {'start': ('start', '始点'), 'end': ('end', '終点'), None: ('', '')}
+    """Lines for the edit view or the export log: a heading, then one line per
+    setting with the value each master has."""
     pick = 1 if japanese else 0
-    parts = []
-    for kind, end in entry['reasons']:
+    names = {'cap curve': ('Cap curve', 'キャップカーブ'),
+             'cap shape': ('Cap shape', '線端の形'),
+             'corner': ('Live corner', 'ライブコーナー'),
+             'virtual': ('Virtual nodes', '仮想ノード'),
+             'outline': ('Outline structure', '輪郭構成')}
+    ends = {'start': ('start', '始点'), 'end': ('end', '終点')}
+    lines = [('Masters incompatible', 'マスター非互換')[pick] +
+             (' (%s)' % ', '.join(entry['layers']) if entry['layers'] else '')]
+    for kind, where, groups in entry['reasons']:
         label = names[kind][pick]
-        if ends[end][pick]:
-            label = ('%s（%s）' if japanese else '%s (%s)') % (label, ends[end][pick])
-        parts.append(label)
-    layers = ', '.join(name for name in entry['layers'] if name)
-    if japanese:
-        return 'マスター非互換：' + '・'.join(parts) + (' ― ' + layers if layers else '')
-    return 'Masters incompatible: ' + ', '.join(parts) + (' - ' + layers if layers else '')
+        if kind in ('cap curve', 'cap shape'):
+            label += (' (%s)', '（%s）')[pick] % ends[where][pick]
+        elif kind == 'corner':
+            label += (' (node %s)', '（ノード %s）')[pick] % ', '.join(map(str, where))
+        elif kind == 'virtual':
+            label += (' (segment %d)', '（区間 %d）')[pick] % where
+        values = ('; ', '／')[pick].join(
+            '%s: %s' % (_describe_value(kind, value, pick), ', '.join(layers))
+            for value, layers in groups)
+        lines.append(('%s – %s', '%s：%s')[pick] % (label, values))
+    return '\n'.join(lines)
 
 
 def node_contour(path):
