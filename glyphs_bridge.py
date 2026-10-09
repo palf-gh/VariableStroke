@@ -1114,6 +1114,18 @@ def copy_stroke_settings(source, target):
     return True
 
 
+def _index_of(items, item):
+    """Position of `item` in `items`, by identity first: == on Glyphs objects
+    sends isEqual:, which compares whole paths and layers."""
+    for i, other in enumerate(items):
+        if other is item:
+            return i
+    for i, other in enumerate(items):
+        if other == item:
+            return i
+    raise StopIteration
+
+
 def _sibling_paths(path, count):
     """On-curve path_nodes of the same path in the glyph's other layers (masters,
     brace layers) with `count` on-curve nodes: needed so every layer rounds the
@@ -1124,13 +1136,15 @@ def _sibling_paths(path, count):
         return []
     try:
         paths = list(layer.paths)
-        index = next(i for i, other in enumerate(paths) if other == path)
+        index = _index_of(paths, path)
         layers = list(glyph.layers)
     except Exception:
         return []
+    layer_id = getattr(layer, 'layerId', None)
     result = []
     for other_layer in layers:
-        if other_layer == layer:
+        if other_layer is layer or (layer_id is not None and
+                                    getattr(other_layer, 'layerId', None) == layer_id):
             continue
         other_paths = list(other_layer.paths)
         if index < len(other_paths):
@@ -1166,19 +1180,56 @@ def note_corner(node):
         pass
 
 
+# On-curve indices with a live corner in another layer, by (glyph, last
+# change, layer, path index, count): reading every master's nodes again for
+# each stroke of each redraw was most of preparing a master with live corners.
+_ROUNDED_ELSEWHERE = collections.OrderedDict()
+_ROUNDED_ELSEWHERE_SIZE = 4096
+
+
+def _rounded_elsewhere(path, count):
+    key = None
+    with PROFILE.section('    corners: parents'):
+        layer = getattr(path, 'parent', None)
+        glyph = getattr(layer, 'parent', None) if layer is not None else None
+    try:
+        with PROFILE.section('    corners: lastChange'):
+            change = glyph.lastChange
+        if change is not None:
+            with PROFILE.section('    corners: path index'):
+                index = _index_of(list(layer.paths), path)
+            with PROFILE.section('    corners: key'):
+                key = (str(glyph.name), str(change), str(layer.layerId), index, count)
+    except Exception:
+        key = None  # plain objects (tests), detached copies: read every time
+    if key is not None:
+        with _CACHE_LOCK:
+            if key in _ROUNDED_ELSEWHERE:
+                _ROUNDED_ELSEWHERE.move_to_end(key)
+                return _ROUNDED_ELSEWHERE[key]
+    with PROFILE.section('corners in other masters'):
+        result = frozenset(k for sibling in _sibling_paths(path, count)
+                           for k, (_, _, _, data) in enumerate(sibling)
+                           if corner_on_of(data))
+    if key is not None:
+        _remember(_ROUNDED_ELSEWHERE, _ROUNDED_ELSEWHERE_SIZE, key, result)
+    return result
+
+
 def corner_specs(path, items=None):
     """Live corner per on-curve node. A corner that is on in any other master of
     the glyph gets a zero-size arc here, so masters keep compatible outlines while
     each master switches its corners on or off on its own."""
     items = path_nodes(path) if items is None else items
-    specs = [corner_spec_of(data) for _, _, _, data in _on_curve(items, bool(path.closed))]
-    if all(spec is not None for spec in specs) or not _glyph_has_corners(path):
+    with PROFILE.section('    corners: own nodes'):
+        specs = [corner_spec_of(data) for _, _, _, data in _on_curve(items, bool(path.closed))]
+    if all(spec is not None for spec in specs):
         return specs
-    rounded_elsewhere = set()
-    for sibling in _sibling_paths(path, len(specs)):
-        for k, (_, _, _, data) in enumerate(sibling):
-            if corner_on_of(data):
-                rounded_elsewhere.add(k)
+    with PROFILE.section('    corners: glyph flag'):
+        has_corners = _glyph_has_corners(path)
+    if not has_corners:
+        return specs
+    rounded_elsewhere = _rounded_elsewhere(path, len(specs))
     return [spec if spec is not None or k not in rounded_elsewhere else dict(ZERO_CORNER)
             for k, spec in enumerate(specs)]
 
@@ -1208,15 +1259,19 @@ def corner_widgets(path, defaults=None, items=None):
 def _outline(path, defaults, items):
     """(segments, cached geometry, original-node map) of a path."""
     with PROFILE.section('outline inputs (segments, corners)'):
-        source_segments = segments_for_path(path, defaults, items)
-        closed = bool(path.closed)
-        attributes = path.attributes
-        caps = (attributes.get(CAP_START_KEY, 'flat'), attributes.get(CAP_END_KEY, 'flat'))
-        angles = (cut_angle(path, CAP_START_ANGLE_KEY), cut_angle(path, CAP_END_ANGLE_KEY))
-        cap_curves = (cap_curve_of(path, False) if cap_curve_enabled(path, False) else None,
-                      cap_curve_of(path, True) if cap_curve_enabled(path, True) else None)
-        specs = virtual_nodes(path, len(source_segments), items)
-        source_corners = corner_specs(path, items)
+        with PROFILE.section('  inputs: segments'):
+            source_segments = segments_for_path(path, defaults, items)
+        with PROFILE.section('  inputs: path attributes'):
+            closed = bool(path.closed)
+            attributes = path.attributes
+            caps = (attributes.get(CAP_START_KEY, 'flat'), attributes.get(CAP_END_KEY, 'flat'))
+            angles = (cut_angle(path, CAP_START_ANGLE_KEY), cut_angle(path, CAP_END_ANGLE_KEY))
+            cap_curves = (cap_curve_of(path, False) if cap_curve_enabled(path, False) else None,
+                          cap_curve_of(path, True) if cap_curve_enabled(path, True) else None)
+        with PROFILE.section('  inputs: virtual nodes'):
+            specs = virtual_nodes(path, len(source_segments), items)
+        with PROFILE.section('  inputs: corners'):
+            source_corners = corner_specs(path, items)
         source_offsets = [(corner_offset_of(data, 'left'), corner_offset_of(data, 'right'))
                           for _, _, _, data in _on_curve(items, closed)]
         source_handles = [tuple(corner_handle_of(data, side, incoming)
@@ -1549,7 +1604,7 @@ class _RecordedLayer(object):
                            if before.get(key, _MISSING) != value}
                 removed = [key for key in before if key not in node.userData]
                 if updates or removed:
-                    node_changes.append((position, updates, removed))
+                    node_changes.append((position, updates, removed, dict(node.userData)))
             paths.append((set_attributes, node_changes))
         return dict(self.userData), paths
 
@@ -1571,13 +1626,43 @@ def _apply_interpolation(layer, recorded):
             path.attributes[key] = value
         if node_changes:
             nodes = list(path.nodes)
-            for position, updates, removed in node_changes:
+            for position, updates, removed, final in node_changes:
+                if _replace_user_data(nodes[position], final):
+                    continue
                 data = nodes[position].userData
                 for key, value in updates.items():
                     data[key] = value
                 for key in removed:
                     if key in data:
                         del data[key]
+
+
+_SET_USER_DATA = []  # [NSMutableDictionary class] once GSNode accepts setUserData:
+
+
+def _replace_user_data(node, data):
+    """Write a node's whole userData in one call: an interpolated node gets some
+    ten values, and Glyphs takes each key as a separate bridge call otherwise.
+    False for plain objects (tests) and wherever the call is not available."""
+    if _SET_USER_DATA == [None]:
+        return False
+    try:
+        methods = node.pyobjc_instanceMethods
+    except AttributeError:
+        return False
+    try:
+        if not _SET_USER_DATA:
+            from Foundation import NSMutableDictionary
+            if not methods.respondsToSelector_('setUserData:'):
+                _SET_USER_DATA.append(None)
+                return False
+            _SET_USER_DATA.append(NSMutableDictionary)
+        methods.setUserData_(_SET_USER_DATA[0].dictionaryWithDictionary_(data))
+        return True
+    except Exception:
+        if not _SET_USER_DATA:
+            _SET_USER_DATA.append(None)
+        return False
 
 
 # Outlines of instances. The masters' outlines have a fixed structure, so an
@@ -1793,6 +1878,37 @@ def interpolate_layer(layer, glyph, interpolation, cache_key=None, glyph_key=Non
     return result
 
 
+def _source_record(glyph, layer_id, glyph_key=None):
+    """What interpolation reads from one source layer, read from Glyphs once per
+    edit of the glyph (by `glyph_key`): its defaults and, per path, the node
+    count, stroke flag, stroke attributes, cap curves and virtual nodes."""
+    key = None if glyph_key is None else ('source', glyph_key, str(layer_id))
+    if key is not None:
+        with _CACHE_LOCK:
+            if key in _SOURCE_OUTLINES:
+                _SOURCE_OUTLINES.move_to_end(key)
+                return _SOURCE_OUTLINES[key]
+    try:
+        source = glyph.layers[layer_id]
+    except (KeyError, IndexError, TypeError):
+        source = None
+    record = None
+    if source is not None:
+        paths = []
+        for path in list(source.paths):
+            attributes = path.attributes
+            paths.append({
+                'path': path, 'count': len(path.nodes), 'enabled': enabled(path),
+                'attributes': {name: attributes[name] for name in _STROKE_ATTRIBUTES
+                               if attributes.get(name) is not None},
+                'cap_curves': (cap_curve_of(path, False), cap_curve_of(path, True)),
+                'virtual': virtual_nodes(path)})
+        record = {'id': str(layer_id), 'defaults': layer_defaults(source), 'paths': paths}
+    if key is not None:
+        _remember(_SOURCE_OUTLINES, _SOURCE_OUTLINES_SIZE, key, record)
+    return record
+
+
 def _interpolate_layer(layer, glyph, interpolation, glyph_key=None):
     """Carry the strokes over to a layer Glyphs has just interpolated (instances in
     the preview, interpolation previews by other plugins, virtual masters).
@@ -1806,48 +1922,43 @@ def _interpolate_layer(layer, glyph, interpolation, glyph_key=None):
     path index.
     """
     sources = []
-    source_ids = {}
     for layer_id, factor in dict(interpolation or {}).items():
-        try:
-            source = glyph.layers[layer_id]
-        except (KeyError, IndexError, TypeError):
-            source = None
-        if source is not None:
-            sources.append((source, list(source.paths), float(factor)))
-            source_ids[id(source)] = str(layer_id)
-    source_defaults = {id(source): layer_defaults(source) for source, _, _ in sources}
+        record = _source_record(glyph, layer_id, glyph_key)
+        if record is not None:
+            sources.append((record, float(factor)))
     if not sources:
         return False
     state = glyph_enabled(glyph)
     layer.userData[LAYER_STATE_KEY] = state
-    layer.userData[LAYER_ITALIC_KEY] = sum(factor * source_defaults[id(source)].italic_angle
-                                           for source, _, factor in sources)
+    layer.userData[LAYER_ITALIC_KEY] = sum(factor * record['defaults'].italic_angle
+                                           for record, factor in sources)
     layer.userData[LAYER_NIB_ANGLE_KEY] = _blend_angles([
-        (source_defaults[id(source)].nib_angle, factor) for source, _, factor in sources])
+        (record['defaults'].nib_angle, factor) for record, factor in sources])
     if not state:
         return True
     for index, path in enumerate(layer.paths):
-        others = [(source, paths[index], factor) for source, paths, factor in sources
-                  if index < len(paths) and len(paths[index].nodes) == len(path.nodes)]
+        # (source record, its path record, factor) for this path index
+        others = [(record, record['paths'][index], factor) for record, factor in sources
+                  if index < len(record['paths']) and
+                  record['paths'][index]['count'] == len(path.nodes)]
         if len(others) != len(sources):
             continue
-        template = next((other for _, other, _ in others if enabled(other)), None)
+        template = next((other for _, other, _ in others if other['enabled']), None)
         if template is None:
             continue
         if path.attributes.get(BLEND_KEY):
             path.attributes[BLEND_KEY] = ''  # copied from a source: not this blend
-        for key in _STROKE_ATTRIBUTES:
-            if template.attributes.get(key) is not None:
-                path.attributes[key] = template.attributes[key]
+        for key, value in template['attributes'].items():
+            path.attributes[key] = value
         for at_end, curve_key in ((False, CAP_START_CURVE_KEY),
                                   (True, CAP_END_CURVE_KEY)):
             if cap_curve_enabled(path, at_end):
-                controls = [cap_curve_of(other, at_end) for _, other, _ in others]
+                controls = [other['cap_curves'][at_end] for _, other, _ in others]
                 path.attributes[curve_key] = [
                     [sum(factor * controls[j][point][axis]
                          for j, (_, _, factor) in enumerate(others))
                      for axis in (0, 1)] for point in (0, 1)]
-        virtual_sources = [(virtual_nodes(other), factor) for _, other, factor in others]
+        virtual_sources = [(other['virtual'], factor) for _, other, factor in others]
         if virtual_sources and all(
                 [(spec['id'], spec['segment'], spec['mode'], spec['side']) for spec in specs] ==
                 [(spec['id'], spec['segment'], spec['mode'], spec['side'])
@@ -1866,10 +1977,10 @@ def _interpolate_layer(layer, glyph, interpolation, glyph_key=None):
                 blended.append(spec)
             path.attributes[VIRTUAL_KEY] = blended
         path.attributes['fill'] = False
-        values = [(_source_values(other, source_defaults[id(source)],
+        values = [(_source_values(other['path'], record['defaults'],
                                   None if glyph_key is None else
-                                  (glyph_key, source_ids[id(source)], index)), factor)
-                  for source, other, factor in others]
+                                  (glyph_key, record['id'], index)), factor)
+                  for record, other, factor in others]
         base_w = sum(factor * entry['width'] for entry, factor in values)
         base_h = sum(factor * entry['height'] for entry, factor in values)
         if base_w <= 0 or base_h <= 0:
@@ -1911,10 +2022,9 @@ def _interpolate_layer(layer, glyph, interpolation, glyph_key=None):
         if blends is not None:
             with PROFILE.section('interpolate layer: blend outlines'):
                 weighted = []
-                for source, other, factor in others:
-                    key = None if glyph_key is None else \
-                        (glyph_key, source_ids[id(source)], index)
-                    contours = _source_outline(other, source_defaults[id(source)], key)
+                for record, other, factor in others:
+                    key = None if glyph_key is None else (glyph_key, record['id'], index)
+                    contours = _source_outline(other['path'], record['defaults'], key)
                     if contours is None:
                         break
                     weighted.append((contours, factor))
