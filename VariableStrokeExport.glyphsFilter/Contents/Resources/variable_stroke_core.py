@@ -344,6 +344,12 @@ def _ellipse_cap(center, nib, tangent, start, left, right):
 
 FIT_TOLERANCE = 1.0
 MITER_LIMIT = 4.0
+# How many half-widths a cap cut may reach along the stroke: a horizontal cut
+# stays horizontal down to a stroke about 5 degrees from horizontal.
+CUT_LIMIT = 12.0
+# Relative change of nib width or height along a segment at which its
+# thickness is fully held between its end thicknesses (see _Side._thickness_range).
+THICKNESS_LIMIT_CHANGE = 0.25
 # Bend fillets (see _fillet_edge): handle length as a share of the distance to
 # the tangent crossing when the centerline gives none, how much an edge may turn
 # back (degrees) before it is replaced, and the sharpest centerline turn
@@ -563,8 +569,48 @@ class _Side(object):
         if edges is None:
             pts = self.pts
             p = add(mul(pts[0], 1-t), mul(pts[1], t)) if self.kind == 'line' else cubic(*pts, t)
-            edges = self._edges[t] = nib_edges(p, self.tangent(t), self.nib(t))
+            edges = self._edges[t] = self._limited(p, nib_edges(p, self.tangent(t),
+                                                                self.nib(t)))
         return edges[0] if self.sign > 0 else edges[1]
+
+    def _thickness_range(self):
+        """(low, high, weight): the end thicknesses, and how far a segment whose
+        nib size changes is held between them.
+
+        A nib growing along a turning centerline can make the stroke thicker
+        midway than at either end: the width axis grows while the stroke still
+        runs across it, then the stroke turns onto the thinner height axis. A
+        growing stroke should not swell and shrink again before its end. With
+        an unchanged nib the turn alone shapes the thickness (round strokes
+        thicken where they run vertically), so the limit fades in with the
+        change of nib size.
+        """
+        limits = self._edges.get(None)
+        if limits is None:
+            ends = []
+            for t in (0.0, 1.0):
+                pts = self.pts
+                p = add(mul(pts[0], 1-t), mul(pts[1], t)) if self.kind == 'line' \
+                    else cubic(*pts, t)
+                left, right = nib_edges(p, self.tangent(t), self.nib(t))
+                ends.append(length(sub(left, right)))
+            change = max(abs(a-b) / max(a, b, EPS)
+                         for a, b in zip(self.n0[:2], self.n1[:2]))
+            weight = min(1.0, change / THICKNESS_LIMIT_CHANGE)
+            weight = weight*weight*(3.0 - 2.0*weight)
+            limits = self._edges[None] = (min(ends), max(ends), weight)
+        return limits
+
+    def _limited(self, p, edges):
+        if self.kind == 'line':
+            return edges
+        low, high, weight = self._thickness_range()
+        thickness = length(sub(edges[0], edges[1]))
+        if weight <= 0 or thickness < EPS or low <= thickness <= high:
+            return edges
+        target = min(max(thickness, low), high)
+        scale = 1.0 + weight*(target/thickness - 1.0)
+        return tuple(add(p, mul(sub(edge, p), scale)) for edge in edges)
 
     def tangent(self, t):
         # The centerline's own direction: both sides and both neighbours of a smooth
@@ -1194,23 +1240,66 @@ def _cubic_interval(controls, t0, t1):
 
 
 def _bend_curve_endpoint(controls, at_end, target):
-    """Keep a requested cut when an exact cubic continuation turns away from it."""
+    """Keep a requested cut when an exact cubic continuation turns away from it.
+
+    While the end handle still points along the chord, it keeps its length (up
+    to 3/4 of the chord): shortening a long handle on a gently curving edge
+    pulls the whole edge inwards. A handle turned onto the chord is kept short.
+    """
     p0, p1, p2, p3 = controls
     if at_end:
         chord = sub(target, p0)
         direction = unit(sub(p3, p2))
+        limit = 0.75
         if direction[0]*chord[0] + direction[1]*chord[1] < 0.5*length(chord):
-            direction = unit(chord)
+            direction, limit = unit(chord), 0.4
         handle = min(max(length(sub(p3, p2)), 0.08*length(chord)),
-                     0.4*length(chord))
+                     limit*length(chord))
         return (p0, p1, sub(target, mul(direction, handle)), target)
     chord = sub(p3, target)
     direction = unit(sub(p1, p0))
+    limit = 0.75
     if direction[0]*chord[0] + direction[1]*chord[1] < 0.5*length(chord):
-        direction = unit(chord)
+        direction, limit = unit(chord), 0.4
     handle = min(max(length(sub(p1, p0)), 0.08*length(chord)),
-                 0.4*length(chord))
+                 limit*length(chord))
     return (target, add(target, mul(direction, handle)), p2, p3)
+
+
+def _refit_extension(controls, bent, at_end):
+    """Refit a bent cut end through the curve it replaces, keeping its end tangents.
+
+    _bend_curve_endpoint moves the end and its handle together. On a long edge
+    that drags the middle of the edge sideways, widening or thinning the stroke;
+    least-squares handle lengths along the same tangents keep it on the old edge.
+    """
+    p0, p3 = bent[0], bent[-1]
+    a, b = length(sub(bent[1], p0)), length(sub(p3, bent[2]))
+    chord = length(sub(p3, p0))
+    old_length = sum(length(sub(cubic(*controls, (i+1)/16.0), cubic(*controls, i/16.0)))
+                     for i in range(16))
+    extension = length(sub(p3 if at_end else p0, controls[-1] if at_end else controls[0]))
+    if min(a, b, chord, old_length) < EPS:
+        return bent
+    d0, d1 = unit(sub(bent[1], p0)), unit(sub(p3, bent[2]))
+    occupied = old_length/(old_length+extension)
+    samples = [cubic(*controls, i/16.0) for i in range(1, 16)]
+    us = [i/16.0*occupied if at_end else 1-occupied+i/16.0*occupied for i in range(1, 16)]
+
+    def error(points):
+        curve = [cubic(*points, i/64.0) for i in range(65)]
+        return max(min(_point_segment_distance(p, curve[j], curve[j+1])
+                       for j in (i-1, i) if 0 <= j < 64)
+                   for p, i in zip(samples, _nearest_along(samples, curve)))
+    best = (error(bent), bent)
+    for _ in range(3):
+        fitted = _handles(p0, p3, d0, d1, samples, us, chord)
+        if length(sub(fitted[1], p0)) < EPS or length(sub(p3, fitted[2])) < EPS:
+            break
+        best = min(best, (error(fitted), fitted))
+        curve = [cubic(*fitted, i/64.0) for i in range(65)]
+        us = [min(max(i/64.0, 1e-3), 1-1e-3) for i in _nearest_along(samples, curve)]
+    return best[1]
 
 
 def _fit_join_extension(controls, at_end, target):
@@ -1330,7 +1419,8 @@ def _cap_on_curve(side, at_end, center, tangent, style, nib, slant, angle=0.0):
             delta = sub(center, edge_point)
             target = add(edge_point, mul(fallback_direction,
                          (delta[0]*m[0] + delta[1]*m[1]) / along))
-        side.override_piece = ('cubic', _bend_curve_endpoint(controls, at_end, target))
+        side.override_piece = ('cubic', _refit_extension(
+            controls, _bend_curve_endpoint(controls, at_end, target), at_end))
         if at_end:
             side.end = target
         else:
@@ -1341,7 +1431,10 @@ def _cap_on_curve(side, at_end, center, tangent, style, nib, slant, angle=0.0):
     if length(derivative) < EPS:
         return keep_cut()
     initial = unit(derivative)
-    max_travel = min(0.75*side.extent(side.tb if at_end else side.ta),
+    # A cut may reach as far along the edge as _usable_cap allows: CUT_LIMIT
+    # half-widths. Beyond the cubic's own continuation keep_cut bends the end
+    # handle, which distorts a long, gently curving edge.
+    max_travel = min(0.5*CUT_LIMIT*side.extent(side.tb if at_end else side.ta),
                      0.5*length(sub(side.pts[-1], side.pts[0])))
     if max_travel < EPS:
         return keep_cut()
@@ -1375,7 +1468,8 @@ def _cap_on_curve(side, at_end, center, tangent, style, nib, slant, angle=0.0):
         if search == outward:
             direction = mul(cubic_derivative(*controls, t), outward)
             if length(direction) < EPS or unit(direction)[0]*initial[0] + \
-                    unit(direction)[1]*initial[1] < 0.85 or travelled > max_travel:
+                    unit(direction)[1]*initial[1] < 0.85 or \
+                    travelled - segment_length > max_travel:
                 return keep_cut()
         if m is None:
             crossed = travelled >= target
@@ -1400,6 +1494,11 @@ def _cap_on_curve(side, at_end, center, tangent, style, nib, slant, angle=0.0):
                     hi = mid
             else:
                 hit = (lo+hi)/2.0
+            # One step is long on a long curve: the crossing may lie inside the
+            # travel limit although the end of its step does not.
+            if search == outward and travelled - segment_length + length(
+                    sub(cubic(*controls, hit), previous_point)) > max_travel:
+                return keep_cut()
             interval = (0.0, hit) if at_end else (hit, 1.0)
             piece = ('cubic', _cubic_interval(controls, *interval))
             side.override_piece = piece
@@ -1415,14 +1514,14 @@ def _cap_on_curve(side, at_end, center, tangent, style, nib, slant, angle=0.0):
 
 
 def _usable_cap(style, tangent, slant=0.0, angle=0.0):
-    """A cut nearly parallel to the stroke would need a spike longer than MITER_LIMIT
+    """A cut nearly parallel to the stroke would need a spike longer than CUT_LIMIT
     half-widths; such caps fall back to flat (same node count)."""
     if style in CUTS:
         m = normal(_cut_direction(style, slant, angle))
         n = normal(tangent)
         along = abs(tangent[0]*m[0] + tangent[1]*m[1])
         across = abs(n[0]*m[0] + n[1]*m[1])
-        if along < 1e-6 or across / along > MITER_LIMIT:
+        if along < 1e-6 or across / along > CUT_LIMIT:
             return 'flat'
     return style
 

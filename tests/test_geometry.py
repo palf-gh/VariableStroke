@@ -225,6 +225,58 @@ class GeometryTests(unittest.TestCase):
         self.assertEqual(len(cut), len(flat))
         self.assertTrue(all(abs(point[1]-150) < 1e-6 for point in cut[1][1]))
 
+    def test_shallow_cut_keeps_the_long_edge_beside_the_centerline(self):
+        # The sweeping stroke of 夜: a horizontal cut at a stroke ending under 20
+        # degrees from horizontal reaches far along the inner edge. Both edges
+        # must stay as far from the centerline as each other.
+        import variable_stroke_core as core
+        # Exact continuation of the cubic, then the refit beyond the travel limit.
+        for limit, tolerance in ((core.CUT_LIMIT, 1.0), (0.5, 3.0)):
+            saved, core.CUT_LIMIT = core.CUT_LIMIT, limit
+            usable, core._usable_cap = core._usable_cap, lambda style, *args: style
+            try:
+                segments = [('line', ((1000, 510), (1000, 420)), (40, 30, 0), (40, 30, 0)),
+                            ('cubic', ((1000, 420), (1000, 273), (899, 58), (445, -72)),
+                             (40, 30, 0), (25.36, 25.26, 0))]
+                contour = outline_curves(segments, cap_end='horizontal')[0]
+            finally:
+                core.CUT_LIMIT, core._usable_cap = saved, usable
+            outer, inner = contour[1][1], contour[3][1]
+            self.assertAlmostEqual(inner[0][1], -72, places=6)
+            edges = [[cubic(*edge, i/400.0) for i in range(401)] for edge in (outer, inner)]
+            for i in range(1, 10):
+                center = cubic(*segments[1][1], i/10.0)
+                distances = [min(length(sub(p, center)) for p in edge) for edge in edges]
+                self.assertLess(abs(distances[0] - distances[1]), tolerance)
+
+    def test_growing_nib_does_not_swell_past_its_ends(self):
+        # The right sweep of 夜 (Condensed ExtraLight High-Contrast): the width
+        # axis grows while the stroke turns towards the thinner height axis.
+        pts = ((392, 560), (418, 328), (514, 37), (740, -91))
+        left = _Side('cubic', pts, (12.24, 20, 0), (54.32, 27.16, 0), 1)
+        right = _Side('cubic', pts, (12.24, 20, 0), (54.32, 27.16, 0), -1)
+        thickness = [length(sub(left.at(i/40.0), right.at(i/40.0))) for i in range(41)]
+        self.assertLessEqual(max(thickness), thickness[-1] + 1e-6)
+        self.assertTrue(all(b >= a - 1e-6 for a, b in zip(thickness, thickness[1:])))
+
+    def test_unchanged_nib_still_thickens_where_the_stroke_turns(self):
+        pts = ((0, 100), (55, 100), (100, 55), (100, 0))  # horizontal into vertical
+        nib = (60, 20, 0)
+        left, right = _Side('cubic', pts, nib, nib, 1), _Side('cubic', pts, nib, nib, -1)
+        middle = length(sub(left.at(0.5), right.at(0.5)))
+        self.assertGreater(middle, length(sub(left.at(0.0), right.at(0.0))) + 10)
+
+    def test_horizontal_cut_holds_on_a_stroke_nine_degrees_from_horizontal(self):
+        # The left sweep of 夢 (Wide ExtraLight Low-Contrast).
+        segments = [('line', ((985, 255), (985, 204)), (40, 40, 0), (40, 40, 0)),
+                    ('cubic', ((985, 204), (985, 74), (658, 6), (172, -72)),
+                     (40, 40, 0), (40, 25.16, 0))]
+        contour = outline_curves(segments, cap_end='horizontal')[0]
+        cut = contour[2]
+        self.assertEqual(cut[0], 'line')
+        self.assertTrue(all(abs(point[1] + 72) < 1e-6 for point in cut[1]))
+        self.assertTrue(cut[1][1][0] < 172 < cut[1][0][0])
+
     def test_cut_corner_widgets_stay_on_the_cut(self):
         segment = [('cubic', ((0, 0), (50, 50), (150, 100), (200, 150)),
                     (120, 80, 0), (120, 80, 0))]
