@@ -1163,9 +1163,21 @@ def _glyph_of(item):
 
 
 def _glyph_has_corners(path):
-    glyph = _glyph_of(path)
+    # A path's glyph is its layer's parent: walking up with hasattr() (see
+    # _glyph_of) asks the Objective-C runtime for a missing method each step.
+    layer = getattr(path, 'parent', None)
+    glyph = getattr(layer, 'parent', None) if layer is not None else None
+    if glyph is None:
+        return False
     try:
-        return bool(glyph is not None and glyph.userData.get(GLYPH_CORNERS_KEY))
+        data = glyph.pyobjc_instanceMethods.userData()
+        return bool(data is not None and data.objectForKey_(GLYPH_CORNERS_KEY))
+    except AttributeError:
+        pass  # plain objects (tests)
+    except Exception:
+        return False
+    try:
+        return bool(glyph.userData.get(GLYPH_CORNERS_KEY))
     except Exception:
         return False
 
