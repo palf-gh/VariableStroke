@@ -462,6 +462,20 @@ def _master_for(layer):
     return None
 
 
+def _is_instance(layer):
+    """A layer Glyphs interpolated for an instance or a preview (it carries the
+    state interpolate_layer writes). Interpolation previews report their layers
+    as master layers, so only brace and bracket layers (also re-interpolated
+    ones) are left out: they draw their own values. The blend lookup itself
+    only matches a layer whose values are exactly the interpolated ones."""
+    try:
+        if layer.userData.get(LAYER_STATE_KEY) is None:
+            return False
+        return not layer.isSpecialLayer
+    except Exception:
+        return False
+
+
 def _glyph_state(layer):
     return layer_state(layer)
 
@@ -713,11 +727,13 @@ class VariableStrokeLayerProcessor(NSObject):
             nib_angle = layer.userData.get(LAYER_NIB_ANGLE_KEY)
             if nib_angle is not None:
                 defaults.nib_angle = float(nib_angle)
+            instance = _is_instance(layer)
             if start is not None:
                 name = 'prepare layer: %s, %s thread' % (
-                    'instance' if layer.userData.get(LAYER_STATE_KEY) is not None else 'master',
+                    'instance' if instance else 'interpolated brace/bracket'
+                    if layer.userData.get(LAYER_STATE_KEY) is not None else 'master',
                     'main' if NSThread.isMainThread() else 'background')
-            expand_layer(layer, state, defaults)
+            expand_layer(layer, state, defaults, blends=instance)
         except Exception:
             print(traceback.format_exc())
         finally:
@@ -737,7 +753,8 @@ class VariableStrokeLayerProcessor(NSObject):
                                         for k, v in dict(interpolation).items())))
                 except Exception:
                     key = None
-                interpolate_layer(layer, glyph, interpolation, key)
+                interpolate_layer(layer, glyph, interpolation, key,
+                                  glyph_key=None if key is None else key[:2])
         except Exception:
             print(traceback.format_exc())
         return True, None
@@ -1598,10 +1615,19 @@ class VariableStrokeTool(SelectTool):
         if NSEvent.pressedMouseButtons() & 1:
             if self._frame_last is not None and now - self._frame_last > 0.0005:
                 self._frame_times.append(now - self._frame_last)
+            elif self._frame_last is None and not PROFILE.enabled:
+                # Other tools and other windows (Variable Font Preview's sliders):
+                # also sum this plugin's own work while the button is down.
+                PROFILE.reset()
+                PROFILE.enabled = self._frame_owns_profile = True
             self._frame_last = now
             return
         self._frame_last = None
         times, self._frame_times = self._frame_times, []
+        report = None
+        if getattr(self, '_frame_owns_profile', False):
+            self._frame_owns_profile = PROFILE.enabled = False
+            report = PROFILE.report()
         if len(times) >= 3:
             try:
                 tool = Glyphs.font.tool
@@ -1611,6 +1637,8 @@ class VariableStrokeTool(SelectTool):
             print('Frame timing (%s): %d draws, average %.1f ms, median %.1f ms, slowest %.1f ms'
                   % (tool, len(times), sum(times) / len(times) * 1000,
                      times[len(times) // 2] * 1000, times[-1] * 1000))
+            if report is not None:
+                print(report)
 
     @objc.python_method
     @_timed('update callback')

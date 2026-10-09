@@ -987,6 +987,46 @@ class BridgeTests(unittest.TestCase):
         self.assertFalse(bridge.interpolate_layer(master(20), glyph, {'a': 1.0},
                                                   cache_key='k'))
 
+    def test_instance_outline_is_the_blend_of_master_outlines(self):
+        def master(x, width):
+            return Layer([Path([Node(0, 0, width=width), Node(x, 0, width=width),
+                                Node(x, 300, width=width)])])
+        a, b = master(100, 20), master(200, 80)
+        glyph = types.SimpleNamespace(layers={'a': a, 'b': b},
+                                      userData={bridge.GLYPH_KEY: True})
+        instance = master(125, 20)
+        bridge.interpolate_layer(instance, glyph, {'a': 0.75, 'b': 0.25}, cache_key='blend',
+                                 glyph_key=('glyph', 1))
+        defaults = bridge.StrokeDefaults(italic_angle=instance.userData[bridge.LAYER_ITALIC_KEY],
+                                         nib_angle=instance.userData[bridge.LAYER_NIB_ANGLE_KEY])
+        self.assertIsNotNone(bridge._blended_outline(
+            instance.paths[0], bridge.path_nodes(instance.paths[0])))
+        bridge.expand_layer(instance, True, defaults, blends=True)
+        expected = []
+        for pa, pb in zip(bridge.generated_paths(a.paths[0]),
+                          bridge.generated_paths(b.paths[0])):
+            expected.append([(0.75*na.position.x + 0.25*nb.position.x,
+                              0.75*na.position.y + 0.25*nb.position.y)
+                             for na, nb in zip(pa.nodes, pb.nodes)])
+        result = [[bridge.xy(node) for node in path.nodes] for path in instance.paths]
+        self.assertEqual(len(result), len(expected))
+        for got, want in zip(result, expected):
+            for p, q in zip(got, want):
+                self.assertAlmostEqual(p[0], q[0])
+                self.assertAlmostEqual(p[1], q[1])
+        # A layer whose values differ from the interpolation computes its own.
+        other = master(125, 20)
+        bridge.interpolate_layer(other, glyph, {'a': 0.75, 'b': 0.25}, cache_key='blend')
+        other.paths[0].nodes[1].userData[bridge.SCALE_KEY] = 200.0
+        self.assertIsNone(bridge._blended_outline(
+            other.paths[0], bridge.path_nodes(other.paths[0])))
+        moved = master(125, 20)
+        bridge.interpolate_layer(moved, glyph, {'a': 0.75, 'b': 0.25}, cache_key='blend')
+        moved.paths[0].nodes[2].position.x += 5
+        self.assertIsNone(bridge._blended_outline(
+            moved.paths[0], bridge.path_nodes(moved.paths[0])))
+        bridge.forget_interpolations()
+
     def test_interpolated_layer_gets_strokes_and_blended_corner(self):
         def master(radius):
             path = Path([Node(0, 0), Node(0, 300), Node(300, 300)])

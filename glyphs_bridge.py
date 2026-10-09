@@ -70,6 +70,7 @@ GENERATED_KEY = 'com.codex.VariableStroke.generated'  # legacy in-layer outlines
 # Marks outlines this plugin produced, so they are never taken for centerlines
 # again (a layer prepared twice, an interpolated or exported copy).
 OUTLINE_KEY = 'com.codex.VariableStroke.outline'
+BLEND_KEY = 'com.codex.VariableStroke.blend'  # instance path: its blended outline in _BLENDS
 ORIGINAL_FILL_KEY = 'com.codex.VariableStroke.originalFill'
 # Keys written by an earlier build that stored outlines in the layer itself.
 LEGACY_KEYS = ('com.codex.VariableStroke.id', 'com.codex.VariableStroke.signature')
@@ -1455,7 +1456,7 @@ def cleanup_legacy_layer(layer):
     return changed
 
 
-def _expansion_plan(layer, glyph_on=None, defaults=None):
+def _expansion_plan(layer, glyph_on=None, defaults=None, blends=False):
     if defaults is None:
         defaults = layer_defaults(layer)
     if glyph_on is False:
@@ -1468,6 +1469,13 @@ def _expansion_plan(layer, glyph_on=None, defaults=None):
             items = path_nodes(path)  # read once for the check and the outline
         if not items or not _valid_structure(path, [item[1] for item in items]):
             continue
+        if blends:
+            with PROFILE.section('look up blended outline'):
+                contours = _blended_outline(path, items, defaults)
+            if contours is not None:
+                with PROFILE.section('build outline GSPaths'):
+                    plan.append((path, generated_paths(path, contours=contours)))
+                continue
         try:
             plan.append((path, _outline_paths(path, defaults, items)))
         except ValueError:
@@ -1483,7 +1491,7 @@ def _apply_plan(layer, plan):
     return len(plan)
 
 
-def expand_layer(layer, glyph_on=None, defaults=None):
+def expand_layer(layer, glyph_on=None, defaults=None, blends=False):
     """Replace every centerline in `layer` by its Bézier outline.
 
     Glyphs calls this on the throwaway copy it prepares for preview, inactive
@@ -1495,8 +1503,12 @@ def expand_layer(layer, glyph_on=None, defaults=None):
     `defaults` (StrokeDefaults) carries the master's default width/height and
     italic angle; pass it when the layer is a detached copy that cannot find its
     master.
+
+    `blends`: the layer is an interpolated instance (not a master, brace or
+    bracket layer); strokes whose master outlines were blended when Glyphs
+    interpolated it (see interpolate_layer) take that blend.
     """
-    return _apply_plan(layer, _expansion_plan(layer, glyph_on, defaults))
+    return _apply_plan(layer, _expansion_plan(layer, glyph_on, defaults, blends))
 
 
 class _RecordedNode(object):
@@ -1568,37 +1580,220 @@ def _apply_interpolation(layer, recorded):
                         del data[key]
 
 
+# Outlines of instances. The masters' outlines have a fixed structure, so an
+# instance is drawn as their point-wise blend: what the exported fonts contain
+# (PreInterpolationFilter expands the masters before interpolation), and no
+# outline geometry per slider step of Variable Font Preview. _SOURCE_OUTLINES
+# holds each master path's outline and values by (glyph, last change, layer,
+# path index). interpolate_layer gives each blended path a token (BLEND_KEY)
+# naming its entry in _BLENDS, together with the positions and values the blend
+# was made for, so a layer that differs from them computes its own outline.
+_SOURCE_OUTLINES = collections.OrderedDict()
+_SOURCE_OUTLINES_SIZE = 4096
+_BLENDS = collections.OrderedDict()
+_BLENDS_SIZE = 4096
+# Interpolated values a blend is checked against (all plain numbers).
+_BLEND_CHECKED = (SCALE_KEY, HEIGHT_SCALE_KEY, OFFSET_KEY, ROTATION_KEY, CORNER_KEY,
+                  CORNER_INNER_KEY)
+_BLEND_TOLERANCE = 0.51  # Glyphs may round interpolated coordinates
+
+
+def _remember(table, size, key, value):
+    with _CACHE_LOCK:
+        table[key] = value
+        table.move_to_end(key)
+        while len(table) > size:
+            table.popitem(last=False)
+
+
+def _number_or_none(value):
+    try:
+        return None if value is None else float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _blend_check(nodes):
+    """[(kind, (x, y), data)] -> what a layer must still have to use a blend:
+    positions and the on-curve values interpolation wrote."""
+    return [(point, None if kind == OFFCURVE else
+             tuple(_number_or_none(data.get(key)) for key in _BLEND_CHECKED))
+            for kind, point, data in nodes]
+
+
+def _blend_mismatch(expected, actual):
+    """None when a layer still has what its blend was made for, else the first
+    difference ('node count', 'position', 'node type' or a userData key)."""
+    if len(expected) != len(actual):
+        return 'node count'
+    for (point, values), (other_point, other_values) in zip(expected, actual):
+        if abs(point[0] - other_point[0]) > _BLEND_TOLERANCE or \
+                abs(point[1] - other_point[1]) > _BLEND_TOLERANCE:
+            return 'position'
+        if values == other_values:
+            continue
+        if values is None or other_values is None:
+            return 'node type'
+        for key, a, b in zip(_BLEND_CHECKED, values, other_values):
+            # Glyphs keeps userData numbers at a lower precision than Python.
+            if (a is None) != (b is None) or (a is not None and
+                                              abs(a - b) > 1e-4 * max(1.0, abs(a), abs(b))):
+                return key.rsplit('.', 1)[-1]
+    return None
+
+
+def _blended_outline(path, items, defaults=None):
+    """The blended master outline made for this centerline, or None."""
+    try:
+        token = path.attributes.get(BLEND_KEY)
+    except Exception:
+        token = None
+    if not token:
+        if PROFILE.enabled:
+            PROFILE.add('blend skipped: no token', 0.0)
+        return None
+    token = str(token)
+    with _CACHE_LOCK:
+        entry = _BLENDS.get(token)
+        if entry is not None:
+            _BLENDS.move_to_end(token)
+    if entry is None:
+        if PROFILE.enabled:
+            PROFILE.add('blend skipped: token unknown', 0.0)
+        return None
+    expected, contours = entry
+    mismatch = _blend_mismatch(expected, _blend_check(
+        [(kind, point, data) for _, kind, point, data in items]))
+    if mismatch is not None:
+        if PROFILE.enabled:
+            PROFILE.add('blend skipped: %s differs' % mismatch, 0.0)
+        return None
+    return contours
+
+
+def _source_outline(path, defaults, key=None):
+    """Outline contours of a master's path as its export expands it, or None."""
+    if key is not None:
+        with _CACHE_LOCK:
+            if key in _SOURCE_OUTLINES:
+                _SOURCE_OUTLINES.move_to_end(key)
+                return _SOURCE_OUTLINES[key]
+    contours = None
+    if not generated(path) and not is_outline(path):
+        items = path_nodes(path)
+        if items and _valid_structure(path, [item[1] for item in items]):
+            try:
+                contours = curves_for_path(path, defaults, items=items)
+            except ValueError:
+                contours = None
+    if key is not None:
+        _remember(_SOURCE_OUTLINES, _SOURCE_OUTLINES_SIZE, key, contours)
+    return contours
+
+
+def _source_values(path, defaults, key=None):
+    """A master path's stroke values as interpolation blends them, read from
+    Glyphs once per edit of the glyph (by `key`) instead of once per instance:
+    {'width', 'height', 'nodes': {position: (w, h, offset, rotation, corner
+    spec or None, left offset, right offset, 4 corner handles)}}."""
+    if key is not None:
+        key = ('values',) + tuple(key)
+        with _CACHE_LOCK:
+            if key in _SOURCE_OUTLINES:
+                _SOURCE_OUTLINES.move_to_end(key)
+                return _SOURCE_OUTLINES[key]
+    base_w = stroke_width(path, defaults)
+    base_h = stroke_height(path, defaults)
+    nodes = {}
+    for position, (_, kind, _, data) in enumerate(path_nodes(path)):
+        if kind == OFFCURVE:
+            continue
+        nib = nib_of(data, base_w, base_h, defaults.nib_angle)
+        nodes[position] = (
+            _width_of(data, base_w), nib[1], offset_of(data),
+            rotation_of(data, defaults.nib_angle), corner_spec_of(data),
+            corner_offset_of(data, 'left'), corner_offset_of(data, 'right'),
+            corner_handle_of(data, 'left', True), corner_handle_of(data, 'left', False),
+            corner_handle_of(data, 'right', True), corner_handle_of(data, 'right', False))
+    values = {'width': base_w, 'height': base_h, 'nodes': nodes}
+    if key is not None:
+        _remember(_SOURCE_OUTLINES, _SOURCE_OUTLINES_SIZE, key, values)
+    return values
+
+
+def _blend_contours(weighted):
+    """Point-wise blend of [(contours, factor)], or None when the contours do
+    not share one structure (contour count, segment kinds)."""
+    first = weighted[0][0]
+    for contours, _ in weighted[1:]:
+        if len(contours) != len(first) or any(
+                [kind for kind, _ in a] != [kind for kind, _ in b]
+                for a, b in zip(contours, first)):
+            return None
+    result = []
+    for index, contour in enumerate(first):
+        blended = []
+        for position, (kind, points) in enumerate(contour):
+            sources = [(contours[index][position][1], factor) for contours, factor in weighted]
+            blended.append((kind, tuple(
+                (sum(factor * pts[k][0] for pts, factor in sources),
+                 sum(factor * pts[k][1] for pts, factor in sources))
+                for k in range(len(points)))))
+        result.append(blended)
+    return result
+
+
 def forget_interpolations():
     """Master settings changed (default width, angle): recompute everything."""
     with _CACHE_LOCK:
         _INTERPOLATIONS.clear()
+        _SOURCE_OUTLINES.clear()
+        _BLENDS.clear()
 
 
-def interpolate_layer(layer, glyph, interpolation, cache_key=None):
-    """Carry the strokes over to `layer` (see _interpolate_layer). With
-    `cache_key`, a result computed for the same key and path structure is
-    written again without reading the sources."""
+def interpolate_layer(layer, glyph, interpolation, cache_key=None, glyph_key=None):
+    """Carry the strokes over to `layer` (see _interpolate_layer) and keep the
+    blended master outlines for its strokes (see _BLENDS). With `cache_key`, a
+    result computed for the same key and path structure is written again
+    without reading the sources. `glyph_key` names the glyph's current state
+    (identity, last change) so the masters' outlines are read once per edit."""
     if cache_key is not None:
         with _CACHE_LOCK:
             cached = _INTERPOLATIONS.get(cache_key)
         if cached is not None:
-            shape, result, recorded = cached
+            shape, result, recorded, blends = cached
             if shape == tuple(len(path.nodes) for path in layer.paths):
                 _apply_interpolation(layer, recorded)
+                for key, contours in blends:
+                    _remember(_BLENDS, _BLENDS_SIZE, key, contours)
                 return result
-    recorder = _RecordedLayer(layer)
-    result = _interpolate_layer(recorder, glyph, interpolation)
-    recorded = recorder.changes()
-    _apply_interpolation(layer, recorded)
+    with PROFILE.section('interpolate layer: read layer'):
+        recorder = _RecordedLayer(layer)
+    recorder.blends = {}
+    with PROFILE.section('interpolate layer: values'):
+        result = _interpolate_layer(recorder, glyph, interpolation, glyph_key)
+    with PROFILE.section('interpolate layer: write layer'):
+        recorded = recorder.changes()
+        _apply_interpolation(layer, recorded)
+    blends = []
+    if recorder.blends:
+        paths = list(layer.paths)
+        for index, (token, contours) in recorder.blends.items():
+            source = recorder.paths[index]
+            with PROFILE.section('interpolate layer: blend check'):
+                check = _blend_check([(node.type, xy(real), node.userData)
+                                      for node, real in zip(source.nodes, paths[index].nodes)])
+            blends.append((token, (check, contours)))
+            _remember(_BLENDS, _BLENDS_SIZE, token, (check, contours))
     if cache_key is not None:
         with _CACHE_LOCK:
-            _INTERPOLATIONS[cache_key] = (recorder.shape(), result, recorded)
+            _INTERPOLATIONS[cache_key] = (recorder.shape(), result, recorded, blends)
             while len(_INTERPOLATIONS) > _INTERPOLATIONS_SIZE:
                 _INTERPOLATIONS.popitem(last=False)
     return result
 
 
-def _interpolate_layer(layer, glyph, interpolation):
+def _interpolate_layer(layer, glyph, interpolation, glyph_key=None):
     """Carry the strokes over to a layer Glyphs has just interpolated (instances in
     the preview, interpolation previews by other plugins, virtual masters).
 
@@ -1606,9 +1801,12 @@ def _interpolate_layer(layer, glyph, interpolation):
     know the ON/OFF state, so this writes the state and the blended italic angle
     onto the layer, the stroke attributes onto its paths, and blends width,
     height, node %, position and live corners (a corner off in a source counts as
-    radius 0) from `interpolation` ({layerId: factor}).
+    radius 0) from `interpolation` ({layerId: factor}). When `layer` has a
+    `blends` dict, the blended master outline of each stroke goes there by
+    path index.
     """
     sources = []
+    source_ids = {}
     for layer_id, factor in dict(interpolation or {}).items():
         try:
             source = glyph.layers[layer_id]
@@ -1616,14 +1814,16 @@ def _interpolate_layer(layer, glyph, interpolation):
             source = None
         if source is not None:
             sources.append((source, list(source.paths), float(factor)))
+            source_ids[id(source)] = str(layer_id)
+    source_defaults = {id(source): layer_defaults(source) for source, _, _ in sources}
     if not sources:
         return False
     state = glyph_enabled(glyph)
     layer.userData[LAYER_STATE_KEY] = state
-    layer.userData[LAYER_ITALIC_KEY] = sum(factor * layer_defaults(source).italic_angle
+    layer.userData[LAYER_ITALIC_KEY] = sum(factor * source_defaults[id(source)].italic_angle
                                            for source, _, factor in sources)
     layer.userData[LAYER_NIB_ANGLE_KEY] = _blend_angles([
-        (layer_defaults(source).nib_angle, factor) for source, _, factor in sources])
+        (source_defaults[id(source)].nib_angle, factor) for source, _, factor in sources])
     if not state:
         return True
     for index, path in enumerate(layer.paths):
@@ -1634,6 +1834,8 @@ def _interpolate_layer(layer, glyph, interpolation):
         template = next((other for _, other, _ in others if enabled(other)), None)
         if template is None:
             continue
+        if path.attributes.get(BLEND_KEY):
+            path.attributes[BLEND_KEY] = ''  # copied from a source: not this blend
         for key in _STROKE_ATTRIBUTES:
             if template.attributes.get(key) is not None:
                 path.attributes[key] = template.attributes[key]
@@ -1664,8 +1866,12 @@ def _interpolate_layer(layer, glyph, interpolation):
                 blended.append(spec)
             path.attributes[VIRTUAL_KEY] = blended
         path.attributes['fill'] = False
-        base_w = sum(factor * stroke_width(other) for _, other, factor in others)
-        base_h = sum(factor * stroke_height(other) for _, other, factor in others)
+        values = [(_source_values(other, source_defaults[id(source)],
+                                  None if glyph_key is None else
+                                  (glyph_key, source_ids[id(source)], index)), factor)
+                  for source, other, factor in others]
+        base_w = sum(factor * entry['width'] for entry, factor in values)
+        base_h = sum(factor * entry['height'] for entry, factor in values)
         if base_w <= 0 or base_h <= 0:
             continue
         path.attributes[STROKE_WIDTH_KEY] = base_w
@@ -1673,39 +1879,26 @@ def _interpolate_layer(layer, glyph, interpolation):
         for position, node in enumerate(path.nodes):
             if node.type == OFFCURVE:
                 continue
-            w = h = o = 0.0
-            angles = []
-            corner, any_corner = dict.fromkeys(_CORNER_PARTS, 0.0), False
-            for source, other, factor in others:
-                source_node = other.nodes[position]
-                w += factor * width(source_node, other, stroke_width(other))
-                h += factor * node_nib(source_node, other, stroke_width(other),
-                                       stroke_height(other))[1]
-                o += factor * offset(source_node)
-                angles.append((rotation(source_node,
-                                        layer_defaults(source).nib_angle), factor))
-                spec = corner_spec(source_node)
-                any_corner = any_corner or spec is not None
-                for key in _CORNER_PARTS:
-                    corner[key] += factor * (spec or ZERO_CORNER)[key]
-            node.userData[SCALE_KEY] = w / base_w * 100.0
-            node.userData[HEIGHT_SCALE_KEY] = h / base_h * 100.0
-            node.userData[OFFSET_KEY] = o
-            for side, key in (('left', CORNER_OFFSET_LEFT_KEY),
-                              ('right', CORNER_OFFSET_RIGHT_KEY)):
-                values = [sum(factor * corner_offset_of(node_data(other.nodes[position]), side)[axis]
-                              for _, other, factor in others) for axis in (0, 1)]
-                node.userData[key] = values
-            for side in ('left', 'right'):
-                for incoming in (True, False):
-                    key = CORNER_HANDLE_KEYS[(0 if side == 'left' else 2) + (0 if incoming else 1)]
-                    node.userData[key] = [sum(
-                        factor * corner_handle_of(node_data(other.nodes[position]),
-                                                  side, incoming)[axis]
-                        for _, other, factor in others) for axis in (0, 1)]
-            node.userData[ROTATION_KEY] = _blend_angles(angles)
+            nodes = [(entry['nodes'][position], factor) for entry, factor in values]
+            # (w, h, offset, rotation, corner spec or None, 2 offsets, 4 handles)
+            node.userData[SCALE_KEY] = sum(f * v[0] for v, f in nodes) / base_w * 100.0
+            node.userData[HEIGHT_SCALE_KEY] = sum(f * v[1] for v, f in nodes) / base_h * 100.0
+            node.userData[OFFSET_KEY] = sum(f * v[2] for v, f in nodes)
+            for slot, key in ((5, CORNER_OFFSET_LEFT_KEY), (6, CORNER_OFFSET_RIGHT_KEY),
+                              (7, CORNER_HANDLE_KEYS[0]), (8, CORNER_HANDLE_KEYS[1]),
+                              (9, CORNER_HANDLE_KEYS[2]), (10, CORNER_HANDLE_KEYS[3])):
+                value = [sum(f * v[slot][0] for v, f in nodes),
+                         sum(f * v[slot][1] for v, f in nodes)]
+                # Absent means (0, 0): skip a write per node and key where no
+                # master moves its outline corners (most strokes).
+                if value != [0.0, 0.0] or key in node.userData:
+                    node.userData[key] = value
+            node.userData[ROTATION_KEY] = _blend_angles([(v[3], f) for v, f in nodes])
+            any_corner = any(v[4] is not None for v, _ in nodes)
             node.userData[CORNER_ON_KEY] = any_corner
             if any_corner:
+                corner = {key: sum(f * (v[4] or ZERO_CORNER)[key] for v, f in nodes)
+                          for key in _CORNER_PARTS}
                 node.userData[CORNER_KEY] = corner['outer']
                 node.userData[CORNER_INNER_KEY] = corner['inner']
                 node.userData[CORNER_TENSION_KEY] = corner['tension']
@@ -1714,6 +1907,23 @@ def _interpolate_layer(layer, glyph, interpolation):
                 node.userData[CORNER_INNER_RATIO_KEY] = corner['inner_ratio']
             if WIDTH_KEY in node.userData:
                 del node.userData[WIDTH_KEY]
+        blends = getattr(layer, 'blends', None)
+        if blends is not None:
+            with PROFILE.section('interpolate layer: blend outlines'):
+                weighted = []
+                for source, other, factor in others:
+                    key = None if glyph_key is None else \
+                        (glyph_key, source_ids[id(source)], index)
+                    contours = _source_outline(other, source_defaults[id(source)], key)
+                    if contours is None:
+                        break
+                    weighted.append((contours, factor))
+                else:
+                    contours = _blend_contours(weighted)
+                    if contours is not None:
+                        token = uuid.uuid4().hex
+                        path.attributes[BLEND_KEY] = token
+                        blends[index] = (token, contours)
     return True
 
 
