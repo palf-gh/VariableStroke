@@ -6,7 +6,8 @@ import threading
 import time
 import uuid
 from GlyphsApp import GSPath, GSNode, LINE, CURVE, OFFCURVE
-from variable_stroke_core import outline_curves, ellipse_nib_edges, sub, DEFAULT_CAP_CURVE
+from variable_stroke_core import (outline_curves, ellipse_nib_edges, sub, move_outline_vertices,
+                                  outline_direction_at_vertex, DEFAULT_CAP_CURVE)
 
 PATH_KEY = 'com.codex.VariableStroke.enabled'
 # Legacy absolute node width; converted to STROKE_WIDTH_KEY x SCALE_KEY on edit.
@@ -16,6 +17,13 @@ SCALE_KEY = 'com.codex.VariableStroke.scale'  # per node, percent of the path wi
 HEIGHT_SCALE_KEY = 'com.codex.VariableStroke.heightScale'  # per node, percent of path height
 STROKE_HEIGHT_KEY = 'com.codex.VariableStroke.strokeHeight'  # per path, font units
 OFFSET_KEY = 'com.codex.VariableStroke.offset'  # per node; values beyond +/-100 move the stroke off the centerline
+CORNER_OFFSET_LEFT_KEY = 'com.codex.VariableStroke.cornerOffsetLeft'
+CORNER_OFFSET_RIGHT_KEY = 'com.codex.VariableStroke.cornerOffsetRight'
+CORNER_HANDLE_KEYS = (
+    'com.codex.VariableStroke.cornerHandleLeftIn',
+    'com.codex.VariableStroke.cornerHandleLeftOut',
+    'com.codex.VariableStroke.cornerHandleRightIn',
+    'com.codex.VariableStroke.cornerHandleRightOut')
 VIRTUAL_KEY = 'com.codex.VariableStroke.virtualNodes'  # per path, ordered virtual sections
 VIRTUAL_ANCHOR_KEY = 'com.codex.VariableStroke.virtualAnchor'  # stable on-curve identity
 ROTATION_KEY = 'com.codex.VariableStroke.rotation'  # per node, nib axes angle in page degrees
@@ -151,6 +159,25 @@ def node_data(node):
     except AttributeError:
         return node.userData  # a plain mapping already (detached data, tests)
     return dict(raw) if raw is not None else {}
+
+
+def corner_offset_of(data, side):
+    value = data.get(CORNER_OFFSET_LEFT_KEY if side == 'left' else CORNER_OFFSET_RIGHT_KEY, (0, 0))
+    try:
+        x, y = float(value[0]), float(value[1])
+        return (x, y) if math.isfinite(x) and math.isfinite(y) else (0.0, 0.0)
+    except (TypeError, ValueError, IndexError, KeyError):
+        return (0.0, 0.0)
+
+
+def corner_handle_of(data, side, incoming):
+    key = CORNER_HANDLE_KEYS[(0 if side == 'left' else 2) + (0 if incoming else 1)]
+    value = data.get(key, (0, 0))
+    try:
+        x, y = float(value[0]), float(value[1])
+        return (x, y) if math.isfinite(x) and math.isfinite(y) else (0.0, 0.0)
+    except (TypeError, ValueError, IndexError, KeyError):
+        return (0.0, 0.0)
 
 
 def path_nodes(path):
@@ -829,6 +856,40 @@ def edges_for_path(path, defaults=None, items=None):
     return [(on_curve[i], pair) for i, pair in sorted(edges.items()) if i < len(on_curve)]
 
 
+def corner_slide_direction(path, node, side, defaults=None, items=None):
+    """Direction of the straight edge or Bézier tangent entering this corner."""
+    defaults = _resolve(defaults, path)
+    items = path_nodes(path) if items is None else items
+    pair = next((pair for owner, pair in edges_for_path(path, defaults, items)
+                 if owner == node), None)
+    if pair is None:
+        return None
+    _, cached, _ = _outline(path, defaults, items)
+    return outline_direction_at_vertex(cached[0], pair[0 if side == 'left' else 1],
+                                       prefer_incoming=(side == 'left'))
+
+
+def corner_bezier_controls(path, defaults=None, items=None):
+    """Editable cubic controls adjacent to each generated outline corner."""
+    defaults = _resolve(defaults, path)
+    items = path_nodes(path) if items is None else items
+    _, cached, _ = _outline(path, defaults, items)
+    contours = cached[0]
+    result = []
+    for node, pair in edges_for_path(path, defaults, items):
+        for side, corner in zip(('left', 'right'), pair):
+            for contour in contours:
+                for kind, points in contour:
+                    if kind != 'cubic':
+                        continue
+                    for incoming, endpoint, handle in ((False, 0, 1), (True, -1, -2)):
+                        if abs(points[endpoint][0]-corner[0]) < 1e-5 and \
+                                abs(points[endpoint][1]-corner[1]) < 1e-5:
+                            result.append({'node': node, 'side': side, 'incoming': incoming,
+                                           'corner': corner, 'control': points[handle]})
+    return result
+
+
 def cut_angle(path, key):
     try:
         return float(path.attributes.get(key, DEFAULT_CUT_ANGLE))
@@ -1030,6 +1091,18 @@ def copy_stroke_settings(source, target):
         source_index = index if matching_nodes else _nearest_progress_index(
             source_positions, position, bool(source.closed))
         source_data = source_nodes[source_index][3]
+        for side, key in (('left', CORNER_OFFSET_LEFT_KEY), ('right', CORNER_OFFSET_RIGHT_KEY)):
+            if key in source_data:
+                data[key] = list(corner_offset_of(source_data, side))
+            else:
+                _pop(data, key)
+        for side in ('left', 'right'):
+            for incoming in (True, False):
+                key = CORNER_HANDLE_KEYS[(0 if side == 'left' else 2) + (0 if incoming else 1)]
+                if key in source_data:
+                    data[key] = list(corner_handle_of(source_data, side, incoming))
+                else:
+                    _pop(data, key)
         for key in corner_keys:
             if key in source_data:
                 data[key] = source_data[key]
@@ -1143,6 +1216,11 @@ def _outline(path, defaults, items):
                       cap_curve_of(path, True) if cap_curve_enabled(path, True) else None)
         specs = virtual_nodes(path, len(source_segments), items)
         source_corners = corner_specs(path, items)
+        source_offsets = [(corner_offset_of(data, 'left'), corner_offset_of(data, 'right'))
+                          for _, _, _, data in _on_curve(items, closed)]
+        source_handles = [tuple(corner_handle_of(data, side, incoming)
+                                for side in ('left', 'right') for incoming in (True, False))
+                          for _, _, _, data in _on_curve(items, closed)]
         independent = any(spec['side'] != 'both' for spec in specs)
         if independent:
             left_specs = [spec for spec in specs if spec['side'] in ('left', 'both')]
@@ -1166,7 +1244,8 @@ def _outline(path, defaults, items):
                tuple(sorted(right_smooths)) if independent else (),
                tuple(left_map) if independent else (),
                tuple(right_map) if independent else (),
-               tuple(None if c is None else tuple(sorted(c.items())) for c in corners))
+               tuple(None if c is None else tuple(sorted(c.items())) for c in corners),
+               tuple(source_offsets), tuple(source_handles))
 
     def compute():
         collected, edges, cap_points = [], {}, {}
@@ -1181,6 +1260,20 @@ def _outline(path, defaults, items):
                                   right_smooth_virtuals=right_smooths if independent else (),
                                   cap_start_curve=cap_curves[0],
                                   cap_end_curve=cap_curves[1], cap_out=cap_points)
+        if any(delta != (0.0, 0.0) for pair in source_offsets for delta in pair) or \
+                any(delta != (0.0, 0.0) for handles in source_handles for delta in handles):
+            if independent:
+                # Independent sides report their edges by original node index.
+                offsets = dict(enumerate(source_offsets))
+                handles = dict(enumerate(source_handles))
+            else:
+                offsets = {expanded_index: source_offsets[original_index]
+                           for expanded_index, original_index in enumerate(node_map)
+                           if original_index is not None and original_index < len(source_offsets)}
+                handles = {expanded_index: source_handles[original_index]
+                           for expanded_index, original_index in enumerate(node_map)
+                           if original_index is not None and original_index < len(source_handles)}
+            contours = move_outline_vertices(contours, edges, offsets, handles)
         # The last slot keeps the outline as GSPaths once built (see _outline_paths).
         return [contours, collected, edges, None, cap_points]
 
@@ -1406,7 +1499,106 @@ def expand_layer(layer, glyph_on=None, defaults=None):
     return _apply_plan(layer, _expansion_plan(layer, glyph_on, defaults))
 
 
-def interpolate_layer(layer, glyph, interpolation):
+class _RecordedNode(object):
+    __slots__ = ('type', 'userData')
+
+    def __init__(self, kind, data):
+        self.type, self.userData = kind, data
+
+
+class _RecordedPath(object):
+    def __init__(self, path):
+        self.attributes = dict(path.attributes or {})
+        self.nodes = [_RecordedNode(kind, dict(data) if data is not None else {})
+                      for _, kind, _, data in path_nodes(path)]
+
+
+class _RecordedLayer(object):
+    """Stands in for an interpolated layer while interpolate_layer works, so the
+    result can be written in one pass and reused (see _INTERPOLATIONS)."""
+    def __init__(self, layer):
+        self.userData = {}
+        self.paths = [_RecordedPath(path) for path in layer.paths]
+        self._original = [(dict(path.attributes),
+                           [dict(node.userData) for node in path.nodes])
+                          for path in self.paths]
+
+    def shape(self):
+        return tuple(len(path.nodes) for path in self.paths)
+
+    def changes(self):
+        paths = []
+        for path, (attributes, nodes) in zip(self.paths, self._original):
+            set_attributes = {key: value for key, value in path.attributes.items()
+                              if attributes.get(key, _MISSING) != value}
+            node_changes = []
+            for position, (node, before) in enumerate(zip(path.nodes, nodes)):
+                updates = {key: value for key, value in node.userData.items()
+                           if before.get(key, _MISSING) != value}
+                removed = [key for key in before if key not in node.userData]
+                if updates or removed:
+                    node_changes.append((position, updates, removed))
+            paths.append((set_attributes, node_changes))
+        return dict(self.userData), paths
+
+
+_MISSING = object()
+# Interpolations of unchanged glyphs at the same position come back on every
+# redraw of instance previews (Variable Font Preview, the preview area); the
+# writes they need are kept by the caller's key (glyph, last change, location).
+_INTERPOLATIONS = collections.OrderedDict()
+_INTERPOLATIONS_SIZE = 512
+
+
+def _apply_interpolation(layer, recorded):
+    layer_data, paths = recorded
+    for key, value in layer_data.items():
+        layer.userData[key] = value
+    for path, (attributes, node_changes) in zip(list(layer.paths), paths):
+        for key, value in attributes.items():
+            path.attributes[key] = value
+        if node_changes:
+            nodes = list(path.nodes)
+            for position, updates, removed in node_changes:
+                data = nodes[position].userData
+                for key, value in updates.items():
+                    data[key] = value
+                for key in removed:
+                    if key in data:
+                        del data[key]
+
+
+def forget_interpolations():
+    """Master settings changed (default width, angle): recompute everything."""
+    with _CACHE_LOCK:
+        _INTERPOLATIONS.clear()
+
+
+def interpolate_layer(layer, glyph, interpolation, cache_key=None):
+    """Carry the strokes over to `layer` (see _interpolate_layer). With
+    `cache_key`, a result computed for the same key and path structure is
+    written again without reading the sources."""
+    if cache_key is not None:
+        with _CACHE_LOCK:
+            cached = _INTERPOLATIONS.get(cache_key)
+        if cached is not None:
+            shape, result, recorded = cached
+            if shape == tuple(len(path.nodes) for path in layer.paths):
+                _apply_interpolation(layer, recorded)
+                return result
+    recorder = _RecordedLayer(layer)
+    result = _interpolate_layer(recorder, glyph, interpolation)
+    recorded = recorder.changes()
+    _apply_interpolation(layer, recorded)
+    if cache_key is not None:
+        with _CACHE_LOCK:
+            _INTERPOLATIONS[cache_key] = (recorder.shape(), result, recorded)
+            while len(_INTERPOLATIONS) > _INTERPOLATIONS_SIZE:
+                _INTERPOLATIONS.popitem(last=False)
+    return result
+
+
+def _interpolate_layer(layer, glyph, interpolation):
     """Carry the strokes over to a layer Glyphs has just interpolated (instances in
     the preview, interpolation previews by other plugins, virtual masters).
 
@@ -1499,6 +1691,18 @@ def interpolate_layer(layer, glyph, interpolation):
             node.userData[SCALE_KEY] = w / base_w * 100.0
             node.userData[HEIGHT_SCALE_KEY] = h / base_h * 100.0
             node.userData[OFFSET_KEY] = o
+            for side, key in (('left', CORNER_OFFSET_LEFT_KEY),
+                              ('right', CORNER_OFFSET_RIGHT_KEY)):
+                values = [sum(factor * corner_offset_of(node_data(other.nodes[position]), side)[axis]
+                              for _, other, factor in others) for axis in (0, 1)]
+                node.userData[key] = values
+            for side in ('left', 'right'):
+                for incoming in (True, False):
+                    key = CORNER_HANDLE_KEYS[(0 if side == 'left' else 2) + (0 if incoming else 1)]
+                    node.userData[key] = [sum(
+                        factor * corner_handle_of(node_data(other.nodes[position]),
+                                                  side, incoming)[axis]
+                        for _, other, factor in others) for axis in (0, 1)]
             node.userData[ROTATION_KEY] = _blend_angles(angles)
             node.userData[CORNER_ON_KEY] = any_corner
             if any_corner:

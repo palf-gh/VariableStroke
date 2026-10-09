@@ -48,6 +48,62 @@ bridge = importlib.import_module('glyphs_bridge')
 
 
 class BridgeTests(unittest.TestCase):
+    def test_generated_corner_bezier_control_is_visible_and_editable(self):
+        corner = Node(100, 0, 'curve')
+        path = Path([Node(0, 0), Node(30, 30, 'offcurve'),
+                     Node(70, 30, 'offcurve'), corner, Node(100, 100)])
+        for node in path.nodes:
+            node.userData.clear()
+        corner.userData[bridge.CORNER_OFFSET_LEFT_KEY] = [-20, 0]
+        before = [item for item in bridge.corner_bezier_controls(path)
+                  if item['node'] == corner and item['side'] == 'left']
+        self.assertTrue(before)
+        widget = before[0]
+        key = bridge.CORNER_HANDLE_KEYS[0 if widget['incoming'] else 1]
+        corner.userData[key] = [0, 12]
+        after = [item for item in bridge.corner_bezier_controls(path)
+                 if item['node'] == corner and item['side'] == 'left' and
+                 item['incoming'] == widget['incoming']][0]
+        self.assertAlmostEqual(after['control'][0], widget['control'][0])
+        self.assertAlmostEqual(after['control'][1], widget['control'][1]+12)
+        self.assertEqual(after['corner'], widget['corner'])
+
+    def test_corner_bezier_control_with_one_sided_virtual_node(self):
+        corner = Node(100, 0, 'curve')
+        path = Path([Node(0, 0), Node(30, 30, 'offcurve'),
+                     Node(70, 30, 'offcurve'), corner, Node(100, 100)])
+        for node in path.nodes:
+            node.userData.clear()
+        path.attributes[bridge.VIRTUAL_KEY] = [self.virtual_spec()]
+        corner.userData[bridge.CORNER_OFFSET_LEFT_KEY] = [-15, 0]
+        before = [item for item in bridge.corner_bezier_controls(path)
+                  if item['node'] == corner and item['side'] == 'left']
+        self.assertTrue(before)
+        widget = before[0]
+        key = bridge.CORNER_HANDLE_KEYS[0 if widget['incoming'] else 1]
+        corner.userData[key] = [0, 7]
+        after = [item for item in bridge.corner_bezier_controls(path)
+                 if item['node'] == corner and item['side'] == 'left' and
+                 item['incoming'] == widget['incoming']][0]
+        self.assertAlmostEqual(after['control'][1], widget['control'][1]+7)
+
+    def test_corner_offset_moves_only_selected_outline_side(self):
+        path = Path([Node(0, 0), Node(100, 0), Node(100, 100)])
+        for node in path.nodes:
+            node.userData.clear()
+        baseline = dict(bridge.edges_for_path(path))
+        corner = path.nodes[1]
+        direction = bridge.corner_slide_direction(path, corner, 'left')
+        self.assertIsNotNone(direction)
+        self.assertAlmostEqual(abs(direction[0]), 1.0)
+        self.assertAlmostEqual(direction[1], 0.0)
+        corner.userData[bridge.CORNER_OFFSET_LEFT_KEY] = [-25, -10]
+        shifted = dict(bridge.edges_for_path(path))
+        self.assertEqual(shifted[corner][0],
+                         (baseline[corner][0][0]-25, baseline[corner][0][1]-10))
+        self.assertEqual(shifted[corner][1], baseline[corner][1])
+        self.assertEqual(shifted[path.nodes[0]], baseline[path.nodes[0]])
+
     @staticmethod
     def virtual_spec(mode='step', t=0.5, before=100, after=150,
                      direction='horizontal'):
@@ -910,6 +966,26 @@ class BridgeTests(unittest.TestCase):
         layer = Layer([plain])
         layer.parent = types.SimpleNamespace(userData={bridge.GLYPH_KEY: True})
         self.assertEqual(bridge.compare_string_suffix(layer), '')
+
+    def test_interpolation_is_reused_for_the_same_key(self):
+        def master(width):
+            path = Path([Node(0, 0, width=width), Node(0, 300, width=width)])
+            return Layer([path])
+        glyph = types.SimpleNamespace(layers={'a': master(20), 'b': master(60)},
+                                      userData={bridge.GLYPH_KEY: True})
+        first = master(20)
+        bridge.interpolate_layer(first, glyph, {'a': 0.5, 'b': 0.5}, cache_key='k')
+        # The sources are gone: a hit writes the recorded result without them.
+        glyph.layers = {}
+        again = master(20)
+        self.assertTrue(bridge.interpolate_layer(again, glyph, {'a': 0.5, 'b': 0.5},
+                                                 cache_key='k'))
+        self.assertEqual([node.userData for node in again.paths[0].nodes],
+                         [node.userData for node in first.paths[0].nodes])
+        self.assertEqual(again.userData, first.userData)
+        bridge.forget_interpolations()
+        self.assertFalse(bridge.interpolate_layer(master(20), glyph, {'a': 1.0},
+                                                  cache_key='k'))
 
     def test_interpolated_layer_gets_strokes_and_blended_corner(self):
         def master(radius):

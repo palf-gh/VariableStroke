@@ -18,6 +18,69 @@ def unit(a):
 def normal(a): return (-a[1], a[0])
 
 
+def move_outline_vertices(contours, edges, offsets, handle_offsets=None):
+    """Move individual sharp outline vertices and their adjacent cubic handles.
+
+    `offsets` maps the edge index to (left delta, right delta). The number and
+    kinds of segments stay fixed for interpolation between masters.
+    """
+    handle_offsets = handle_offsets or {}
+    targets = []
+    for index, pair in edges.items():
+        vertex_pair = offsets.get(index, ((0, 0), (0, 0)))
+        handles = handle_offsets.get(index, ((0, 0),) * 4)
+        for side, (point, delta) in enumerate(zip(pair, vertex_pair)):
+            incoming, outgoing = handles[side*2:side*2+2]
+            if any(value for vector in (delta, incoming, outgoing) for value in vector):
+                targets.append((point, delta, incoming, outgoing))
+    if not targets:
+        return contours
+    moved = []
+    for contour in contours:
+        result = []
+        for kind, points in contour:
+            points = list(points)
+            for endpoint, handle in ((0, 1), (-1, -2)):
+                original = points[endpoint]
+                for point, delta, incoming, outgoing in targets:
+                    if length(sub(original, point)) < 1e-5:
+                        points[endpoint] = add(original, delta)
+                        if kind == 'cubic':
+                            points[handle] = add(points[handle], add(delta,
+                                incoming if endpoint == -1 else outgoing))
+                        break
+            result.append((kind, tuple(points)))
+        moved.append(result)
+    for index, pair in list(edges.items()):
+        deltas = offsets.get(index, ((0, 0), (0, 0)))
+        edges[index] = tuple(add(point, delta) for point, delta in zip(pair, deltas))
+    return moved
+
+
+def outline_direction_at_vertex(contours, point, prefer_incoming=True):
+    """Prefer a touching line; otherwise use the nearest Bézier control handle."""
+    lines, curves = [], []
+    for contour in contours:
+        for kind, points in contour:
+            start, end = points[0], points[-1]
+            if length(sub(end, point)) < 1e-5:
+                direction = sub(end, start) if kind == 'line' else sub(end, points[-2])
+                if length(direction) < EPS and kind == 'cubic':
+                    direction = sub(end, points[-3])
+                (lines if kind == 'line' else curves).append((True, direction))
+            if length(sub(start, point)) < 1e-5:
+                direction = sub(end, start) if kind == 'line' else sub(points[1], start)
+                if length(direction) < EPS and kind == 'cubic':
+                    direction = sub(points[2], start)
+                (lines if kind == 'line' else curves).append((False, direction))
+    for candidates in (lines, curves):
+        for incoming in (prefer_incoming, not prefer_incoming):
+            for candidate_incoming, direction in candidates:
+                if candidate_incoming == incoming and length(direction) > EPS:
+                    return unit(direction)
+    return None
+
+
 # The two hottest functions of live editing, written out (same arithmetic as
 # add/mul, so results are unchanged).
 def cubic(p0, p1, p2, p3, t):

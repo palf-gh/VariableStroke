@@ -1,5 +1,6 @@
 # encoding: utf-8
 """Variable Stroke editing tool for Glyphs 3."""
+import collections
 import functools
 import math
 import time
@@ -35,15 +36,19 @@ from glyphs_bridge import (CAP_START_KEY, CAP_END_KEY, CAP_START_ANGLE_KEY, CAP_
                            cleanup_legacy_layer, glyph_enabled, GLYPH_KEY, set_glyph_enabled,
                            normalize_layer, MASTER_WIDTH_KEY, master_default_width,
                            has_width_override, reset_width_overrides, STROKE_HEIGHT_KEY,
-                           OFFSET_KEY, ROTATION_KEY, MASTER_HEIGHT_KEY, MASTER_ANGLE_KEY,
+                           OFFSET_KEY, CORNER_OFFSET_LEFT_KEY, CORNER_OFFSET_RIGHT_KEY,
+                           CORNER_HANDLE_KEYS,
+                           ROTATION_KEY, MASTER_HEIGHT_KEY, MASTER_ANGLE_KEY,
                            LAYER_NIB_ANGLE_KEY, master_default_height, master_default_angle,
                            master_defaults,
                            layer_defaults, stroke_height, has_height_override, offset, rotation,
-                           edges_for_path, selected_nib_nodes, ellipse_cap_nodes,
+                           edges_for_path, corner_slide_direction, corner_bezier_controls,
+                           selected_nib_nodes, ellipse_cap_nodes,
                            set_node_nib_size, path_nodes, PROFILE, LAYER_STATE_KEY, has_live_corners, nib_of,
-                           scale_of, height_scale_of, offset_of, rotation_of,
+                           scale_of, height_scale_of, offset_of, rotation_of, corner_offset_of,
+                           corner_handle_of,
                            corner_on_of, corner_spec_of, copied_contours,
-                           copy_stroke_settings, compare_string_suffix,
+                           copy_stroke_settings, compare_string_suffix, forget_interpolations,
                            master_incompatibilities, describe_incompatibility)
 from glyphs_bridge import (VIRTUAL_KEY, virtual_nodes, virtual_widgets, virtual_point,
                            segments_for_path, _virtual_section_angle)
@@ -260,17 +265,40 @@ def _hook_copy():
 _hooked_compare = []
 
 
-def _in_open_document(layer):
-    """True for a layer of a font the user edits (it has a document window).
-    Export works on detached copies, often off the main thread; those keep
-    Glyphs' own compare string."""
+# compare_string_suffix per (layer, glyph's last change): Glyphs asks for compare
+# strings on every interpolation (Variable Font Preview redraws, instance
+# previews), and the outline structure only changes with an edit.
+_SUFFIXES = collections.OrderedDict()
+_SUFFIX_CACHE_SIZE = 4096
+
+
+def _stroke_suffix(layer):
+    """The compare string suffix of a master, brace or bracket layer of a stroke
+    glyph in a font the user edits; '' for everything else. Export works on
+    detached copies, often off the main thread; those keep Glyphs' own string."""
     if not NSThread.isMainThread():
-        return False
+        return ''
     try:
-        font = layer.parent.parent
-        return font is not None and font.parent is not None
+        glyph = layer.parent
+        if glyph is None or not glyph_enabled(glyph):
+            return ''
+        if not (layer.isMasterLayer or layer.isSpecialLayer):
+            return ''  # interpolated layers are not compared
+        font = glyph.parent
+        if font is None or font.parent is None:
+            return ''
+        key = (objc.pyobjc_id(layer), str(glyph.lastChange))
     except Exception:
-        return False
+        return ''
+    suffix = _SUFFIXES.get(key)
+    if suffix is None:
+        suffix = compare_string_suffix(layer)
+        _SUFFIXES[key] = suffix
+        while len(_SUFFIXES) > _SUFFIX_CACHE_SIZE:
+            _SUFFIXES.popitem(last=False)
+    else:
+        _SUFFIXES.move_to_end(key)
+    return suffix
 
 
 def _hook_compare_string():
@@ -286,10 +314,8 @@ def _hook_compare_string():
 
     def wrapper(self, original=original):
         result = original(self)
-        if not _in_open_document(self):
-            return result  # export copies: half converted while Glyphs checks them
         try:
-            suffix = compare_string_suffix(self)
+            suffix = _stroke_suffix(self)
         except Exception:
             print(traceback.format_exc())
             suffix = ''
@@ -477,7 +503,9 @@ def _normalize_quietly(layer):
 _PATH_KEYS = (STROKE_WIDTH_KEY, STROKE_HEIGHT_KEY, CAP_START_KEY, CAP_END_KEY,
               CAP_START_ANGLE_KEY, CAP_END_ANGLE_KEY, CAP_START_CURVE_KEY,
               CAP_END_CURVE_KEY, CAP_START_CURVE_ON_KEY, CAP_END_CURVE_ON_KEY, VIRTUAL_KEY)
-_NODE_KEYS = (SCALE_KEY, HEIGHT_SCALE_KEY, OFFSET_KEY, ROTATION_KEY, WIDTH_KEY, CORNER_ON_KEY, CORNER_KEY, CORNER_INNER_KEY,
+_NODE_KEYS = (SCALE_KEY, HEIGHT_SCALE_KEY, OFFSET_KEY, CORNER_OFFSET_LEFT_KEY,
+              CORNER_OFFSET_RIGHT_KEY) + CORNER_HANDLE_KEYS + (ROTATION_KEY, WIDTH_KEY,
+              CORNER_ON_KEY, CORNER_KEY, CORNER_INNER_KEY,
               CORNER_TENSION_KEY, CORNER_INNER_TENSION_KEY,
               CORNER_RATIO_KEY, CORNER_INNER_RATIO_KEY)
 _MISSING = object()
@@ -703,7 +731,13 @@ class VariableStrokeLayerProcessor(NSObject):
         # the ON state, stroke settings and blended values onto the new layer.
         try:
             with PROFILE.section('interpolate layer'):
-                interpolate_layer(layer, glyph, interpolation)
+                try:
+                    key = (objc.pyobjc_id(glyph), str(glyph.lastChange),
+                           tuple(sorted((str(k), round(float(v), 9))
+                                        for k, v in dict(interpolation).items())))
+                except Exception:
+                    key = None
+                interpolate_layer(layer, glyph, interpolation, key)
         except Exception:
             print(traceback.format_exc())
         return True, None
@@ -967,6 +1001,7 @@ class VariableStrokeSettings(object):
     def resetOverrides(self, sender):
         if self.font is None:
             return
+        forget_interpolations()
         items = self.w.masters.get()
         master_ids = {items[i]['id'] for i in self.w.masters.getSelection()}
         for glyph in self.font.glyphs:
@@ -979,6 +1014,7 @@ class VariableStrokeSettings(object):
         Glyphs.redraw()
 
     def _invalidate_master(self, master_id):
+        forget_interpolations()
         for glyph in self.font.glyphs:
             if glyph_enabled(glyph):
                 for layer in glyph.layers:
@@ -2575,6 +2611,21 @@ class VariableStrokeTool(SelectTool):
                     yield path, widget
 
     @objc.python_method
+    def _corner_bezier_handles(self, strokes, defaults, selected):
+        for path, items in strokes:
+            if not any(node in selected and data is not None and
+                       (CORNER_OFFSET_LEFT_KEY in data or CORNER_OFFSET_RIGHT_KEY in data)
+                       for node, _, _, data in items):
+                continue
+            for widget in corner_bezier_controls(path, defaults, items):
+                node = widget['node']
+                if node not in selected:
+                    continue
+                key = CORNER_OFFSET_LEFT_KEY if widget['side'] == 'left' else CORNER_OFFSET_RIGHT_KEY
+                if key in node.userData:
+                    yield path, widget
+
+    @objc.python_method
     @_timed('draw handles (foreground)')
     def foreground(self, layer):
         if layer is None:
@@ -2603,6 +2654,7 @@ class VariableStrokeTool(SelectTool):
         self._draw_curve_caps(strokes, defaults, scale)
         selected = set(layer.selection)
         handles = list(self._handles(strokes, defaults))
+        bezier_handles = list(self._corner_bezier_handles(strokes, defaults, selected))
         selected_nibs = list(self._selected_nibs(strokes, defaults, selected))
         previews = [item for item in selected_nibs if item[4]]
         for kind, _, widget, position in self._corner_parts(strokes, defaults, selected):
@@ -2648,6 +2700,18 @@ class VariableStrokeTool(SelectTool):
             for handle in (left, right):
                 NSBezierPath.bezierPathWithOvalInRect_(((handle[0]-radius, handle[1]-radius),
                                                         (radius*2, radius*2))).fill()
+        control_color = NSColor.colorWithCalibratedRed_green_blue_alpha_(0.55, 0.27, 0.83, 1.0)
+        for _, widget in bezier_handles:
+            corner, control = widget['corner'], widget['control']
+            control_color.colorWithAlphaComponent_(0.6).set()
+            line = NSBezierPath.bezierPath()
+            line.moveToPoint_(corner)
+            line.lineToPoint_(control)
+            line.setLineWidth_(1.0 / scale)
+            line.stroke()
+            control_color.set()
+            NSBezierPath.bezierPathWithOvalInRect_(
+                ((control[0]-small, control[1]-small), (small*2, small*2))).fill()
         angle_color = NSColor.colorWithCalibratedRed_green_blue_alpha_(0.5, 0.25, 0.85, 1.0)
         for _, _, middle, nib, _ in previews:
             angle = math.radians(nib[3])
@@ -2955,6 +3019,33 @@ class VariableStrokeTool(SelectTool):
                     return
             selected = set(layer.selection)
             handles = list(self._handles(strokes, defaults))
+            bezier_hits = [(length(sub(point, widget['control'])), path, widget)
+                           for path, widget in self._corner_bezier_handles(
+                               strokes, defaults, selected)]
+            if bezier_hits:
+                distance, path, widget = min(bezier_hits, key=lambda hit: hit[0])
+                if distance <= threshold:
+                    node = widget['node']
+                    tangent = None
+                    if getattr(node, 'smooth', False):
+                        path_items = next((items for candidate, items in strokes
+                                           if candidate == path), ())
+                        index = next((i for i, item in enumerate(path_items)
+                                      if item[0] == node), None)
+                        if index is not None:
+                            tangent = self._node_tangent(path_items, path.closed, index)
+                    self._select_node(layer, node)
+                    layer.beginChanges()
+                    self._drag = {'kind': 'corner-bezier', 'layer': layer, 'path': path,
+                                  'node': node, 'side': widget['side'],
+                                  'incoming': widget['incoming'], 'start': point,
+                                  'tangent': tangent,
+                                  'initial': corner_handle_of(node.userData,
+                                                              widget['side'], widget['incoming'])}
+                    self._select_tab('node')
+                    self._last_ui_state = None
+                    self._refresh_ui()
+                    return
             selected_nibs = list(self._selected_nibs(strokes, defaults, selected))
             previews = [item for item in selected_nibs if item[4]]
             # Small handles first: they can sit right next to the radius handle.
@@ -3012,6 +3103,17 @@ class VariableStrokeTool(SelectTool):
                     self._select_node(layer, node)
                     layer.beginChanges()
                     migrate_path(path)
+                    if NSEvent.modifierFlags() & NSEventModifierFlagShift:
+                        side = 'left' if sign > 0 else 'right'
+                        self._drag = {'kind': 'corner-offset', 'layer': layer,
+                                      'path': path, 'node': node, 'side': side,
+                                      'start': point, 'initial': corner_offset_of(node.userData, side),
+                                      'line_direction': corner_slide_direction(
+                                          path, node, side, defaults)}
+                        self._select_tab('node')
+                        self._last_ui_state = None
+                        self._refresh_ui()
+                        return
                     near, far = length(sub(handle, center)), length(sub(other, center))
                     direction = unit(sub(handle, center)) if near > 1e-6 \
                         else unit(sub(center, other))
@@ -3129,6 +3231,35 @@ class VariableStrokeTool(SelectTool):
             return
         drag = self._drag
         loc = self.editViewController().graphicView().getActiveLocation_(event)
+        if drag.get('kind') == 'corner-bezier':
+            initial, start = drag['initial'], drag['start']
+            index = (0 if drag['side'] == 'left' else 2) + (0 if drag['incoming'] else 1)
+            delta = (loc.x-start[0], loc.y-start[1])
+            tangent = drag['tangent']
+            if tangent is not None and not (NSEvent.modifierFlags() & NSEventModifierFlagOption):
+                distance = delta[0]*tangent[0] + delta[1]*tangent[1]
+                delta = (distance*tangent[0], distance*tangent[1])
+            drag['node'].userData[CORNER_HANDLE_KEYS[index]] = [
+                round(initial[0] + delta[0], 2),
+                round(initial[1] + delta[1], 2)]
+            _invalidate(drag['layer'], [drag['path']])
+            self._redraw()
+            return
+        if drag.get('kind') == 'corner-offset':
+            initial = drag['initial']
+            start = drag['start']
+            delta = (loc.x-start[0], loc.y-start[1])
+            direction = drag['line_direction']
+            if direction is not None and not (NSEvent.modifierFlags() & NSEventModifierFlagOption):
+                distance = delta[0]*direction[0] + delta[1]*direction[1]
+                delta = (distance*direction[0], distance*direction[1])
+            value = [round(initial[0] + delta[0], 2),
+                     round(initial[1] + delta[1], 2)]
+            key = CORNER_OFFSET_LEFT_KEY if drag['side'] == 'left' else CORNER_OFFSET_RIGHT_KEY
+            drag['node'].userData[key] = value
+            _invalidate(drag['layer'], [drag['path']])
+            self._redraw()
+            return
         if drag.get('kind') == 'cap-curve':
             widget = drag['widget']
             coordinates = cap_curve_coordinates(

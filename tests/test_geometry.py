@@ -4,11 +4,45 @@ import unittest
 from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from variable_stroke_core import (outline, outline_curves, node_edges, nib_edges,
+                                  move_outline_vertices, outline_direction_at_vertex,
                                   cap_curve_geometry, cap_curve_coordinates,
                                   _Side, _join, sub, unit, length, cubic)
 
 
 class GeometryTests(unittest.TestCase):
+    def test_corner_slide_uses_line_before_curve_and_curve_handle_otherwise(self):
+        point = (10, 10)
+        curve = ('cubic', ((0, 0), (2, 8), (8, 6), point))
+        line = ('line', (point, (20, 10)))
+        direction = outline_direction_at_vertex([[curve]], point)
+        self.assertAlmostEqual(direction[0], 1 / math.sqrt(5))
+        self.assertAlmostEqual(direction[1], 2 / math.sqrt(5))
+        direction = outline_direction_at_vertex([[curve, line]], point)
+        self.assertEqual(direction, (1.0, 0.0))
+
+    def test_moving_bezier_corner_preserves_its_handle_direction(self):
+        curve = ('cubic', ((0, 0), (2, 8), (8, 6), (10, 10)))
+        moved = move_outline_vertices([[curve]], {0: ((10, 10), (50, 50))},
+                                      {0: ((-3, 4), (0, 0))})[0][0][1]
+        self.assertEqual(moved[-1], (7, 14))
+        self.assertEqual(moved[-2], (5, 10))
+        self.assertEqual(sub(moved[-1], moved[-2]),
+                         sub(curve[1][-1], curve[1][-2]))
+
+    def test_corner_offset_moves_one_outline_vertex_without_changing_structure(self):
+        segments = [('line', ((0, 0), (100, 0)), 20, 20),
+                    ('line', ((100, 0), (100, 100)), 20, 20)]
+        edges = {}
+        original = outline_curves(segments, edges=edges)
+        target = edges[1][0]
+        moved = move_outline_vertices(original, edges, {1: ((-25, -10), (0, 0))})
+        self.assertEqual(edges[1][0], (target[0]-25, target[1]-10))
+        self.assertEqual([piece[0] for piece in moved[0]],
+                         [piece[0] for piece in original[0]])
+        for before, after in zip(moved[0], moved[0][1:] + moved[0][:1]):
+            self.assertEqual(before[1][-1], after[1][0])
+        self.assertIn(edges[1][0], [piece[1][0] for piece in moved[0]])
+
     def test_editable_cubic_caps_keep_endpoints_and_allow_concave_shape(self):
         segments = [('line', ((0, 0), (0, 100)), 20, 20)]
         settings = ((0.6, -0.5), (-0.4, -0.3))
