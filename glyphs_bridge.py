@@ -622,6 +622,9 @@ def _layer_of(path):
         return None
 
 
+_BOOKKEEPING = [0]  # writes made under _without_undo (see virtual_nodes)
+
+
 @contextlib.contextmanager
 def _without_undo(layer):
     """Bookkeeping written while drawing (anchor ids, the layer's copies of the
@@ -633,6 +636,7 @@ def _without_undo(layer):
         manager = None
     if manager is not None:
         manager.disableUndoRegistration()
+    _BOOKKEEPING[0] += 1
     try:
         yield
     finally:
@@ -640,13 +644,22 @@ def _without_undo(layer):
             manager.enableUndoRegistration()
 
 
-def _kept_sections(layer):
-    """{path id: JSON of its sections} kept on a layer (see virtual_nodes)."""
+def _kept_store(layer):
+    """The layer's own object holding the kept sections (see _kept_sections)."""
     try:
-        kept = layer.userData.get(VIRTUAL_STORE_KEY) if layer is not None else None
+        return layer.userData.get(VIRTUAL_STORE_KEY) if layer is not None else None
     except (AttributeError, TypeError):
         return None
-    return {str(key): str(value) for key, value in dict(kept or {}).items()}
+
+
+def _kept_sections(layer, store=None):
+    """{path id: JSON of its sections} kept on a layer (see virtual_nodes)."""
+    if store is None:
+        store = _kept_store(layer)
+    try:
+        return {str(key): str(value) for key, value in dict(store or {}).items()}
+    except (AttributeError, TypeError, ValueError):
+        return None
 
 
 _PARSED_SECTIONS = collections.OrderedDict()  # kept JSON -> [(entry, start, end)]
@@ -691,6 +704,15 @@ def _joined_sections(path, layer, kept, owner, anchor_ids):
     return found
 
 
+# Results of virtual_nodes by what they were read from: every redraw asks
+# for each stroke's sections, also on the copies Glyphs prepares for every
+# preview, and turning the stored values into Python (the path's attributes,
+# the layer's kept copies) and normalizing them costs more than the outline
+# it then finds cached. Their description, built by Foundation in one call,
+# tells whether they changed.
+_VIRTUAL_RESULTS = collections.OrderedDict()
+
+
 def virtual_nodes(path, segment_count=None, items=None):
     """Normalized sections, following their original segment across node edits.
 
@@ -712,7 +734,42 @@ def virtual_nodes(path, segment_count=None, items=None):
     on_curve_items = _on_curve(items, closed)
     anchor_ids = [item[3].get(VIRTUAL_ANCHOR_KEY) for item in on_curve_items]
     layer = _layer_of(path)
-    kept = _kept_sections(layer) if raw or any(anchor_ids) else None
+    if not raw and not any(anchor_ids):
+        return []
+    store = _kept_store(layer)
+    key = (_described(raw), _described(store), owner, tuple(anchor_ids), segment_count,
+           closed)
+    cached = _VIRTUAL_RESULTS.get(key)
+    if cached is not None:
+        if PROFILE.enabled:
+            PROFILE.add('    virtual nodes: reused', 0.0)
+        return [dict(spec) for spec in cached]
+    writes = _BOOKKEEPING[0]
+    result = _virtual_nodes(path, raw, owner, items, closed, on_curve_items, anchor_ids,
+                            layer, _kept_sections(layer, store), segment_count)
+    if _BOOKKEEPING[0] != writes:
+        # It bound anchors or kept a copy: the same values on another path
+        # (a duplicate) need that too, so only a quiet read is reused.
+        return result
+    with _CACHE_LOCK:
+        _VIRTUAL_RESULTS[key] = [dict(spec) for spec in result]
+        while len(_VIRTUAL_RESULTS) > _CACHE_SIZE:
+            _VIRTUAL_RESULTS.popitem(last=False)
+    return result
+
+
+def _described(value):
+    """Text that changes with a stored value's contents (see _VIRTUAL_RESULTS)."""
+    if value is None:
+        return None
+    try:
+        return str(value.description())
+    except AttributeError:  # a Python value (tests, values set in this session)
+        return repr(value)
+
+
+def _virtual_nodes(path, raw, owner, items, closed, on_curve_items, anchor_ids, layer, kept,
+                   segment_count):
     saved = list(raw)
     changed = False
     adopted = set()

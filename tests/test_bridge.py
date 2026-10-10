@@ -398,6 +398,23 @@ class BridgeTests(unittest.TestCase):
         copy.parent = first.parent
         self.assertEqual(bridge.virtual_nodes(copy, items=bridge.path_nodes(copy)), [])
 
+    def test_virtual_nodes_are_reused_until_their_values_change(self):
+        path = self.column(2)
+        path.attributes[bridge.VIRTUAL_KEY] = [self.scaling_spec('whole', 50)]
+        bridge.virtual_nodes(path)  # binds anchors, keeps a copy
+        first = bridge.virtual_nodes(path)
+        bridge.PROFILE.enabled = True
+        bridge.PROFILE.reset()
+        try:
+            self.assertEqual(bridge.virtual_nodes(path), first)
+            self.assertIn('    virtual nodes: reused', bridge.PROFILE.report())
+        finally:
+            bridge.PROFILE.enabled = False
+        changed = [dict(path.attributes[bridge.VIRTUAL_KEY][0])]
+        changed[0]['before'] = {'left': 70.0, 'right': 70.0}
+        path.attributes[bridge.VIRTUAL_KEY] = changed
+        self.assertEqual(bridge.virtual_nodes(path)[0]['before']['left'], 70.0)
+
     def test_virtual_bookkeeping_is_not_an_undo_step(self):
         recorded = []
 

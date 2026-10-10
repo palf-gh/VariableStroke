@@ -742,7 +742,11 @@ class VariableStrokeLayerProcessor(NSObject):
 
     def stemThicknessOutlineRequest_(self, notification):
         """Give the reporter an expanded copy while keeping the editable centerlines."""
-        request = notification.object()
+        with PROFILE.section('stem thickness outline request'):
+            self._stem_thickness_outline(notification.object())
+
+    @objc.python_method
+    def _stem_thickness_outline(self, request):
         try:
             source = request.objectForKey_('layer')
             state = _glyph_state(source)
