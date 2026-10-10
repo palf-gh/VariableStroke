@@ -6,8 +6,10 @@ import threading
 import time
 import uuid
 from GlyphsApp import GSPath, GSNode, LINE, CURVE, OFFCURVE
-from variable_stroke_core import (outline_curves, ellipse_nib_edges, sub, move_outline_vertices,
+from variable_stroke_core import (outline_curves, ellipse_nib_edges, sub, add, mul,
+                                  move_outline_vertices,
                                   outline_direction_at_vertex, DEFAULT_CAP_CURVE)
+import width_profile
 
 PATH_KEY = 'com.codex.VariableStroke.enabled'
 # Legacy absolute node width; converted to STROKE_WIDTH_KEY x SCALE_KEY on edit.
@@ -59,6 +61,12 @@ CAP_START_CURVE_KEY = 'com.codex.VariableStroke.capStartCurve'
 CAP_END_CURVE_KEY = 'com.codex.VariableStroke.capEndCurve'
 CAP_START_CURVE_ON_KEY = 'com.codex.VariableStroke.capStartCurveOn'
 CAP_END_CURVE_ON_KEY = 'com.codex.VariableStroke.capEndCurveOn'
+# Width profiles (see width_profile): the font's library {id: profile} and, per
+# path, the id of the profile it uses. Interpolated layers cannot reach their
+# font, so they carry the profile itself.
+FONT_PROFILES_KEY = 'com.codex.VariableStroke.profiles'
+PROFILE_KEY = 'com.codex.VariableStroke.profile'
+PROFILE_DATA_KEY = 'com.codex.VariableStroke.profileData'
 DEFAULT_CUT_ANGLE = 45.0
 EXPORT_FILTER = 'VariableStrokeExport'
 DEFAULT_WIDTH = 40.0
@@ -80,7 +88,7 @@ LEGACY_HAIRLINE_KEY = 'com.codex.VariableStroke.hairline'
 # Path attributes that define the stroke (copied onto interpolated layers).
 _STROKE_ATTRIBUTES = (PATH_KEY, CAP_START_KEY, CAP_END_KEY, CAP_START_ANGLE_KEY,
                       CAP_END_ANGLE_KEY, CAP_START_CURVE_KEY, CAP_END_CURVE_KEY,
-                      CAP_START_CURVE_ON_KEY, CAP_END_CURVE_ON_KEY)
+                      CAP_START_CURVE_ON_KEY, CAP_END_CURVE_ON_KEY, PROFILE_KEY)
 
 # Outline geometry is recomputed constantly (Glyphs' preview, handle drawing,
 # hit tests) for unchanged input, so results are kept by their exact input.
@@ -691,7 +699,21 @@ def expanded_virtual_segments(segments, specs, corners=None, closed=False):
     result = []
     breaks = {'left': set(), 'right': set()}
     smooths, expanded_corners, node_map = set(), [], []
-    for index, (kind, pts, e0, e1) in enumerate(segments):
+    for index, segment in enumerate(segments):
+        kind, pts, e0, e1 = segment[:4]
+        modulation = segment[4] if len(segment) > 4 else None
+        if modulation is not None:
+            table = _stroke_length_tables([segment])[0][0]
+
+            def progress_at(t, table=table, modulation=modulation):
+                share = _length_at(table, t)/table[-1] if table[-1] > 1e-9 else t
+                return modulation[1] + (modulation[2]-modulation[1])*share
+
+        def piece(points, nib0, nib1, t0, t1):
+            if modulation is None:
+                return (kind, points, nib0, nib1)
+            return (kind, points, nib0, nib1,
+                    (modulation[0], progress_at(t0), progress_at(t1)))
         current_pts, start_t, current_nib = pts, 0.0, e0
         source_specs = sorted(by_segment[index], key=lambda item: item['t'])
         for spec in source_specs:
@@ -710,7 +732,7 @@ def expanded_virtual_segments(segments, specs, corners=None, closed=False):
             before = _virtual_nib(base, spec['before'], axis)
             after = _virtual_nib(base, spec['after'] if spec['mode'] == 'step'
                                  else spec['before'], axis)
-            result.append((kind, first, current_nib, before))
+            result.append(piece(first, current_nib, before, start_t, t))
             expanded_corners.append(corners[index] if corners and start_t == 0 else None)
             node_map.append(index if start_t == 0 else None)
             if spec['mode'] == 'step':
@@ -720,7 +742,7 @@ def expanded_virtual_segments(segments, specs, corners=None, closed=False):
             else:
                 smooths.add(len(result)-1)
             current_nib, start_t = after, t
-        result.append((kind, current_pts, current_nib, e1))
+        result.append(piece(current_pts, current_nib, e1, start_t, 1.0))
         expanded_corners.append(corners[index] if corners and start_t == 0 else None)
         node_map.append(index if start_t == 0 else None)
     if not closed:
@@ -729,18 +751,296 @@ def expanded_virtual_segments(segments, specs, corners=None, closed=False):
     return result, breaks, smooths, expanded_corners, node_map
 
 
+# Width profiles ------------------------------------------------------------
+# A font's profiles are read from its userData once and kept here by font, as
+# outlines are computed for every redraw. set_profiles() writes and refreshes.
+_PROFILE_LIBRARIES = {}
+# Every profile seen, by id (uuids, unique across fonts): instances and other
+# interpolated layers belong to glyph copies that cannot reach their font.
+_PROFILES_BY_ID = {}
+_PROFILE_SEARCHED = set()  # ids looked for in every open font without success
+
+
+def _font_key(font):
+    try:
+        import objc
+        return objc.pyobjc_id(font)
+    except Exception:
+        return id(font)
+
+
+def font_of(item):
+    """The font a path, layer or glyph belongs to, or None."""
+    for _ in range(4):
+        if item is None:
+            return None
+        if hasattr(item, 'glyphs') and hasattr(item, 'masters'):
+            return item
+        item = getattr(item, 'parent', None)
+    return None
+
+
+def _plain(value):
+    """Plist data from Glyphs (NSDictionary, NSArray, NSNumber) as plain Python."""
+    if isinstance(value, str):
+        return str(value)
+    if hasattr(value, 'keys'):
+        return {str(key): _plain(value[key]) for key in value.keys()}
+    if isinstance(value, (list, tuple)) or hasattr(value, 'count') and \
+            hasattr(value, 'objectAtIndex_'):
+        return [_plain(item) for item in value]
+    return value
+
+
+def profiles(font):
+    """{id: profile} of the font's width profiles (see width_profile)."""
+    if font is None:
+        return {}
+    key = _font_key(font)
+    library = _PROFILE_LIBRARIES.get(key)
+    if library is None:
+        library = {}
+        try:
+            raw = font.userData.get(FONT_PROFILES_KEY)
+        except Exception:
+            raw = None
+        for profile_id, data in (_plain(raw) or {}).items():
+            profile = width_profile.normalize(data)
+            if profile is not None:
+                library[str(profile_id)] = profile
+        _PROFILE_LIBRARIES[key] = library
+        _PROFILES_BY_ID.update(library)
+    return library
+
+
+def _saved_profile(profile):
+    data = {'name': profile['name'], 'points': [list(point) for point in profile['points']]}
+    if profile.get('divisions') is not None:
+        data['divisions'] = profile['divisions']
+    return data
+
+
+def set_profiles(font, library):
+    """Save the font's width profiles {id: profile}."""
+    library = {str(key): width_profile.normalize(value) for key, value in library.items()}
+    for removed in set(profiles(font)) - set(library):
+        _PROFILES_BY_ID.pop(removed, None)
+    font.userData[FONT_PROFILES_KEY] = {key: _saved_profile(value)
+                                        for key, value in library.items()}
+    _PROFILE_LIBRARIES[_font_key(font)] = library
+    _PROFILES_BY_ID.update(library)
+    _PROFILE_SEARCHED.clear()
+
+
+def preview_profile(font, pid, profile):
+    """Draw strokes with `profile` as `pid` until set_profiles or forget_profiles,
+    without saving it (an editor drag in progress)."""
+    library = dict(profiles(font))
+    library[str(pid)] = width_profile.normalize(profile)
+    _PROFILE_LIBRARIES[_font_key(font)] = library
+    _PROFILES_BY_ID[str(pid)] = library[str(pid)]
+
+
+def forget_profiles(font=None):
+    if font is None:
+        _PROFILE_LIBRARIES.clear()
+        _PROFILES_BY_ID.clear()
+    else:
+        _PROFILE_LIBRARIES.pop(_font_key(font), None)
+    _PROFILE_SEARCHED.clear()
+
+
+def _profile_anywhere(pid):
+    """A profile by id when the path's own font is out of reach."""
+    profile = _PROFILES_BY_ID.get(pid)
+    if profile is not None or pid in _PROFILE_SEARCHED:
+        return profile
+    try:
+        from GlyphsApp import Glyphs
+        fonts = list(Glyphs.fonts)
+    except Exception:
+        fonts = []
+    for font in fonts:
+        profiles(font)
+    profile = _PROFILES_BY_ID.get(pid)
+    if profile is None:
+        _PROFILE_SEARCHED.add(pid)
+    return profile
+
+
+def profile_id(path):
+    try:
+        value = path.attributes.get(PROFILE_KEY)
+    except (AttributeError, TypeError):
+        return None
+    return str(value) if value else None
+
+
+def path_profile(path):
+    """The width profile a stroke uses, or None. A profile id the font does not
+    know (deleted) means none; the id stays so undo can bring it back."""
+    pid = profile_id(path)
+    if pid is None:
+        return None
+    try:
+        data = path.attributes.get(PROFILE_DATA_KEY)
+    except (AttributeError, TypeError):
+        data = None
+    if data:
+        return width_profile.normalize(_plain(data))
+    # Instances belong to glyph copies or interpolated fonts that may not reach
+    # (or carry) the font's profiles: look the id up among all of them.
+    font = font_of(path)
+    profile = profiles(font).get(pid) if font is not None else None
+    return profile if profile is not None else _profile_anywhere(pid)
+
+
+def profile_name(path):
+    profile = path_profile(path)
+    return None if profile is None else (profile['name'] or '?')
+
+
+def profile_users(font, pid):
+    """Layers of the font with a stroke using profile `pid`."""
+    result = []
+    for glyph in list(font.glyphs):
+        if not glyph_enabled(glyph):
+            continue
+        for layer in list(glyph.layers):
+            if any(profile_id(path) == pid for path in list(layer.paths)):
+                result.append(layer)
+    return result
+
+
+def profile_node_factors(path, items=None):
+    """{index in path_nodes: thickness factor} of a stroke's on-curve nodes from
+    its width profile (1.0 everywhere without one)."""
+    items = path_nodes(path) if items is None else items
+    on_curve = [index for index, item in enumerate(items) if item[1] != OFFCURVE]
+    profile = path_profile(path)
+    if profile is None:
+        return {index: 1.0 for index in on_curve}
+    segments = segments_for_path(path, items=items)
+    if not segments:
+        return {index: 1.0 for index in on_curve}
+    _, totals = _stroke_length_tables(segments)
+    closed = bool(path.closed)
+    first = on_curve[0]
+    ordered = on_curve[on_curve.index(first):]  # segments_for_path starts here
+    result = {}
+    for position, index in enumerate(ordered):
+        progress = totals[position]/totals[-1] if totals[-1] > 1e-9 else \
+            position/float(max(1, len(segments)))
+        result[index] = width_profile.evaluate(profile, progress*100.0) / 100.0
+    if closed and ordered:
+        result[ordered[0]] = width_profile.evaluate(profile, 0.0) / 100.0
+    return result
+
+
+def apply_profile(segments, specs, profile, closed=False):
+    """Bake a width profile into centerline segments and virtual specs.
+
+    The profile is a factor over the stroke's length. Each node's nib is scaled
+    by its value there, and every segment gets the same number of smooth
+    sections (width_profile.divisions), placed evenly along its length, that
+    carry the profile between nodes. The count depends on the profile alone, so
+    masters keep compatible outlines whatever their segment lengths. Virtual
+    nodes' percentages are relative to the straight blend of their segment's end
+    nibs, so theirs and the new sections' are corrected for that blend.
+    """
+    if profile is None or not segments:
+        return segments, specs
+    tables, totals = _stroke_length_tables(segments)
+    total = totals[-1]
+    count = len(segments)
+
+    def progress(index, distance):
+        if total < 1e-9:
+            return (index + (distance/tables[index][-1] if tables[index][-1] > 1e-9 else 0.0)) \
+                / float(count)
+        return (totals[index] + distance) / total
+
+    def factor(value):
+        return width_profile.evaluate(profile, value*100.0) / 100.0
+
+    ends = [(factor(progress(index, 0.0)), factor(progress(index, tables[index][-1])))
+            for index in range(count)]
+
+    def scaled(nib, value):
+        nib = tuple(nib) if isinstance(nib, (tuple, list)) else (nib,)
+        width = nib[0] * value
+        height = (nib[1] if len(nib) > 1 and nib[1] is not None else nib[0]) * value
+        return (width, height) + nib[2:]
+
+    flat = width_profile.is_flat(profile)
+    key = tuple(tuple(point) for point in profile['points'])
+    result = []
+    for index, (kind, pts, e0, e1) in enumerate(segments):
+        if kind == 'line' and not flat:
+            # The profile bends a straight stroke's edges: fit them as curves.
+            kind, pts = 'cubic', (pts[0], add(mul(pts[0], 2/3.0), mul(pts[1], 1/3.0)),
+                                  add(mul(pts[0], 1/3.0), mul(pts[1], 2/3.0)), pts[1])
+        segment = (kind, pts, scaled(e0, ends[index][0]), scaled(e1, ends[index][1]))
+        if not flat:
+            segment += ((key, progress(index, 0.0), progress(index, tables[index][-1])),)
+        result.append(segment)
+
+    def ratio(index, t):
+        f0, f1 = ends[index]
+        base = f0*(1-t) + f1*t
+        return factor(progress(index, _length_at(tables[index], t))) / max(base, 1e-9)
+
+    corrected = []
+    for spec in specs:
+        spec = dict(spec)
+        r = ratio(spec['segment'], spec['t'])
+        for end in ('before', 'after'):
+            spec[end] = {side: value*r for side, value in spec[end].items()}
+        corrected.append(spec)
+    sections = width_profile.divisions(profile)
+    taken = collections.defaultdict(list)
+    for spec in specs:
+        taken[spec['segment']].append(spec['t'])
+    for index in range(count):
+        length = tables[index][-1]
+        for j in range(1, sections+1):
+            t = _t_at_length(tables[index], length*j/float(sections+1)) if length > 1e-9 \
+                else j/float(sections+1)
+            t = max(0.006, min(0.994, t))
+            for other in taken[index]:  # a virtual node there would swallow it
+                if abs(other - t) < 0.003:
+                    t = other + (0.003 if t >= other else -0.003)
+            percent = 100.0 * ratio(index, t)
+            corrected.append({
+                'id': '~profile-%d-%d' % (index, j), 'segment': index, 't': t,
+                'mode': 'continuous', 'side': 'both', 'direction': 'normal',
+                'angle': 0.0, 'linked': True,
+                'before': {'left': percent, 'right': percent},
+                'after': {'left': percent, 'right': percent}})
+    corrected.sort(key=lambda spec: (spec['segment'], spec['t'], spec['id']))
+    return result, corrected
+
+
 def virtual_widgets(path, defaults=None):
     """Canvas positions for virtual sections, using the same nibs as expansion."""
     from variable_stroke_core import _nib, _derivative, unit, nib_edges, normal
     segments = segments_for_path(path, defaults)
+    specs = virtual_nodes(path, len(segments))
+    # A width profile scales the stroke around each virtual node: its 100 % is
+    # the profiled width there (see apply_profile).
+    segments, profiled = apply_profile(segments, specs, path_profile(path), bool(path.closed))
+    factors = {spec['id']: spec['before']['left'] for spec in profiled}
     widgets = []
-    for spec in virtual_nodes(path, len(segments)):
-        kind, pts, e0, e1 = segments[spec['segment']]
+    for spec in specs:
+        kind, pts, e0, e1 = segments[spec['segment']][:4]
         t = spec['t']
         center = virtual_point((kind, pts), t)
         tangent = unit(_derivative(kind, pts, t))
         n0, n1 = _nib(e0), _nib(e1)
+        factor = factors.get(spec['id'], spec['before']['left']) / spec['before']['left']
         values = [n0[j]*(1-t)+n1[j]*t for j in range(3)]
+        values[0] *= factor
+        values[1] *= factor
         turn = (n1[3]-n0[3]+90.0) % 180.0-90.0
         base = tuple(values + [n0[3]+turn*t])
         angle = _virtual_section_angle(spec, tangent)
@@ -948,7 +1248,8 @@ def _stroke_length_tables(segments):
     """Cumulative centerline lengths, with samples for Bézier distance mapping."""
     from variable_stroke_core import cubic, length
     tables, totals = [], [0.0]
-    for kind, points, _, _ in segments:
+    for segment in segments:
+        kind, points = segment[:2]
         samples = [points[0]] + [
             (points[0][0]*(1-i/32.0)+points[1][0]*i/32.0,
              points[0][1]*(1-i/32.0)+points[1][1]*i/32.0)
@@ -1074,6 +1375,10 @@ def copy_stroke_settings(source, target):
         else:
             _pop(attributes, key)
     attributes[VIRTUAL_KEY] = virtuals
+    if profile_id(source):
+        attributes[PROFILE_KEY] = profile_id(source)
+    else:
+        _pop(attributes, PROFILE_KEY)
     corner_keys = (CORNER_ON_KEY, CORNER_KEY, CORNER_INNER_KEY,
                    CORNER_TENSION_KEY, CORNER_INNER_TENSION_KEY,
                    CORNER_RATIO_KEY, CORNER_INNER_RATIO_KEY)
@@ -1282,6 +1587,9 @@ def _outline(path, defaults, items):
                           cap_curve_of(path, True) if cap_curve_enabled(path, True) else None)
         with PROFILE.section('  inputs: virtual nodes'):
             specs = virtual_nodes(path, len(source_segments), items)
+        with PROFILE.section('  inputs: width profile'):
+            source_segments, specs = apply_profile(source_segments, specs,
+                                                   path_profile(path), bool(path.closed))
         with PROFILE.section('  inputs: corners'):
             source_corners = corner_specs(path, items)
         source_offsets = [(corner_offset_of(data, 'left'), corner_offset_of(data, 'right'))
@@ -1914,7 +2222,7 @@ def _source_record(glyph, layer_id, glyph_key=None):
                 'attributes': {name: attributes[name] for name in _STROKE_ATTRIBUTES
                                if attributes.get(name) is not None},
                 'cap_curves': (cap_curve_of(path, False), cap_curve_of(path, True)),
-                'virtual': virtual_nodes(path)})
+                'virtual': virtual_nodes(path), 'profile': path_profile(path)})
         record = {'id': str(layer_id), 'defaults': layer_defaults(source), 'paths': paths}
     if key is not None:
         _remember(_SOURCE_OUTLINES, _SOURCE_OUTLINES_SIZE, key, record)
@@ -1962,6 +2270,11 @@ def _interpolate_layer(layer, glyph, interpolation, glyph_key=None):
             path.attributes[BLEND_KEY] = ''  # copied from a source: not this blend
         for key, value in template['attributes'].items():
             path.attributes[key] = value
+        if template['profile'] is not None:  # the instance cannot reach the font
+            path.attributes[PROFILE_DATA_KEY] = _saved_profile(template['profile'])
+        else:
+            _pop(path.attributes, PROFILE_KEY)
+            _pop(path.attributes, PROFILE_DATA_KEY)
         for at_end, curve_key in ((False, CAP_START_CURVE_KEY),
                                   (True, CAP_END_CURVE_KEY)):
             if cap_curve_enabled(path, at_end):
@@ -2212,6 +2525,11 @@ def _mismatch_reasons(entries, names):
         curves = [cap_curve_enabled(path, at_end) for path, _ in entries]
         if len(set(curves)) > 1:
             reasons.append(('cap curve', end, _groups(curves, names)))
+    profiled = [width_profile.divisions(profile) if profile is not None else None
+                for profile in (path_profile(path) for path, _ in entries)]
+    if len(set(profiled)) > 1:
+        values = [profile_name(path) for path, _ in entries]
+        reasons.append(('profile', None, _groups(values, names)))
     layouts = [_virtual_layout(path, items) for path, items in entries]
     if len({len(layout) for layout in layouts}) == 1:
         for segment in range(len(layouts[0])):
@@ -2294,6 +2612,8 @@ def _describe_value(kind, value, pick):
         return 'ON' if value else 'OFF'
     if kind == 'cap shape':
         return _CAP_LABELS.get(value, (value, value))[pick]
+    if kind == 'profile':
+        return value or ('none', 'なし')[pick]
     if kind == 'virtual':
         if not value:
             return ('none', 'なし')[pick]
@@ -2314,6 +2634,7 @@ def describe_incompatibility(entry, japanese=False):
              'cap shape': ('Cap shape', '線端の形'),
              'corner': ('Live corner', 'ライブコーナー'),
              'virtual': ('Virtual nodes', '仮想ノード'),
+             'profile': ('Width profile', '線幅プロファイル'),
              'outline': ('Outline structure', '輪郭構成')}
     ends = {'start': ('start', '始点'), 'end': ('end', '終点')}
     lines = [('Masters incompatible', 'マスター非互換')[pick] +

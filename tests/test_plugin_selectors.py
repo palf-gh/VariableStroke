@@ -69,7 +69,8 @@ class SelectorTests(unittest.TestCase):
                       and node.name == '_refresh_ui')
         method = ast.FunctionDef(name=method.name, args=method.args, body=method.body,
                                  decorator_list=[], returns=None)
-        namespace = {}
+        namespace = {'profiles': lambda font: {}, 'sorted_profiles': lambda library: [],
+                     'profile_id': lambda path: None}
         exec(compile(ast.fix_missing_locations(ast.Module(body=[method], type_ignores=[])),
                      str(PLUGIN), 'exec'), namespace)
 
@@ -83,7 +84,8 @@ class SelectorTests(unittest.TestCase):
             _sample_error = ''
             _fields = {}
             infoBoxWindow = types.SimpleNamespace(group=types.SimpleNamespace(
-                virtualTab='virtual', nodeTab='node', capsTab='caps', cornerTab='corner'))
+                virtualTab='virtual', nodeTab='node', capsTab='caps', cornerTab='corner',
+                profileTab='profile'))
 
             def __init__(self, tab):
                 self._tab = tab
@@ -97,8 +99,10 @@ class SelectorTests(unittest.TestCase):
             def _show_node_tab(self, *args): self.called.append(('node', len(args)))
             def _show_caps_tab(self, *args): self.called.append(('caps', len(args)))
             def _show_corner_tab(self, *args): self.called.append(('corner', len(args)))
+            def _show_profile_tab(self, *args): self.called.append(('profile', len(args)))
 
-        for tab, argc in (('virtual', 3), ('node', 3), ('caps', 3), ('corner', 4)):
+        for tab, argc in (('virtual', 3), ('node', 3), ('caps', 3), ('corner', 4),
+                          ('profile', 4)):
             with self.subTest(tab=tab):
                 inspector = Inspector(tab)
                 namespace['_refresh_ui'](inspector)
@@ -402,7 +406,7 @@ class SelectorTests(unittest.TestCase):
     def test_panel_has_distinct_on_off_controls(self):
         source = PLUGIN.read_text()
         self.assertIn('InspectorGroup(', source)
-        self.assertIn('PANEL_SIZE = (545, 105)', source)
+        self.assertIn('PANEL_SIZE = (600, 105)', source)
         for control in ('radiusLink', 'tensionLink', 'ratioLink'):
             self.assertIn('corner.' + control + ' = ImageButton(', source)
         self.assertIn('setTranslatesAutoresizingMaskIntoConstraints_(False)', source)
@@ -432,6 +436,8 @@ class SelectorTests(unittest.TestCase):
         self.assertIn('group.capsTab = Group((0, TAB_TOP, -0, 48))', source)
         self.assertIn('group.virtualTab = Group((0, TAB_TOP, -0, 72))', source)
         self.assertIn("('virtual', 'Virtual', '仮想')", source)
+        self.assertIn('group.profileTab = Group((0, TAB_TOP, -0, 48))', source)
+        self.assertIn("('profile', 'Profile', 'プロファイル')", source)
 
 
 if __name__ == '__main__':

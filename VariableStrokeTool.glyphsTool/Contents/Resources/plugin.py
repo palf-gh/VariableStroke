@@ -52,6 +52,9 @@ from glyphs_bridge import (CAP_START_KEY, CAP_END_KEY, CAP_START_ANGLE_KEY, CAP_
                            master_incompatibilities, describe_incompatibility)
 from glyphs_bridge import (VIRTUAL_KEY, virtual_nodes, virtual_widgets, virtual_point,
                            segments_for_path, _virtual_section_angle)
+from glyphs_bridge import (PROFILE_KEY as PATH_PROFILE_KEY, profiles, profile_id,
+                           profile_node_factors, forget_profiles)
+from profile_editor import VariableStrokeProfileEditor, fill_popup, sorted_profiles
 from clipboard_export import svg_document, pdf_document
 from variable_stroke_core import (unit, sub, add, length, outline_curves,
                                   cap_curve_coordinates,
@@ -85,10 +88,11 @@ def _inspector_via_callback():
         return False
 PREPARE_LAYER_CALLBACK = 'GSPrepareLayerCallback'
 STEM_THICKNESS_OUTLINE_REQUEST = 'com.codex.VariableStroke.stemThicknessOutlineRequest'
-PANEL_SIZE = (545, 105)
+PANEL_SIZE = (600, 105)
 TAB_TOP = 32  # the tab row, below the stroke row
 TABS = (('node', 'Node', 'ノード'), ('caps', 'Caps', '線端'),
-        ('corner', 'Corners', '角丸'), ('virtual', 'Virtual', '仮想'))
+        ('corner', 'Corners', '角丸'), ('virtual', 'Virtual', '仮想'),
+        ('profile', 'Profile', 'プロファイル'))
 TAB_NAMES = [item[0] for item in TABS]
 TAB_DEFAULTS_KEY = 'com.codex.VariableStroke.inspectorTab'
 # Must be an NSObject, not a Python str. Glyphs already stores GSGlyph / GSAnchor
@@ -1058,6 +1062,8 @@ class VariableStrokeTool(SelectTool):
         self._menu_callback = VariableStrokeContextMenu.new()
         self._layer_processor = VariableStrokeLayerProcessor.new()
         self._settings = None
+        self._profile_editor = None
+        self._profile_ids = []  # popup index -> profile id (None: no profile)
         self._refresh_pending = False
         self._check_pending = False
         self._incompatible = (None, {})  # (glyph id, master_incompatibilities)
@@ -1098,7 +1104,7 @@ class VariableStrokeTool(SelectTool):
                                        bordered=False, callback=self.resetWidthFromInspector_)
         group.eyedropper = ImageButton((239, 5, 18, 18), imageObject=_eyedropper_icon(),
                                        bordered=False, callback=self.sampleFromInspector_)
-        group.tabs = SegmentedButton((width_px - 285, 4, 254, 20),
+        group.tabs = SegmentedButton((width_px - 341, 4, 310, 20),
                                      [{'title': _loc(english, japanese)}
                                       for _, english, japanese in TABS],
                                      callback=self.tabFromInspector_, sizeStyle='small')
@@ -1201,6 +1207,17 @@ class VariableStrokeTool(SelectTool):
         virtual.afterRight = SteppingEditText((314, 47, 48, 19), sizeStyle='small')
         virtual.afterUnit = TextBox((365, 53, 90, 14), _loc('% L / R', '% 左 / 右'), sizeStyle='small')
         virtual.message = TextBox((6, 51, 198, 17), '', sizeStyle='small')
+
+        profile = group.profileTab = Group((0, TAB_TOP, -0, 48))
+        profile.label = TextBox((6, 4, 70, 14), _loc('Profile', 'プロファイル'), sizeStyle='small')
+        profile.popup = PopUpButton((78, 0, 230, 22), [], callback=self.profileFromInspector_,
+                                    sizeStyle='small')
+        profile.edit = Button((314, 0, 80, 20), _loc('Edit…', '編集…'),
+                              callback=self.editProfileFromInspector_, sizeStyle='small')
+        profile.note = TextBox((6, 26, -6, 17), _loc(
+            'Width along the stroke, times the node widths. Shared by every master.',
+            'ストローク全体に沿った太さの倍率（ノードの太さに掛け合わせ）。全マスター共通です。'),
+            sizeStyle='small')
 
         group.widthReset.getNSButton().setToolTip_(
             _loc('Follow the master default width and height', 'マスターの既定の幅・高さに戻す'))
@@ -1401,7 +1418,8 @@ class VariableStrokeTool(SelectTool):
     def _show_tab(self, name):
         group = self.infoBoxWindow.group
         for tab, view in (('node', group.nodeTab), ('caps', group.capsTab),
-                          ('corner', group.cornerTab), ('virtual', group.virtualTab)):
+                          ('corner', group.cornerTab), ('virtual', group.virtualTab),
+                          ('profile', group.profileTab)):
             view.show(tab == name and not self._sampling)
         group.sampleStatus.show(self._sampling)
         group.tabs.set(TAB_NAMES.index(name))
@@ -1705,6 +1723,7 @@ class VariableStrokeTool(SelectTool):
 
     @objc.python_method
     def _on_document_opened(self, notification=None):
+        forget_profiles()  # a new font may reuse a closed one's address
         try:
             self._cleanup_font(notification.object().font)
         except Exception:
@@ -1911,6 +1930,11 @@ class VariableStrokeTool(SelectTool):
                                      else value) for key, value in virtual_spec.items()))
                        if virtual_spec is not None else None,
                        self._virtual_adding, self._virtual_error)
+        elif tab == 'profile':
+            font = layer.parent.parent if layer is not None else None
+            details = (tuple(profile_id(path) for path in paths),
+                       tuple((pid, profile['name'], tuple(map(tuple, profile['points'])))
+                             for pid, profile in sorted_profiles(profiles(font))))
         elif tab == 'caps':
             open_paths = [path for path in paths if not path.closed]
             details = tuple((path.attributes.get(CAP_START_KEY, 'flat'),
@@ -1954,6 +1978,8 @@ class VariableStrokeTool(SelectTool):
                 self._show_virtual_tab(group.virtualTab, editable, virtual_spec)
             elif tab == 'node':
                 self._show_node_tab(group.nodeTab, editable, details)
+            elif tab == 'profile':
+                self._show_profile_tab(group.profileTab, editable, layer, details[0])
             elif tab == 'caps':
                 self._show_caps_tab(group.capsTab, bool(details), details)
             else:
@@ -1984,6 +2010,59 @@ class VariableStrokeTool(SelectTool):
                              (group.heightField, height_overridden)):
             field.getNSTextField().setTextColor_(
                 NSColor.labelColor() if any(flags) else NSColor.secondaryLabelColor())
+
+    @objc.python_method
+    def _show_profile_tab(self, tab, editable, layer, ids):
+        font = layer.parent.parent if layer is not None else None
+        library = profiles(font)
+        known = [pid if pid in library else None for pid in ids]
+        selected = known[0] if known and len(set(known)) == 1 else ''
+        self._profile_ids = fill_popup(tab.popup, sorted_profiles(library), selected,
+                                       _loc('None', 'なし'))
+        tab.popup.enable(editable)
+        tab.edit.enable(font is not None)
+
+    def profileFromInspector_(self, sender):
+        index = sender.get()
+        if self._updating_ui or not 0 <= index < len(self._profile_ids):
+            return
+        self._set_profile(self._profile_ids[index])
+
+    def editProfileFromInspector_(self, sender):
+        layer = self._layer()
+        paths = self._target_paths(layer) if layer is not None else []
+        ids = [profile_id(path) for path in paths]
+        self._show_profile_editor(ids[0] if ids and len(set(ids)) == 1 else None)
+
+    @objc.python_method
+    def _show_profile_editor(self, pid=None):
+        if self._profile_editor is None or not self._profile_editor.is_open():
+            self._profile_editor = VariableStrokeProfileEditor(self)
+        self._profile_editor.open(pid)
+
+    @objc.python_method
+    def _set_profile(self, pid):
+        """Give the target strokes profile `pid` (None: no profile), in every
+        master with the same path, so the masters stay compatible."""
+        layer = self._layer()
+        if layer is None or not glyph_enabled(layer.parent):
+            return
+        for path in self._target_paths(layer):
+            for other_layer, other in self._virtual_siblings(path):
+                if profile_id(other) == pid:
+                    continue
+                other_layer.beginChanges()
+                if pid is None:
+                    if PATH_PROFILE_KEY in other.attributes:
+                        del other.attributes[PATH_PROFILE_KEY]
+                else:
+                    other.attributes[PATH_PROFILE_KEY] = pid
+                other_layer.endChanges()
+                _invalidate(other_layer, [other])
+        forget_interpolations()
+        self._last_ui_state = None
+        self._refresh_ui()
+        self._redraw()
 
     @objc.python_method
     def _show_node_tab(self, tab, editable, details):
@@ -2592,10 +2671,13 @@ class VariableStrokeTool(SelectTool):
             ellipse_ends = set(ellipse_cap_nodes(path, items))
             base_w = stroke_width(path, defaults)
             base_h = stroke_height(path, defaults)
+            factors = profile_node_factors(path, items)
             for index, (node, _, point, data) in enumerate(items):
                 if node not in owners:
                     continue
                 nib = nib_of(data, base_w, base_h, defaults.nib_angle)
+                factor = factors.get(index, 1.0)
+                nib = (nib[0]*factor, nib[1]*factor) + tuple(nib[2:])
                 tangent = self._node_tangent(items, path.closed, index)
                 ellipse_end = node in ellipse_ends
                 left, right = (ellipse_nib_edges if ellipse_end else nib_edges)(
@@ -3121,11 +3203,15 @@ class VariableStrokeTool(SelectTool):
                 self._select_node(layer, node)
                 layer.beginChanges()
                 migrate_path(path)
+                items = path_nodes(path)
+                factor = profile_node_factors(path, items).get(
+                    next((i for i, item in enumerate(items) if item[0] == node), -1), 1.0)
+                # The handle shows the profiled size; the node keeps its own share.
                 self._drag = {'kind': 'nib-size', 'axis': axis, 'layer': layer,
                               'path': path, 'node': node, 'center': origin,
                               'direction': direction,
-                              'base_width': stroke_width(path, defaults),
-                              'base_height': stroke_height(path, defaults)}
+                              'base_width': stroke_width(path, defaults)*factor,
+                              'base_height': stroke_height(path, defaults)*factor}
                 self._select_tab('node')
                 self._last_ui_state = None
                 self._refresh_ui()

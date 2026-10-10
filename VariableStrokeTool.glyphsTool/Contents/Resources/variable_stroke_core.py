@@ -1,6 +1,7 @@
 """Pure geometry for Variable Stroke. Coordinates are Glyphs font units."""
 from __future__ import division
 import math
+import width_profile
 
 CAPS = ('flat', 'round', 'ellipse', 'square', 'horizontal', 'vertical', 'angle', 'curve')
 CUTS = ('horizontal', 'vertical', 'angle')
@@ -536,10 +537,11 @@ def _point_segment_distance(p, a, b):
 class _Side(object):
     """One side (sign +1 left, -1 right) of one centerline segment, trimmable by t."""
 
-    def __init__(self, kind, pts, e0, e1, sign, slant=0.0, shared=None):
+    def __init__(self, kind, pts, e0, e1, sign, slant=0.0, shared=None, modulation=None):
         if kind not in ('line', 'cubic'):
             raise ValueError('Unsupported segment: ' + str(kind))
         self.kind, self.pts, self.sign, self.slant = kind, pts, sign, slant
+        self._modulation = _Modulation(kind, pts, modulation) if modulation else None
         # {t: (left, right)}: both sides of a segment sample the same centerline
         # points, so the pair shares one table (see _side_pair).
         self._edges = {} if shared is None else shared
@@ -556,6 +558,10 @@ class _Side(object):
         # The two axes describe the same ellipse after a 180-degree turn.
         # Interpolating normalized end angles directly (e.g. 179 -> 1)
         # would rotate through 90 degrees and make the outline swell midway.
+        if self._modulation is not None:
+            factor = self._modulation.factor(t)
+            values[0] *= factor
+            values[1] *= factor
         turn = (self.n1[3] - self.n0[3] + 90.0) % 180.0 - 90.0
         return tuple(values + [self.n0[3] + turn*t,
                                self.n0[4]*(1-t) + self.n1[4]*t])
@@ -602,8 +608,8 @@ class _Side(object):
         return limits
 
     def _limited(self, p, edges):
-        if self.kind == 'line':
-            return edges
+        if self.kind == 'line' or self._modulation is not None:
+            return edges  # a width profile shapes the thickness on purpose
         low, high, weight = self._thickness_range()
         thickness = length(sub(edges[0], edges[1]))
         if weight <= 0 or thickness < EPS or low <= thickness <= high:
@@ -736,10 +742,12 @@ class _Side(object):
         # different tilt gradients; using their offset derivatives here makes
         # an otherwise smooth centerline acquire a visible kink.
         p0, p1, p2, p3 = controls
-        if abs(ta) < EPS and (self.smooth_start or abs(self.n0[3]) > EPS):
+        # A width profile turns the edge on purpose; _join matches its handles.
+        modulated = self._modulation is not None
+        if abs(ta) < EPS and ((self.smooth_start and not modulated) or abs(self.n0[3]) > EPS):
             handle = min(max(length(sub(p1, p0)), 0.05*chord), 0.75*chord)
             p1 = add(p0, mul(center0, handle))
-        if abs(tb-1) < EPS and (self.smooth_end or abs(self.n1[3]) > EPS):
+        if abs(tb-1) < EPS and ((self.smooth_end and not modulated) or abs(self.n1[3]) > EPS):
             handle = min(max(length(sub(p3, p2)), 0.05*chord), 0.75*chord)
             p2 = sub(p3, mul(center1, handle))
         return ('cubic', (p0, p1, p2, p3))
@@ -859,11 +867,39 @@ def _fillet_edge(side, controls, samples, d0, d1):
     return fillet(scale)
 
 
-def _side_pair(kind, pts, e0, e1, slant=0.0):
+def _side_pair(kind, pts, e0, e1, slant=0.0, modulation=None):
     """Left and right side of one centerline segment, sharing their samples."""
     shared = {}
-    return (_Side(kind, pts, e0, e1, 1, slant, shared),
-            _Side(kind, pts, e0, e1, -1, slant, shared))
+    return (_Side(kind, pts, e0, e1, 1, slant, shared, modulation),
+            _Side(kind, pts, e0, e1, -1, slant, shared, modulation))
+
+
+class _Modulation(object):
+    """A width profile over one segment: (profile points, start, end), where start
+    and end are the segment's share of the stroke's length (0-1). The segment's end
+    nibs already carry the profile there; between them the straight blend of the
+    nibs is scaled to follow the profile along the segment's length."""
+
+    def __init__(self, kind, pts, modulation):
+        points, self.p0, self.p1 = modulation
+        self.profile = {'points': points}
+        self.f0 = width_profile.evaluate(self.profile, self.p0*100.0)
+        self.f1 = width_profile.evaluate(self.profile, self.p1*100.0)
+        samples = [add(mul(pts[0], 1-i/32.0), mul(pts[1], i/32.0)) if kind == 'line'
+                   else cubic(*pts, i/32.0) for i in range(33)]
+        self.lengths = [0.0]
+        for a, b in zip(samples, samples[1:]):
+            self.lengths.append(self.lengths[-1] + length(sub(b, a)))
+
+    def factor(self, t):
+        position = min(32.0, max(0.0, t*32.0))
+        index = min(31, int(position))
+        distance = self.lengths[index] + (self.lengths[index+1]-self.lengths[index]) * \
+            (position-index)
+        share = distance/self.lengths[-1] if self.lengths[-1] > EPS else t
+        value = width_profile.evaluate(self.profile,
+                                       (self.p0 + (self.p1-self.p0)*share)*100.0)
+        return value / max(self.f0*(1-t) + self.f1*t, EPS)
 
 
 def _nearest_along(samples, curve, window=24):
@@ -998,6 +1034,11 @@ def _join(a, b, width):
         b_piece = b.override_piece or b.piece()
         point = mul(add(a.end, b.start), 0.5)
         direction = unit(add(incoming, outgoing))
+        if a._modulation is not None or b._modulation is not None:
+            # Width profiles turn the edges: share the edges' own direction.
+            edge = add(a.edge_tangent(a.tb), b.edge_tangent(b.ta))
+            if length(edge) > EPS:
+                direction = unit(edge)
         a.end = b.start = point
         # A line side's piece is just start..end. Freezing it here would keep
         # its far end even after the next corner join moves that end.
@@ -1174,10 +1215,14 @@ def _smooth_virtual_join(a, b):
         return
     shared = unit(shared)
     handle = min(first_length, second_length) / 3.0
-    a.override_piece = ('cubic', (p0, add(p0, mul(d0, first_length/3.0)),
-                                   sub(middle, mul(shared, handle)), middle))
-    b.override_piece = ('cubic', (middle, add(middle, mul(shared, handle)),
-                                   sub(p3, mul(d1, second_length/3.0)), p3))
+    # In a run of controls (a width profile) each line is joined at both ends:
+    # keep the handle the other join already gave it, in whichever order.
+    start = a.override_piece[1][1] if a.override_piece and \
+        a.override_piece[0] == 'cubic' else add(p0, mul(d0, first_length/3.0))
+    end = b.override_piece[1][2] if b.override_piece and \
+        b.override_piece[0] == 'cubic' else sub(p3, mul(d1, second_length/3.0))
+    a.override_piece = ('cubic', (p0, start, sub(middle, mul(shared, handle)), middle))
+    b.override_piece = ('cubic', (middle, add(middle, mul(shared, handle)), end, p3))
 
 
 def _normalized_bend(points):
@@ -1399,7 +1444,11 @@ def _cap_on_curve(side, at_end, center, tangent, style, nib, slant, angle=0.0):
         else:
             side.start = point
         if side.override_piece is not None:  # set by a smooth join; keep it in step
-            side.override_piece = ('line', (side.start, side.end))
+            if side.override_piece[0] == 'cubic':  # keep the join's matched handle
+                _, q1, q2, _ = side.override_piece[1]
+                side.override_piece = ('cubic', (side.start, q1, q2, side.end))
+            else:
+                side.override_piece = ('line', (side.start, side.end))
         return True
 
     controls = (side.override_piece or side.piece())[1]
@@ -1728,10 +1777,12 @@ def _independent_outline_curves(left_segments, right_segments, closed, cap_start
 
     def make_sides(segments, sign):
         sides, widths = [], []
-        for kind, pts, e0, e1 in segments:
+        for segment in segments:
+            kind, pts, e0, e1 = segment[:4]
             if all(length(sub(p, pts[0])) < EPS for p in pts):
                 continue
-            side = _Side(kind, pts, e0, e1, sign, slant)
+            side = _Side(kind, pts, e0, e1, sign, slant, None,
+                         segment[4] if len(segment) > 4 else None)
             sides.append(side)
             widths.append(side.extent(1.0))
         return sides, widths
@@ -1883,8 +1934,9 @@ def outline_curves(segments, closed=False, cap_start='flat', cap_end='flat',
                    cap_out=None):
     """Return closed contours of ('line'|'cubic', control points) segments.
 
-    Each segment is (kind, points, start, end) where start/end is a width or a
-    (width, height, offset) nib; see _nib. `italic_angle` (degrees) tilts
+    Each segment is (kind, points, start, end[, modulation]) where start/end is a
+    width or a (width, height, offset) nib; see _nib, and the optional modulation
+    shapes the width between them by a width profile; see _Modulation. `italic_angle` (degrees) tilts
     vertical cuts. `start_angle` / `end_angle` (degrees
     on the page) are the cut directions of 'angle' caps. `corner_radii[i]` is the
     live corner of on-curve node i (segment i starts at node i): None (sharp), a
@@ -1914,10 +1966,12 @@ def outline_curves(segments, closed=False, cap_start='flat', cap_end='flat',
         left_breaks = right_breaks = set(breaks)
     smooth_virtuals = set(smooth_virtuals)
     lefts, rights, widths, indices = [], [], [], []
-    for index, (kind, pts, e0, e1) in enumerate(segments):
+    for index, segment in enumerate(segments):
+        kind, pts, e0, e1 = segment[:4]
         if all(length(sub(p, pts[0])) < EPS for p in pts):
             continue  # zero-length segment
-        left, right = _side_pair(kind, pts, e0, e1, slant)
+        left, right = _side_pair(kind, pts, e0, e1, slant,
+                                 segment[4] if len(segment) > 4 else None)
         lefts.append(left)
         rights.append(right)
         widths.append(lefts[-1].extent(1.0))
