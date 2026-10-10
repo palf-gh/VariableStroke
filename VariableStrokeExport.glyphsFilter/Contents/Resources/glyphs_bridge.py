@@ -1982,8 +1982,59 @@ def corner_widgets(path, defaults=None, items=None):
     return report
 
 
+# _outline results by everything they are read from (see _outline_fingerprint):
+# each redraw asks for every stroke's outline several times over (Glyphs'
+# preview copies, StemThickness, the tool's handles), and gathering its inputs
+# from Glyphs costs more than finding its geometry in _CACHE.
+_OUTLINES = collections.OrderedDict()
+
+
+def _outline_fingerprint(path, defaults, items):
+    """What a stroke's outline is made from, as one hashable value, or None.
+
+    Nodes (positions, types, userData), the path's attributes, the layer's kept
+    virtual sections, the master defaults, the width profile and the live
+    corners (which also depend on the other masters)."""
+    try:
+        attributes = _described(path.attributes)
+        closed = bool(path.closed)
+    except (AttributeError, TypeError):
+        return None
+    nodes = tuple((kind, position, None if data is None else repr(sorted(data.items())))
+                  for _, kind, position, data in items)
+    store = None
+    if VIRTUAL_KEY in attributes or any(data and VIRTUAL_ANCHOR_KEY in data
+                                        for _, _, _, data in items):
+        store = _described(_kept_store(_layer_of(path)))
+    profile = path_profile(path)
+    return (nodes, attributes, store, closed,
+            (defaults.width, defaults.height, defaults.italic_angle, defaults.nib_angle),
+            None if profile is None else repr((profile['points'], profile.get('divisions'))),
+            repr(corner_specs(path, items)))
+
+
 def _outline(path, defaults, items):
     """(segments, cached geometry, original-node map) of a path."""
+    with PROFILE.section('outline inputs (segments, corners)'):
+        with PROFILE.section('  inputs: fingerprint'):
+            fingerprint = _outline_fingerprint(path, defaults, items)
+        found = _OUTLINES.get(fingerprint) if fingerprint is not None else None
+    if found is not None:
+        if PROFILE.enabled:
+            PROFILE.add('    outline inputs: reused', 0.0)
+        return found
+    writes = _BOOKKEEPING[0]
+    result = _gathered_outline(path, defaults, items)
+    if fingerprint is not None and _BOOKKEEPING[0] == writes:
+        # (A run that bound virtual anchors read the path before them.)
+        with _CACHE_LOCK:
+            _OUTLINES[fingerprint] = result
+            while len(_OUTLINES) > _CACHE_SIZE:
+                _OUTLINES.popitem(last=False)
+    return result
+
+
+def _gathered_outline(path, defaults, items):
     with PROFILE.section('outline inputs (segments, corners)'):
         with PROFILE.section('  inputs: segments'):
             source_segments = segments_for_path(path, defaults, items)

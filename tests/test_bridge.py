@@ -415,6 +415,26 @@ class BridgeTests(unittest.TestCase):
         path.attributes[bridge.VIRTUAL_KEY] = changed
         self.assertEqual(bridge.virtual_nodes(path)[0]['before']['left'], 70.0)
 
+    def test_outline_is_reused_until_its_inputs_change(self):
+        path = self.column(2)
+        first = bridge.curves_for_path(path)
+        bridge.PROFILE.enabled = True
+        bridge.PROFILE.reset()
+        try:
+            self.assertEqual(bridge.curves_for_path(path), first)
+            self.assertIn('outline inputs: reused', bridge.PROFILE.report())
+        finally:
+            bridge.PROFILE.enabled = False
+        # Each input changes the outline: node position, node data, attributes.
+        path.nodes[1].position.y = 200
+        self.assertEqual(self.half_widths(path).get(200.0), {10.0})
+        path.nodes[1].userData[bridge.SCALE_KEY] = 50
+        self.assertEqual(self.half_widths(path)[200.0], {5.0})
+        path.attributes[bridge.STROKE_WIDTH_KEY] = 40
+        self.assertEqual(self.half_widths(path)[0.0], {20.0})
+        path.attributes[bridge.VIRTUAL_KEY] = [self.scaling_spec('whole', 50)]
+        self.assertEqual(self.half_widths(path)[0.0], {10.0})
+
     def test_virtual_bookkeeping_is_not_an_undo_step(self):
         recorded = []
 
