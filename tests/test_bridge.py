@@ -321,6 +321,144 @@ class BridgeTests(unittest.TestCase):
         path.nodes.insert(1, removed)
         self.assertEqual(len(bridge.virtual_nodes(path)), 1)
 
+    WIDE_BEFORE = {'left': 100.0, 'right': 100.0}
+    WIDE_AFTER = {'left': 100.0, 'right': 150.0}
+
+    def joinable_strokes(self):
+        """Two open strokes meeting at (0, 100), each with a virtual node at t=0.25."""
+        first = Path([Node(0, 0), Node(0, 100)])
+        second = Path([Node(0, 100), Node(0, 200), Node(0, 300)])
+        for path, name in ((first, 'first'), (second, 'second')):
+            for node in path.nodes:
+                node.userData.clear()
+            spec = self.virtual_spec(t=0.25)
+            spec['id'] = name
+            path.attributes[bridge.VIRTUAL_KEY] = [spec]
+        Layer([first, second])
+        for path in (first, second):
+            bridge.virtual_nodes(path, items=bridge.path_nodes(path))  # bind, keep on the layer
+        return first, second
+
+    @staticmethod
+    def join(survivor, absorbed, nodes):
+        survivor.nodes = nodes
+        survivor.parent.shapes.remove(absorbed)
+
+    def virtual_positions(self, path):
+        segments = bridge.segments_for_path(path)
+        return {spec['id']: (bridge.virtual_point(segments[spec['segment']], spec['t']),
+                             spec['side'], spec['before'], spec['after'])
+                for spec in bridge.virtual_nodes(path, items=bridge.path_nodes(path))}
+
+    def test_virtual_nodes_survive_joining_two_strokes(self):
+        for keep_second_node in (False, True):
+            first, second = self.joinable_strokes()
+            # Glyphs keeps one node where the ends met and only the first path's attributes.
+            self.join(first, second, first.nodes[:1] + second.nodes if keep_second_node
+                      else first.nodes + second.nodes[1:])
+            self.assertEqual(self.virtual_positions(first), {
+                'first': ((0.0, 25.0), 'right', self.WIDE_BEFORE, self.WIDE_AFTER),
+                'second': ((0.0, 125.0), 'right', self.WIDE_BEFORE, self.WIDE_AFTER)})
+            # Saved with the path; the joined stroke's copy is gone from the layer.
+            first.parent.userData.clear()
+            self.assertEqual(len(bridge.virtual_nodes(first)), 2)
+
+    def test_virtual_nodes_follow_a_reversed_stroke_when_joining(self):
+        first, second = self.joinable_strokes()
+        # The joined stroke runs from the second stroke's end, which keeps its attributes.
+        self.join(second, first, second.nodes[::-1] + first.nodes[::-1][1:])
+        # Reversed, the right side is on the left and the step's sides swap.
+        flipped = ('left', {'left': 150.0, 'right': 100.0}, {'left': 100.0, 'right': 100.0})
+        self.assertEqual(self.virtual_positions(second), {
+            'first': ((0.0, 25.0),) + flipped, 'second': ((0.0, 125.0),) + flipped})
+
+    def test_virtual_nodes_survive_closing_a_stroke(self):
+        path = Path([Node(0, 0), Node(100, 0), Node(100, 100), Node(0, 0)])
+        for node in path.nodes:
+            node.userData.clear()
+        spec = self.virtual_spec(t=0.25)
+        spec['segment'] = 2
+        path.attributes[bridge.VIRTUAL_KEY] = [spec]
+        Layer([path])
+        bridge.virtual_nodes(path, items=bridge.path_nodes(path))
+        path.nodes = path.nodes[:3]
+        path.closed = True
+        self.assertEqual(self.virtual_positions(path)['section-a'][0], (75.0, 75.0))
+
+    def test_virtual_nodes_stay_off_node_user_data(self):
+        # Glyphs writes node userData into a fixed-size buffer; long values crash it.
+        first, second = self.joinable_strokes()
+        for node in first.nodes + second.nodes:
+            self.assertEqual(set(node.userData), {bridge.VIRTUAL_ANCHOR_KEY})
+
+    def test_unjoined_duplicate_does_not_take_virtual_nodes(self):
+        first, second = self.joinable_strokes()
+        copy = Path(list(second.nodes))  # shares the anchors, has no sections
+        first.parent.shapes.append(copy)
+        copy.parent = first.parent
+        self.assertEqual(bridge.virtual_nodes(copy, items=bridge.path_nodes(copy)), [])
+
+    def test_virtual_bookkeeping_is_not_an_undo_step(self):
+        recorded = []
+
+        class UndoManager:
+            enabled = True
+
+            def disableUndoRegistration(self):
+                self.enabled = False
+
+            def enableUndoRegistration(self):
+                self.enabled = True
+
+        manager = UndoManager()
+
+        class Recording(dict):
+            def __setitem__(self, key, value):
+                recorded.append((key, manager.enabled))
+                super().__setitem__(key, value)
+
+        path = Path([Node(0, 0), Node(0, 100)])
+        for node in path.nodes:
+            node.userData = Recording()
+        path.attributes = Recording(path.attributes)
+        path.attributes[bridge.VIRTUAL_KEY] = [self.virtual_spec()]
+        layer = Layer([path])
+        layer.userData = Recording()
+        layer.parent = types.SimpleNamespace(undoManager=lambda: manager)
+        del recorded[:]
+        bridge.virtual_nodes(path, items=bridge.path_nodes(path))
+        self.assertTrue(recorded)
+        self.assertEqual([key for key, enabled in recorded if enabled], [])
+        self.assertTrue(manager.enabled)
+
+    def test_pasted_copy_of_a_stroke_gets_its_own_id(self):
+        first, _ = self.joinable_strokes()
+        copy = Path([Node(0, 0), Node(0, 100)])
+        for source, node in zip(first.nodes, copy.nodes):
+            node.userData = dict(source.userData)
+        copy.attributes = {key: value for key, value in first.attributes.items()}
+        copy.attributes[bridge.VIRTUAL_KEY] = [dict(spec, t=0.75) for spec in
+                                               first.attributes[bridge.VIRTUAL_KEY]]
+        first.parent.shapes.append(copy)
+        copy.parent = first.parent
+        for _ in range(2):  # both settle instead of overwriting each other
+            for path in (first, copy):
+                bridge.virtual_nodes(path, items=bridge.path_nodes(path))
+        kept = dict(first.parent.userData[bridge.VIRTUAL_STORE_KEY])
+        self.assertNotEqual(first.attributes[bridge.VIRTUAL_OWNER_KEY],
+                            copy.attributes[bridge.VIRTUAL_OWNER_KEY])
+        before = dict(kept)
+        for path in (first, copy):
+            bridge.virtual_nodes(path, items=bridge.path_nodes(path))
+        self.assertEqual(dict(first.parent.userData[bridge.VIRTUAL_STORE_KEY]), before)
+
+    def test_deleted_virtual_node_does_not_return_when_joining(self):
+        first, second = self.joinable_strokes()
+        second.attributes[bridge.VIRTUAL_KEY] = []
+        bridge.virtual_nodes(second, items=bridge.path_nodes(second))
+        self.join(first, second, first.nodes + second.nodes[1:])
+        self.assertEqual(set(self.virtual_positions(first)), {'first'})
+
     def test_virtual_continuous_splits_a_cubic_without_extra_glyphs_nodes(self):
         path = Path([Node(0, 0), Node(0, 80, 'offcurve'),
                      Node(100, 80, 'offcurve'), Node(100, 0, 'curve')])
@@ -376,6 +514,207 @@ class BridgeTests(unittest.TestCase):
         widget = bridge.virtual_widgets(path)[0]
         self.assertGreater(abs(widget['axis'][0]), 0.4)
         self.assertGreater(abs(widget['axis'][1]), 0.4)
+
+    @staticmethod
+    def column(count=3, closed=False):
+        """A vertical stroke 20 wide with a node every 100 units."""
+        path = Path([Node(0, 100*index) for index in range(count)], closed=closed)
+        for node in path.nodes:
+            node.userData.clear()
+        path.attributes[bridge.STROKE_WIDTH_KEY] = 20
+        Layer([path])
+        return path
+
+    @staticmethod
+    def scaling_spec(mode, percent, segment=0, t=0.5, after=100.0, **extra):
+        spec = {'id': mode, 'segment': segment, 't': t, 'mode': mode, 'side': 'both',
+                'linked': True, 'direction': 'normal', 'angle': 0.0,
+                'before': {'left': 100.0, 'right': 100.0},
+                'after': {'left': 100.0, 'right': 100.0}}
+        spec['before'] = {'left': float(percent), 'right': float(percent)}
+        spec['after'] = {'left': float(after), 'right': float(after)}
+        spec.update(extra)
+        return spec
+
+    @staticmethod
+    def half_widths(path):
+        """{y: set of |x|} over the outline's points of a vertical stroke."""
+        found = {}
+        for contour in bridge.curves_for_path(path):
+            for _, points in contour:
+                for x, y in points:
+                    found.setdefault(round(y, 6), set()).add(round(abs(x), 6))
+        return found
+
+    def test_whole_step_scales_every_width_to_the_end(self):
+        path = self.column()
+        path.attributes[bridge.VIRTUAL_KEY] = [self.scaling_spec('whole', 100, after=50)]
+        widths = self.half_widths(path)
+        self.assertEqual(widths[0.0], {10.0})
+        self.assertEqual(widths[50.0], {10.0, 5.0})
+        self.assertEqual(widths[100.0], {5.0})
+        self.assertEqual(widths[200.0], {5.0})
+
+    def test_whole_step_scales_every_width_from_the_start(self):
+        path = self.column()
+        path.attributes[bridge.VIRTUAL_KEY] = [
+            self.scaling_spec('whole', 50, segment=1)]
+        widths = self.half_widths(path)
+        self.assertEqual(widths[0.0], {5.0})
+        self.assertEqual(widths[100.0], {5.0})
+        self.assertEqual(widths[150.0], {10.0, 5.0})
+        self.assertEqual(widths[200.0], {10.0})
+
+    def test_section_thins_only_its_stretch(self):
+        path = self.column(2)
+        path.attributes[bridge.VIRTUAL_KEY] = [
+            self.scaling_spec('section', 50, t=0.3, endSegment=0, endT=0.7)]
+        widths = self.half_widths(path)
+        self.assertEqual(widths[0.0], {10.0})
+        self.assertEqual(widths[30.0], {10.0, 5.0})
+        self.assertEqual(widths[70.0], {10.0, 5.0})
+        self.assertEqual(widths[100.0], {10.0})
+        self.assertEqual(len(bridge.virtual_widgets(path)), 2)
+
+    def test_section_reaches_across_a_node(self):
+        path = self.column()
+        path.attributes[bridge.VIRTUAL_KEY] = [
+            self.scaling_spec('section', 50, endSegment=1, endT=0.5)]
+        widths = self.half_widths(path)
+        self.assertEqual(widths[100.0], {5.0})
+        self.assertEqual(widths[200.0], {10.0})
+
+    def test_section_on_one_side_keeps_the_other(self):
+        path = self.column(2)
+        spec = self.scaling_spec('section', 50, t=0.3, endSegment=0, endT=0.7,
+                                 side='right')
+        spec['before'] = {'left': 100.0, 'right': 50.0}
+        path.attributes[bridge.VIRTUAL_KEY] = [spec]
+        xs = {round(x, 6) for contour in bridge.curves_for_path(path)
+              for _, points in contour for x, _ in points}
+        self.assertEqual(xs, {-10.0, 10.0, 5.0})
+
+    def test_section_ends_are_put_in_path_order(self):
+        path = self.column(2)
+        path.attributes[bridge.VIRTUAL_KEY] = [
+            self.scaling_spec('section', 50, t=0.7, endSegment=0, endT=0.3)]
+        spec = bridge.virtual_nodes(path)[0]
+        self.assertEqual((spec['t'], spec['endT']), (0.3, 0.7))
+
+    def test_section_follows_a_reversed_stroke(self):
+        path = self.column()
+        path.attributes[bridge.VIRTUAL_KEY] = [
+            self.scaling_spec('section', 50, t=0.25, endSegment=1, endT=0.5)]
+        bridge.virtual_nodes(path)  # bind both ends to their real nodes
+        path.nodes = path.nodes[::-1]
+        spec = bridge.virtual_nodes(path)[0]
+        segments = bridge.segments_for_path(path)
+        self.assertEqual(bridge.virtual_point(segments[spec['segment']], spec['t']),
+                         (0.0, 150.0))
+        self.assertEqual(bridge.virtual_point(segments[spec['endSegment']], spec['endT']),
+                         (0.0, 25.0))
+        self.assertEqual(self.half_widths(path)[100.0], {5.0})
+
+    def test_section_hides_while_its_end_segment_is_gone(self):
+        path = self.column(4)
+        path.attributes[bridge.VIRTUAL_KEY] = [
+            self.scaling_spec('section', 50, endSegment=2, endT=0.5)]
+        bridge.virtual_nodes(path)
+        removed = path.nodes.pop(2)
+        self.assertEqual(bridge.virtual_nodes(path), [])
+        path.nodes.insert(2, removed)  # undo
+        spec = bridge.virtual_nodes(path)[0]
+        self.assertEqual((spec['endSegment'], spec['endT']), (2, 0.5))
+
+    def test_section_start_moved_to_another_segment_binds_there(self):
+        path = self.column(4)
+        path.attributes[bridge.VIRTUAL_KEY] = [
+            self.scaling_spec('section', 50, endSegment=2, endT=0.5)]
+        spec = bridge.virtual_nodes(path)[0]
+        for key in ('anchorStart', 'anchorEnd', 'anchorCount', 'startOpen', 'endOpen',
+                    'anchorBefore', 'anchorAfter'):
+            spec.pop(key)
+        spec.update(segment=1, t=0.25)
+        path.attributes[bridge.VIRTUAL_KEY] = [spec]
+        spec = bridge.virtual_nodes(path)[0]
+        self.assertEqual((spec['segment'], spec['endSegment']), (1, 2))
+        self.assertEqual(self.half_widths(path)[100.0], {10.0})
+        self.assertEqual(self.half_widths(path)[200.0], {5.0})
+
+    def test_whole_step_scales_both_ways(self):
+        path = self.column()
+        path.attributes[bridge.VIRTUAL_KEY] = [self.scaling_spec('whole', 50, after=150)]
+        widths = self.half_widths(path)
+        self.assertEqual(widths[0.0], {5.0})
+        self.assertEqual(widths[50.0], {5.0, 15.0})
+        self.assertEqual(widths[200.0], {15.0})
+
+    def test_whole_step_swaps_its_widths_on_a_reversed_stroke(self):
+        path = self.column()
+        path.attributes[bridge.VIRTUAL_KEY] = [self.scaling_spec('whole', 100, after=50)]
+        bridge.virtual_nodes(path)
+        path.nodes = path.nodes[::-1]
+        spec = bridge.virtual_nodes(path)[0]
+        self.assertEqual(spec['before'], {'left': 50.0, 'right': 50.0})
+        self.assertEqual(spec['after'], {'left': 100.0, 'right': 100.0})
+        widths = self.half_widths(path)  # the same stroke, drawn the other way
+        self.assertEqual(widths[200.0], {5.0})
+        self.assertEqual(widths[0.0], {10.0})
+
+    def test_section_wraps_around_the_start_of_a_closed_stroke(self):
+        path = Path([Node(0, 0), Node(100, 0), Node(100, 100), Node(0, 100)], closed=True)
+        for node in path.nodes:
+            node.userData.clear()
+        path.attributes[bridge.STROKE_WIDTH_KEY] = 20
+        Layer([path])
+        path.attributes[bridge.VIRTUAL_KEY] = [
+            self.scaling_spec('section', 50, segment=3, endSegment=0, endT=0.5)]
+        events, scale = bridge._virtual_events(bridge.segments_for_path(path),
+                                               bridge.virtual_nodes(path), True)
+        self.assertEqual([event['role'] for event in events], ['end', 'start'])
+        self.assertEqual(scale(0, 0.0), (0.5, 0.5))
+        self.assertEqual(scale(1, 0.0), (1.0, 1.0))
+        contours = bridge.curves_for_path(path)
+        for contour in contours:
+            for before, after in zip(contour, contour[1:] + contour[:1]):
+                self.assertAlmostEqual(before[1][-1][0], after[1][0][0])
+                self.assertAlmostEqual(before[1][-1][1], after[1][0][1])
+
+    def test_scaling_on_a_closed_stroke_is_a_plain_step(self):
+        path = Path([Node(0, 0), Node(100, 0), Node(100, 100)], closed=True)
+        for node in path.nodes:
+            node.userData.clear()
+        Layer([path])
+        path.attributes[bridge.VIRTUAL_KEY] = [self.scaling_spec('whole', 50)]
+        events, scale = bridge._virtual_events(bridge.segments_for_path(path),
+                                               bridge.virtual_nodes(path), True)
+        self.assertEqual(events[0]['role'], 'step')
+        self.assertEqual(scale(2, 0.5), (1.0, 1.0))
+
+    def test_section_ends_are_part_of_master_compatibility(self):
+        def entry(end_segment):
+            path = self.column()
+            path.attributes[bridge.VIRTUAL_KEY] = [
+                self.scaling_spec('section', 50, endSegment=end_segment, endT=0.5)]
+            return path, bridge.path_nodes(path)
+        layouts = [bridge._virtual_layout(*entry(segment)) for segment in (0, 1)]
+        self.assertNotEqual(layouts[0], layouts[1])
+        self.assertEqual(layouts[1], [(('section', 'both'),), (('section end', 'both'),)])
+
+    def test_interpolated_sections_blend_their_ends(self):
+        def master(end_t, percent):
+            path = self.column(2)
+            path.attributes[bridge.VIRTUAL_KEY] = [
+                self.scaling_spec('section', percent, t=0.2, endSegment=0, endT=end_t)]
+            return path.parent
+        first, second = master(0.6, 40), master(0.8, 60)
+        glyph = types.SimpleNamespace(layers={'a': first, 'b': second},
+                                      userData={bridge.GLYPH_KEY: True})
+        target = master(0.6, 40)
+        self.assertTrue(bridge.interpolate_layer(target, glyph, {'a': 0.5, 'b': 0.5}))
+        spec = bridge.virtual_nodes(target.paths[0])[0]
+        self.assertAlmostEqual(spec['endT'], 0.7)
+        self.assertAlmostEqual(spec['before']['left'], 50)
 
     def test_interpolated_virtual_sections_blend_values_and_keep_piece_count(self):
         def master(t, after):

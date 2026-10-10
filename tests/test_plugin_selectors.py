@@ -440,5 +440,54 @@ class SelectorTests(unittest.TestCase):
         self.assertIn("('profile', 'Profile', 'プロファイル')", source)
 
 
+class VirtualModeHelperTests(unittest.TestCase):
+    def setUp(self):
+        module = ast.parse(PLUGIN.read_text())
+        wanted = ('_virtual_handle_ends', '_moved_section', '_set_virtual_mode',
+                  '_SEGMENT_KEYS', '_END_KEYS')
+        body = [node for node in module.body
+                if (isinstance(node, ast.FunctionDef) and node.name in wanted) or
+                (isinstance(node, ast.Assign) and
+                 any(getattr(target, 'id', None) in wanted for target in node.targets))]
+        self.namespace = {}
+        exec(compile(ast.Module(body=body, type_ignores=[]), str(PLUGIN), 'exec'),
+             self.namespace)
+
+    def test_section_handles_sit_inside_the_section(self):
+        ends = self.namespace['_virtual_handle_ends']
+        self.assertEqual(ends({'role': 'start'}), (('before', 5.0),))
+        self.assertEqual(ends({'role': 'end'}), (('before', -5.0),))
+        self.assertEqual(ends({'role': 'whole'}), (('before', -5.0), ('after', 5.0)))
+        self.assertEqual(ends({'role': 'continuous'}), (('before', 0.0),))
+
+    def test_new_section_gets_an_end_after_its_start(self):
+        set_mode = self.namespace['_set_virtual_mode']
+        spec = {'mode': 'section', 'segment': 1, 't': 0.3,
+                'before': {'left': 80.0, 'right': 80.0}, 'after': {'left': 120.0, 'right': 120.0}}
+        set_mode(None, spec)
+        self.assertEqual((spec['endSegment'], spec['endT']), (1, 0.55))
+        self.assertEqual(spec['after'], spec['before'])
+        late = {'mode': 'section', 'segment': 0, 't': 0.9,
+                'before': {'left': 80.0, 'right': 80.0}, 'after': {}}
+        set_mode(None, late)
+        self.assertAlmostEqual(late['t'], 0.65)
+        self.assertEqual(late['endT'], 0.9)
+        late['mode'] = 'step'
+        set_mode(None, late)
+        self.assertNotIn('endT', late)
+
+    def test_moving_a_section_end_to_another_segment_unbinds_only_that_end(self):
+        moved = self.namespace['_moved_section']
+        spec = {'segment': 0, 't': 0.2, 'endSegment': 0, 'endT': 0.6,
+                'anchorStart': 'a', 'anchorEnd': 'b', 'endAnchorStart': 'a',
+                'endAnchorEnd': 'b'}
+        changed = moved(spec, (0, 0.2), (1, 0.4))
+        self.assertEqual(changed['anchorStart'], 'a')
+        self.assertNotIn('endAnchorStart', changed)
+        self.assertEqual((changed['endSegment'], changed['endT']), (1, 0.4))
+        changed = moved(spec, (1, 0.1), (1, 0.4))
+        self.assertNotIn('anchorStart', changed)
+
+
 if __name__ == '__main__':
     unittest.main()

@@ -110,6 +110,22 @@ class ProfileTests(unittest.TestCase):
         across = length(sub(widget['before'][0], widget['before'][1]))
         self.assertAlmostEqual(across, 20, delta=0.5)
 
+    def test_section_percent_scales_the_profiled_width(self):
+        plain = bridge.curves_for_path(stroke(line(), DIP), 40)
+        path = stroke(line(), DIP)
+        path.attributes[bridge.VIRTUAL_KEY] = [{
+            'id': 'v', 'segment': 0, 't': 0.4, 'mode': 'section', 'endSegment': 0,
+            'endT': 0.6, 'before': {'left': 50, 'right': 50}}]
+        contours = bridge.curves_for_path(path, 40)
+        self.assertAlmostEqual(thickness_at(contours, (500, 0)), 10, delta=1.0)
+        for x in (200, 300, 700):
+            self.assertAlmostEqual(thickness_at(contours, (x, 0)),
+                                   thickness_at(plain, (x, 0)), delta=0.5)
+        start, end = bridge.virtual_widgets(path, 40)
+        for widget, x in ((start, 400), (end, 600)):
+            across = length(sub(widget['before'][0], widget['before'][1]))
+            self.assertAlmostEqual(across, thickness_at(plain, (x, 0))/2, delta=0.5)
+
     def test_paths_out_of_reach_of_their_font_still_find_the_profile(self):
         # Instances (Variable Font Preview) belong to glyph copies whose parent
         # is no font, or to fonts that do not carry the profiles.

@@ -1,6 +1,7 @@
 """Glyphs 3 adapters shared by the editing tool and the export filter."""
 import collections
 import contextlib
+import json
 import math
 import threading
 import time
@@ -28,6 +29,12 @@ CORNER_HANDLE_KEYS = (
     'com.codex.VariableStroke.cornerHandleRightOut')
 VIRTUAL_KEY = 'com.codex.VariableStroke.virtualNodes'  # per path, ordered virtual sections
 VIRTUAL_ANCHOR_KEY = 'com.codex.VariableStroke.virtualAnchor'  # stable on-curve identity
+VIRTUAL_STORE_KEY = 'com.codex.VariableStroke.virtualSections'  # per layer (see virtual_nodes)
+VIRTUAL_OWNER_KEY = 'com.codex.VariableStroke.virtualOwner'  # per path id
+# Virtual node modes. 'whole' is a step whose before/after percentages scale
+# every width up to the path's start/end; 'section' scales the stretch up to
+# its endSegment/endT.
+VIRTUAL_MODES = ('continuous', 'step', 'whole', 'section')
 ROTATION_KEY = 'com.codex.VariableStroke.rotation'  # per node, nib axes angle in page degrees
 # Live corners, per node. The radius key alone (older files) also means ON.
 CORNER_ON_KEY = 'com.codex.VariableStroke.corner'  # bool
@@ -566,50 +573,212 @@ def segments_for_path(path, defaults=None, items=None):
     return result
 
 
+_OUTSIDE = object()  # beyond the ends of an open path (see _find_section)
+
+
+def _find_section(data, anchor_ids, count, closed):
+    """(segment, reversed) of a saved section among the path's anchors, or None.
+
+    A reversed path finds the section with its two anchors swapped. Joining two
+    strokes keeps one node where their ends met, so a section next to that end
+    may have lost the anchor there; the anchor on its other side, saved with
+    it, then tells which neighbour of the remaining anchor it now runs to."""
+    total = len(anchor_ids)
+
+    def at(index):
+        if closed:
+            return anchor_ids[index % total]
+        return anchor_ids[index] if 0 <= index < total else _OUTSIDE
+    start_id, end_id = data.get('anchorStart'), data.get('anchorEnd')
+    for index in range(count):
+        if (at(index), at(index+1)) == (start_id, end_id):
+            return index, False
+        if (at(index), at(index+1)) == (end_id, start_id):
+            return index, True
+    for found, lost, sign, open_key, outer_key in (
+            (start_id, end_id, 1, 'endOpen', 'anchorBefore'),
+            (end_id, start_id, -1, 'startOpen', 'anchorAfter')):
+        if not data.get(open_key) or lost in anchor_ids or found not in anchor_ids:
+            continue
+        index = anchor_ids.index(found)
+        outer = data.get(outer_key) or _OUTSIDE
+        for step in (1, -1):
+            if at(index-step) != outer or at(index+step) is _OUTSIDE:
+                continue
+            segment = (index if step == 1 else index-1) % total
+            if 0 <= segment < count:
+                return segment, step != sign
+    return None
+
+
+def _flip_sides(values):
+    return {'left': values['right'], 'right': values['left']}
+
+
+def _layer_of(path):
+    try:
+        return path.parent
+    except AttributeError:
+        return None
+
+
+@contextlib.contextmanager
+def _without_undo(layer):
+    """Bookkeeping written while drawing (anchor ids, the layer's copies of the
+    sections) must not become undo steps: undoing one would only have it
+    written again by the next redraw, and undo would never get past it."""
+    try:
+        manager = layer.parent.undoManager()
+    except Exception:
+        manager = None
+    if manager is not None:
+        manager.disableUndoRegistration()
+    try:
+        yield
+    finally:
+        if manager is not None:
+            manager.enableUndoRegistration()
+
+
+def _kept_sections(layer):
+    """{path id: JSON of its sections} kept on a layer (see virtual_nodes)."""
+    try:
+        kept = layer.userData.get(VIRTUAL_STORE_KEY) if layer is not None else None
+    except (AttributeError, TypeError):
+        return None
+    return {str(key): str(value) for key, value in dict(kept or {}).items()}
+
+
+def _joined_sections(path, layer, kept, owner, anchor_ids):
+    """Sections kept for strokes joined into this path: those of a path id no
+    path on the layer has any more, on a segment with one of this path's anchors."""
+    anchors = set(anchor_id for anchor_id in anchor_ids if anchor_id)
+    found = {}
+    for key, text in kept.items():
+        if key == owner:
+            continue
+        try:
+            entries = [dict(entry) for entry in json.loads(text)]
+        except (TypeError, ValueError):
+            continue
+        entries = [entry for entry in entries
+                   if entry.get('anchorStart') in anchors or entry.get('anchorEnd') in anchors]
+        if entries:
+            found[key] = entries
+    if found:
+        try:
+            alive = set(str(other.attributes.get(VIRTUAL_OWNER_KEY))
+                        for other in layer.paths if other is not path)
+        except (AttributeError, TypeError):
+            return {}
+        found = {key: entries for key, entries in found.items() if key not in alive}
+    return found
+
+
 def virtual_nodes(path, segment_count=None, items=None):
-    """Normalized sections, following their original segment across node edits."""
+    """Normalized sections, following their original segment across node edits.
+
+    The path's attributes hold the sections. When Glyphs joins two strokes only
+    one path keeps its attributes, so the layer also keeps each path's sections
+    by path id; a path takes over those of a path id gone from the layer whose
+    anchor nodes it now has. (Not on the nodes: Glyphs writes node userData into
+    a fixed-size buffer.)"""
     try:
         raw = path.attributes.get(VIRTUAL_KEY) or []
+        owner = path.attributes.get(VIRTUAL_OWNER_KEY)
     except (AttributeError, TypeError):
         return []
-    if not raw:
+    owner = str(owner) if owner else None
+    if not raw and items is None:
         return []
-    count = len(segments_for_path(path)) if segment_count is None else segment_count
-    on_curve_items = _on_curve(path_nodes(path) if items is None else items,
-                               bool(path.closed))
-    on_curve = [item[0] for item in on_curve_items]
-    pairs = [(on_curve[i], on_curve[(i+1) % len(on_curve)]) for i in range(count)] \
-        if len(on_curve) >= count + (0 if path.closed else 1) and on_curve else []
+    items = path_nodes(path) if items is None else items
+    closed = bool(path.closed)
+    on_curve_items = _on_curve(items, closed)
     anchor_ids = [item[3].get(VIRTUAL_ANCHOR_KEY) for item in on_curve_items]
+    layer = _layer_of(path)
+    kept = _kept_sections(layer) if raw or any(anchor_ids) else None
     saved = list(raw)
     changed = False
+    adopted = set()
+    joined = _joined_sections(path, layer, kept, owner, anchor_ids) if kept else {}
+    if joined:
+        known = set()
+        for item in raw:
+            try:
+                known.add(str(dict(item).get('id', '')))
+            except (TypeError, ValueError):
+                continue
+        for entries in joined.values():
+            for entry in entries:
+                if str(entry.get('id', '')) not in known:
+                    known.add(str(entry.get('id', '')))
+                    adopted.add(len(saved))
+                    saved.append(entry)
+                    changed = True
+    if not saved:
+        if kept and owner in kept:  # every section was deleted
+            _keep_sections(path, layer, kept, owner, [], joined)
+        return []
+    if not owner:
+        owner = uuid.uuid4().hex
+        with _without_undo(layer):
+            path.attributes[VIRTUAL_OWNER_KEY] = owner
+    count = len(segments_for_path(path)) if segment_count is None else segment_count
+    on_curve = [item[0] for item in on_curve_items]
+    pairs = [(on_curve[i], on_curve[(i+1) % len(on_curve)]) for i in range(count)] \
+        if len(on_curve) >= count + (0 if closed else 1) and on_curve else []
     result = []
-    for raw_index, item in enumerate(raw):
+    for raw_index, item in enumerate(saved):
         try:
             data = dict(item)
             segment, t = int(data['segment']), float(data['t'])
             if not (0.005 <= t <= 0.995 and math.isfinite(t)):
                 continue
+            reverse = False
             start_id, end_id = data.get('anchorStart'), data.get('anchorEnd')
             if start_id and end_id:
-                matches = [i for i in range(len(pairs))
-                           if anchor_ids[i] == start_id and
-                           anchor_ids[(i+1) % len(on_curve)] == end_id]
-                if matches:
-                    segment = matches[0]
-                elif (start_id in anchor_ids or end_id in anchor_ids or
-                      data.get('anchorCount') != count):
+                match = _find_section(data, anchor_ids, count, closed) if pairs else None
+                if match:
+                    segment, reverse = match
+                elif (raw_index in adopted or start_id in anchor_ids or
+                      end_id in anchor_ids or data.get('anchorCount') != count):
                     # Its original segment was removed or split. Keep the saved
                     # entry so undo can restore the virtual node with the path.
                     continue
+            elif raw_index in adopted:
+                continue
             if not 0 <= segment < count:
                 continue
             mode = data.get('mode', 'continuous')
             side = data.get('side', 'both')
             direction = data.get('direction', 'normal')
-            if mode not in ('continuous', 'step') or side not in ('left', 'right', 'both') \
+            if mode not in VIRTUAL_MODES or side not in ('left', 'right', 'both') \
                     or direction not in ('normal', 'horizontal', 'vertical', 'angle'):
                 continue
+            end_segment = end_t = None
+            if mode == 'section':
+                end_t = float(data['endT'])
+                if not (0.005 <= end_t <= 0.995 and math.isfinite(end_t)):
+                    continue
+                span = int(data.get('endSegment', data['segment'])) - int(data['segment'])
+                found = _find_section({'anchorStart': data.get('endAnchorStart'),
+                                       'anchorEnd': data.get('endAnchorEnd')},
+                                      anchor_ids, count, closed) \
+                    if pairs and data.get('endAnchorStart') and data.get('endAnchorEnd') \
+                    else None
+                if found:
+                    end_segment = found[0]
+                    if found[1] != reverse:  # one end reversed, the other not
+                        continue
+                elif pairs and data.get('endAnchorEnd') and (
+                        data.get('endAnchorStart') in anchor_ids or
+                        data['endAnchorEnd'] in anchor_ids or
+                        data.get('anchorCount') != count):
+                    continue  # its end's segment was removed (kept for undo)
+                else:
+                    end_segment = segment - span if reverse else segment + span
+                    end_segment = end_segment % count if closed else \
+                        max(0, min(count-1, end_segment))
             before = dict(data.get('before') or {})
             after = dict(data.get('after') or before)
             for values in (before, after):
@@ -621,32 +790,106 @@ def virtual_nodes(path, segment_count=None, items=None):
             angle = float(data.get('angle', 0.0))
             if not math.isfinite(angle):
                 continue
+            if reverse:  # the path now runs the other way along this segment
+                t = 1.0-t
+                side = {'left': 'right', 'right': 'left'}.get(side, side)
+                before, after = (_flip_sides(after), _flip_sides(before)) \
+                    if mode in ('step', 'whole') \
+                    else (_flip_sides(before), _flip_sides(after))
+                if mode == 'section':  # its end comes first now
+                    segment, t, end_segment, end_t = end_segment, 1.0-end_t, segment, t
+            if mode == 'section':
+                if not closed and (end_segment, end_t) < (segment, t):
+                    segment, t, end_segment, end_t = end_segment, end_t, segment, t
+                if end_segment == segment and abs(end_t-t) < 0.002:
+                    continue
+                after = dict(before)
+            spec = {'id': str(data.get('id', '')), 'segment': segment, 't': t,
+                    'mode': mode, 'side': side, 'direction': direction,
+                    'angle': angle, 'linked': bool(data.get('linked', True)),
+                    'before': before, 'after': after,
+                    'anchorStart': start_id, 'anchorEnd': end_id, 'anchorCount': count}
+            if mode == 'section':
+                spec.update(endSegment=end_segment, endT=end_t,
+                            endAnchorStart=data.get('endAnchorStart'),
+                            endAnchorEnd=data.get('endAnchorEnd'))
             if pairs:
-                start, end = pairs[segment]
-                for index in (segment, (segment+1) % len(on_curve)):
+                last = len(on_curve)-1
+                neighbours = (segment-1, segment, segment+1, segment+2)
+                if mode == 'section':
+                    neighbours += (end_segment, end_segment+1)
+                if not closed:
+                    neighbours = tuple(i for i in neighbours if 0 <= i <= last)
+                for index in neighbours:
+                    index %= len(on_curve)
                     if not anchor_ids[index]:
                         anchor_ids[index] = uuid.uuid4().hex
-                        on_curve[index].userData[VIRTUAL_ANCHOR_KEY] = anchor_ids[index]
-                start_id = anchor_ids[segment]
-                end_id = anchor_ids[(segment+1) % len(on_curve)]
-                if (data.get('segment') != segment or data.get('anchorStart') != start_id
-                        or data.get('anchorEnd') != end_id or
-                        data.get('anchorCount') != count):
-                    data.update(segment=segment, anchorStart=start_id,
-                                anchorEnd=end_id, anchorCount=count)
-                    saved[raw_index] = data
+                        with _without_undo(layer):
+                            on_curve[index].userData[VIRTUAL_ANCHOR_KEY] = anchor_ids[index]
+                first, second = segment, (segment+1) % len(on_curve)
+                spec.update(anchorStart=anchor_ids[first], anchorEnd=anchor_ids[second],
+                            startOpen=not closed and first == 0,
+                            endOpen=not closed and second == last,
+                            anchorBefore=anchor_ids[(first-1) % len(on_curve)]
+                            if closed or first > 0 else None,
+                            anchorAfter=anchor_ids[(second+1) % len(on_curve)]
+                            if closed or second < last else None)
+                if mode == 'section':
+                    spec.update(endAnchorStart=anchor_ids[end_segment],
+                                endAnchorEnd=anchor_ids[(end_segment+1) % len(on_curve)])
+                if reverse or raw_index in adopted or any(
+                        data.get(key) != spec.get(key) for key in (
+                            'segment', 'anchorStart', 'anchorEnd', 'anchorCount',
+                            'startOpen', 'endOpen', 'anchorBefore', 'anchorAfter',
+                            'endSegment', 'endT', 'endAnchorStart', 'endAnchorEnd')):
+                    saved[raw_index] = dict(spec)
                     changed = True
-            result.append({'id': str(data.get('id', '')), 'segment': segment, 't': t,
-                           'mode': mode, 'side': side, 'direction': direction,
-                           'angle': angle, 'linked': bool(data.get('linked', True)),
-                           'before': before, 'after': after,
-                           'anchorStart': start_id, 'anchorEnd': end_id,
-                           'anchorCount': count})
+            result.append(spec)
         except (TypeError, ValueError, KeyError):
             continue
     if changed:
-        path.attributes[VIRTUAL_KEY] = saved
+        with _without_undo(layer):
+            path.attributes[VIRTUAL_KEY] = saved
+    if pairs and layer is not None:
+        _keep_sections(path, layer, kept, owner, result, joined)
     return sorted(result, key=lambda spec: (spec['segment'], spec['t'], spec['id']))
+
+
+def _keep_sections(path, layer, kept, owner, specs, joined):
+    """Save a path's sections on its layer, dropping those of joined paths."""
+    kept = dict((_kept_sections(layer) if kept is None else kept) or {})
+    updated = dict(kept)
+    for key in joined:
+        updated.pop(key, None)
+    text = json.dumps(sorted(specs, key=lambda spec: spec['id']),
+                      sort_keys=True) if specs else None
+    if text is not None and kept.get(owner) not in (None, text):
+        # A pasted or duplicated stroke carries the id of the one it was copied
+        # from; sharing it, the two would overwrite each other's copy forever.
+        try:
+            shared = any(other is not path and
+                         str(other.attributes.get(VIRTUAL_OWNER_KEY)) == owner
+                         for other in layer.paths)
+        except (AttributeError, TypeError):
+            shared = False
+        if shared:
+            owner = uuid.uuid4().hex
+            with _without_undo(layer):
+                path.attributes[VIRTUAL_OWNER_KEY] = owner
+    if text is not None:
+        updated[owner] = text
+    else:
+        updated.pop(owner, None)
+    if updated == kept:
+        return
+    try:
+        with _without_undo(layer):
+            if updated:
+                layer.userData[VIRTUAL_STORE_KEY] = updated
+            else:
+                _pop(layer.userData, VIRTUAL_STORE_KEY)
+    except (AttributeError, TypeError):
+        pass
 
 
 def virtual_point(segment, t):
@@ -689,13 +932,103 @@ def _virtual_nib(base, percentages, section_angle):
     return (w*total/2.0, h*total/2.0, (left-right)/total, angle, section_angle)
 
 
+_FULL = {'left': 100.0, 'right': 100.0}
+
+
+def _side_factors(spec, values):
+    """(left, right) factors of a spec's percentages, 1 on a side it leaves alone."""
+    return tuple(values[side]/100.0 if spec['side'] in (side, 'both') else 1.0
+                 for side in ('left', 'right'))
+
+
+def _virtual_scale(specs, closed):
+    """Factor (left, right) at a position (segment, t) from the nodes that scale
+    everything after or before them, or a section of the stroke."""
+    reach = []
+    for spec in specs:
+        start = (spec['segment'], spec['t'])
+        if spec['mode'] == 'whole' and not closed:
+            reach.append((lambda at, start=start: at > start,
+                          _side_factors(spec, spec['after'])))
+            reach.append((lambda at, start=start: at < start,
+                          _side_factors(spec, spec['before'])))
+        elif spec['mode'] == 'section':
+            end = (spec['endSegment'], spec['endT'])
+            if start < end:
+                inside = (lambda at, start=start, end=end: start < at < end)
+            else:  # around the start node of a closed path
+                inside = (lambda at, start=start, end=end: at > start or at < end)
+            reach.append((inside, _side_factors(spec, spec['before'])))
+
+    def scale(segment, t):
+        left = right = 1.0
+        for inside, (l, r) in reach:
+            if inside((segment, t)):
+                left, right = left*l, right*r
+        return left, right
+    return scale
+
+
+def _virtual_events(segments, specs, closed=False):
+    """The cuts virtual nodes make in a stroke, in path order, with the nibs on
+    both sides of each. A section makes two cuts (roles 'start' and 'end');
+    the others one, with their mode as role ('step' for a whole step on a closed
+    path, which has no ends to scale up to)."""
+    from variable_stroke_core import _nib, _derivative, unit
+    scale = _virtual_scale(specs, closed)
+    events = []
+    for spec in specs:
+        role = spec['mode']
+        if closed and role == 'whole':
+            role = 'step'
+        if role == 'section':
+            events.append((spec['segment'], spec['t'], spec, 'start'))
+            events.append((spec['endSegment'], spec['endT'], spec, 'end'))
+        else:
+            events.append((spec['segment'], spec['t'], spec, role))
+    result = []
+    for segment, t, spec, role in sorted(events, key=lambda item: item[:2]):
+        kind, pts, e0, e1 = segments[segment][:4]
+        base0, base1 = _nib(e0), _nib(e1)
+        values = [base0[j]*(1-t)+base1[j]*t for j in range(3)]
+        turn = (base1[3]-base0[3]+90.0) % 180.0-90.0
+        base = tuple(values + [base0[3]+turn*t])
+        tangent = unit(_derivative(kind, pts, t))
+        axis = _virtual_section_angle(spec, tangent)
+        if axis is None:
+            axis = 0.0  # defensive fallback for an invalid saved direction
+        local = spec.get('endScale' if role == 'end' else 'scale', 1.0)
+        before_scale, after_scale = scale(segment, t-1e-9), scale(segment, t+1e-9)
+
+        def nib(values, factors):
+            return _virtual_nib(base, {side: values[side]*factor*local for side, factor
+                                       in zip(('left', 'right'), factors)}, axis)
+        before = nib(_FULL if role in ('whole', 'start', 'end') else spec['before'],
+                     before_scale)
+        after = nib(spec['after'] if role == 'step' else
+                    spec['before'] if role == 'continuous' else _FULL, after_scale)
+        result.append({'segment': segment, 't': t, 'spec': spec, 'role': role,
+                       'base': nib(_FULL, before_scale), 'axis': axis,
+                       'tangent': tangent, 'before': before, 'after': after})
+    return result, scale
+
+
+def _scaled_nib(nib, factors):
+    if factors == (1.0, 1.0):
+        return nib
+    from variable_stroke_core import _nib
+    base = _nib(nib)
+    return _virtual_nib(base, {'left': 100.0*factors[0], 'right': 100.0*factors[1]},
+                        base[4])
+
+
 def expanded_virtual_segments(segments, specs, corners=None, closed=False):
     """Split source segments without changing the Glyphs path; return pieces,
     step breaks, expanded corner list, and original-node index for each vertex."""
-    from variable_stroke_core import _nib, _derivative, unit
+    events, scale = _virtual_events(segments, specs, closed)
     by_segment = collections.defaultdict(list)
-    for spec in specs:
-        by_segment[spec['segment']].append(spec)
+    for event in events:
+        by_segment[event['segment']].append(event)
     result = []
     breaks = {'left': set(), 'right': set()}
     smooths, expanded_corners, node_map = set(), [], []
@@ -714,35 +1047,26 @@ def expanded_virtual_segments(segments, specs, corners=None, closed=False):
                 return (kind, points, nib0, nib1)
             return (kind, points, nib0, nib1,
                     (modulation[0], progress_at(t0), progress_at(t1)))
-        current_pts, start_t, current_nib = pts, 0.0, e0
-        source_specs = sorted(by_segment[index], key=lambda item: item['t'])
-        for spec in source_specs:
-            t = spec['t']
+        current_pts, start_t = pts, 0.0
+        current_nib = _scaled_nib(e0, scale(index, 0.0))
+        for event in by_segment[index]:
+            t = event['t']
             if t <= start_t + 0.001:
                 continue
             first, current_pts = _split_segment(kind, current_pts,
                                                  (t-start_t)/(1-start_t))
-            base0, base1 = _nib(e0), _nib(e1)
-            values = [base0[j]*(1-t)+base1[j]*t for j in range(3)]
-            turn = (base1[3]-base0[3]+90.0) % 180.0-90.0
-            base = tuple(values + [base0[3]+turn*t])
-            axis = _virtual_section_angle(spec, unit(_derivative(kind, pts, t)))
-            if axis is None:
-                axis = 0.0  # defensive fallback for an invalid saved direction
-            before = _virtual_nib(base, spec['before'], axis)
-            after = _virtual_nib(base, spec['after'] if spec['mode'] == 'step'
-                                 else spec['before'], axis)
-            result.append(piece(first, current_nib, before, start_t, t))
+            result.append(piece(first, current_nib, event['before'], start_t, t))
             expanded_corners.append(corners[index] if corners and start_t == 0 else None)
             node_map.append(index if start_t == 0 else None)
-            if spec['mode'] == 'step':
+            if event['role'] != 'continuous':
                 for side in ('left', 'right'):
-                    if spec['side'] in (side, 'both'):
+                    if event['spec']['side'] in (side, 'both'):
                         breaks[side].add(len(result)-1)
             else:
                 smooths.add(len(result)-1)
-            current_nib, start_t = after, t
-        result.append(piece(current_pts, current_nib, e1, start_t, 1.0))
+            current_nib, start_t = event['after'], t
+        result.append(piece(current_pts, current_nib, _scaled_nib(e1, scale(index, 1.0)),
+                            start_t, 1.0))
         expanded_corners.append(corners[index] if corners and start_t == 0 else None)
         node_map.append(index if start_t == 0 else None)
     if not closed:
@@ -992,15 +1316,18 @@ def apply_profile(segments, specs, profile, closed=False):
 
     corrected = []
     for spec in specs:
-        spec = dict(spec)
-        r = ratio(spec['segment'], spec['t'])
-        for end in ('before', 'after'):
-            spec[end] = {side: value*r for side, value in spec[end].items()}
+        # A node that scales the stroke beyond itself keeps its percentages.
+        spec = dict(spec, scale=spec.get('scale', 1.0)*ratio(spec['segment'], spec['t']))
+        if spec['mode'] == 'section':
+            spec['endScale'] = spec.get('endScale', 1.0)*ratio(spec['endSegment'],
+                                                               spec['endT'])
         corrected.append(spec)
     sections = width_profile.divisions(profile)
     taken = collections.defaultdict(list)
     for spec in specs:
         taken[spec['segment']].append(spec['t'])
+        if spec['mode'] == 'section':
+            taken[spec['endSegment']].append(spec['endT'])
     for index in range(count):
         length = tables[index][-1]
         for j in range(1, sections+1):
@@ -1022,34 +1349,32 @@ def apply_profile(segments, specs, profile, closed=False):
 
 
 def virtual_widgets(path, defaults=None):
-    """Canvas positions for virtual sections, using the same nibs as expansion."""
-    from variable_stroke_core import _nib, _derivative, unit, nib_edges, normal
+    """Canvas positions for virtual sections, using the same nibs as expansion.
+
+    A section has two widgets, at its start and end; their 'before' and 'after'
+    edges are both those of the stretch it scales."""
+    from variable_stroke_core import nib_edges, normal
     segments = segments_for_path(path, defaults)
     specs = virtual_nodes(path, len(segments))
     # A width profile scales the stroke around each virtual node: its 100 % is
     # the profiled width there (see apply_profile).
     segments, profiled = apply_profile(segments, specs, path_profile(path), bool(path.closed))
-    factors = {spec['id']: spec['before']['left'] for spec in profiled}
+    originals = {spec['id']: spec for spec in specs}
+    events, _ = _virtual_events(segments, profiled, bool(path.closed))
     widgets = []
-    for spec in specs:
-        kind, pts, e0, e1 = segments[spec['segment']][:4]
-        t = spec['t']
-        center = virtual_point((kind, pts), t)
-        tangent = unit(_derivative(kind, pts, t))
-        n0, n1 = _nib(e0), _nib(e1)
-        factor = factors.get(spec['id'], spec['before']['left']) / spec['before']['left']
-        values = [n0[j]*(1-t)+n1[j]*t for j in range(3)]
-        values[0] *= factor
-        values[1] *= factor
-        turn = (n1[3]-n0[3]+90.0) % 180.0-90.0
-        base = tuple(values + [n0[3]+turn*t])
-        angle = _virtual_section_angle(spec, tangent)
-        if angle is None:
-            angle = 0.0
-        before = _virtual_nib(base, spec['before'], angle)
-        after = _virtual_nib(base, spec['after'] if spec['mode'] == 'step'
-                             else spec['before'], angle)
-        baseline = nib_edges(center, tangent, base)
+    for event in events:
+        spec = originals.get(event['spec']['id'])
+        if spec is None:  # a profile's own section
+            continue
+        kind, pts = segments[event['segment']][:2]
+        center = virtual_point((kind, pts), event['t'])
+        tangent, angle = event['tangent'], event['axis']
+        before, after = event['before'], event['after']
+        if event['role'] == 'start':
+            before = after
+        elif event['role'] == 'end':
+            after = before
+        baseline = nib_edges(center, tangent, event['base'])
         before_edges = nib_edges(center, tangent, before)
         after_edges = nib_edges(center, tangent, after)
         if spec['side'] == 'left':
@@ -1062,10 +1387,9 @@ def virtual_widgets(path, defaults=None):
         radians = math.radians(angle)
         axis = (axis[0]*math.cos(radians)-axis[1]*math.sin(radians),
                 axis[0]*math.sin(radians)+axis[1]*math.cos(radians))
-        widgets.append({'spec': spec, 'center': center, 'tangent': tangent,
-                        'axis': axis, 'before': before_edges,
-                        'after': after_edges,
-                        'base': base})
+        widgets.append({'spec': spec, 'role': event['role'], 'center': center,
+                        'tangent': tangent, 'axis': axis, 'before': before_edges,
+                        'after': after_edges, 'base': event['base']})
     return widgets
 
 
@@ -1346,19 +1670,23 @@ def copy_stroke_settings(source, target):
                for item in source_nodes]
     source_specs = virtual_nodes(source, len(source_segments), source_items)
     virtuals = []
-    for spec in source_specs:
+
+    def mapped(segment, t):
         if matching_segments:
-            segment, t = spec['segment'], spec['t']
-        else:
-            distance = source_totals[spec['segment']] + \
-                _length_at(source_tables[spec['segment']], spec['t'])
-            progress = distance/source_totals[-1] if source_totals[-1] > 1e-9 else \
-                (spec['segment']+spec['t'])/len(source_segments)
-            segment, t = _map_virtual_progress(progress, target_tables, target_totals)
+            return segment, t
+        distance = source_totals[segment] + _length_at(source_tables[segment], t)
+        progress = distance/source_totals[-1] if source_totals[-1] > 1e-9 else \
+            (segment+t)/len(source_segments)
+        return _map_virtual_progress(progress, target_tables, target_totals)
+    for spec in source_specs:
+        segment, t = mapped(spec['segment'], spec['t'])
         copied = {key: value for key, value in spec.items()
-                  if not key.startswith('anchor')}
+                  if not key.startswith(('anchor', 'endAnchor'))}
         copied.update(id=uuid.uuid4().hex, segment=segment, t=round(t, 6),
                       before=dict(spec['before']), after=dict(spec['after']))
+        if spec['mode'] == 'section':
+            end_segment, end_t = mapped(spec['endSegment'], spec['endT'])
+            copied.update(endSegment=end_segment, endT=round(end_t, 6))
         virtuals.append(copied)
     attributes = target.attributes
     attributes[STROKE_WIDTH_KEY] = source_width
@@ -2285,9 +2613,11 @@ def _interpolate_layer(layer, glyph, interpolation, glyph_key=None):
                      for axis in (0, 1)] for point in (0, 1)]
         virtual_sources = [(other['virtual'], factor) for _, other, factor in others]
         if virtual_sources and all(
-                [(spec['id'], spec['segment'], spec['mode'], spec['side']) for spec in specs] ==
-                [(spec['id'], spec['segment'], spec['mode'], spec['side'])
-                 for spec in virtual_sources[0][0]] for specs, _ in virtual_sources):
+                [(spec['id'], spec['segment'], spec['mode'], spec['side'],
+                  spec.get('endSegment')) for spec in specs] ==
+                [(spec['id'], spec['segment'], spec['mode'], spec['side'],
+                  spec.get('endSegment')) for spec in virtual_sources[0][0]]
+                for specs, _ in virtual_sources):
             blended = []
             for position, template_spec in enumerate(virtual_sources[0][0]):
                 spec = dict(template_spec)
@@ -2295,6 +2625,9 @@ def _interpolate_layer(layer, glyph, interpolation, glyph_key=None):
                                 for specs, factor in virtual_sources)
                 spec['angle'] = sum(factor * specs[position]['angle']
                                     for specs, factor in virtual_sources)
+                if spec['mode'] == 'section':
+                    spec['endT'] = sum(factor * specs[position]['endT']
+                                       for specs, factor in virtual_sources)
                 for end in ('before', 'after'):
                     spec[end] = {side: sum(factor * specs[position][end][side]
                                            for specs, factor in virtual_sources)
@@ -2504,10 +2837,12 @@ def _virtual_layout(path, items):
     """Per centerline segment, the (mode, side) of its virtual nodes in order."""
     count = max(0, len(_on_curve(items, bool(path.closed))) - (0 if path.closed else 1))
     layout = [[] for _ in range(count)]
-    for spec in sorted(virtual_nodes(path, count, items), key=lambda s: s['t']):
+    for spec in virtual_nodes(path, count, items):
         if 0 <= spec['segment'] < count:
-            layout[spec['segment']].append((spec['mode'], spec['side']))
-    return [tuple(specs) for specs in layout]
+            layout[spec['segment']].append((spec['t'], spec['mode'], spec['side']))
+        if spec['mode'] == 'section' and 0 <= spec['endSegment'] < count:
+            layout[spec['endSegment']].append((spec['endT'], 'section end', spec['side']))
+    return [tuple(entry[1:] for entry in sorted(specs)) for specs in layout]
 
 
 def _mismatch_reasons(entries, names):
@@ -2617,7 +2952,9 @@ def _describe_value(kind, value, pick):
     if kind == 'virtual':
         if not value:
             return ('none', 'なし')[pick]
-        modes = {'continuous': ('smooth', '連続'), 'step': ('step', '段差')}
+        modes = {'continuous': ('smooth', '連続'), 'step': ('step', '段差'),
+                 'whole': ('whole step', '全体段差'),
+                 'section': ('section', '区間'), 'section end': ('section end', '区間終点')}
         sides = {'left': ('left', '左'), 'right': ('right', '右'), 'both': ('both', '両方')}
         return ', '.join(('%s/%s', '%s・%s')[pick] % (modes[mode][pick], sides[side][pick])
                          for mode, side in value)

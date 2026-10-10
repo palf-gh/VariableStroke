@@ -90,6 +90,12 @@ PREPARE_LAYER_CALLBACK = 'GSPrepareLayerCallback'
 STEM_THICKNESS_OUTLINE_REQUEST = 'com.codex.VariableStroke.stemThicknessOutlineRequest'
 PANEL_SIZE = (600, 105)
 TAB_TOP = 32  # the tab row, below the stroke row
+# Virtual node modes in the panel: smooth, step, a step whose two widths reach
+# to the path's ends, and a section scaled between two handles.
+VIRTUAL_MODE_TITLES = (('continuous', 'Smooth', '連続'), ('step', 'Step', '段差'),
+                       ('whole', 'Whole', '全体'),
+                       ('section', 'Section', '区間'))
+VIRTUAL_MODE_NAMES = tuple(mode for mode, _, _ in VIRTUAL_MODE_TITLES)
 TABS = (('node', 'Node', 'ノード'), ('caps', 'Caps', '線端'),
         ('corner', 'Corners', '角丸'), ('virtual', 'Virtual', '仮想'),
         ('profile', 'Profile', 'プロファイル'))
@@ -544,6 +550,53 @@ def _corner_color(which):
     return (NSColor.colorWithCalibratedRed_green_blue_alpha_(0.95, 0.5, 0.0, 1.0)
             if which == 'outer' else
             NSColor.colorWithCalibratedRed_green_blue_alpha_(0.0, 0.62, 0.38, 1.0))
+
+
+def _virtual_handle_ends(widget):
+    """(end, shift along the stroke in screen points) of a virtual widget's width
+    handles: steps show both ends apart, a section its inside at each end."""
+    role = widget['role']
+    if role == 'continuous':
+        return (('before', 0.0),)
+    if role in ('start', 'end'):
+        return (('before', 5.0 if role == 'start' else -5.0),)
+    return (('before', -5.0), ('after', 5.0))
+
+
+_SEGMENT_KEYS = ('anchorStart', 'anchorEnd', 'anchorCount', 'startOpen', 'endOpen',
+                 'anchorBefore', 'anchorAfter')
+_END_KEYS = ('endSegment', 'endT', 'endAnchorStart', 'endAnchorEnd')
+
+
+def _moved_section(spec, start, end):
+    """A section with new ends; an end moved to another segment drops the
+    anchors that would pull it back (virtual_nodes binds it again)."""
+    changed = dict(spec)
+    if start[0] != spec['segment']:
+        for key in _SEGMENT_KEYS:
+            changed.pop(key, None)
+    if end[0] != spec['endSegment']:
+        changed.pop('endAnchorStart', None)
+        changed.pop('endAnchorEnd', None)
+    changed.update(segment=start[0], t=start[1], endSegment=end[0], endT=end[1])
+    return changed
+
+
+def _set_virtual_mode(path, spec):
+    """Fit a virtual node to the mode just set on it: a new section ends a
+    quarter of the segment further on (or before its node, near the end)."""
+    if spec['mode'] != 'section':
+        for key in _END_KEYS:
+            spec.pop(key, None)
+        return
+    spec['after'] = dict(spec['before'])
+    if 'endT' in spec:
+        return
+    t = spec['t']
+    if t <= 0.7:
+        spec.update(endSegment=spec['segment'], endT=t + 0.25)
+    else:
+        spec.update(t=t - 0.25, endSegment=spec['segment'], endT=t)
 
 
 def _parse_field(name, text):
@@ -1179,16 +1232,16 @@ class VariableStrokeTool(SelectTool):
                              callback=self.virtualAddFromInspector_, sizeStyle='small')
         virtual.delete = Button((65, 0, 55, 20), _loc('Delete', '削除'),
                                 callback=self.virtualDeleteFromInspector_, sizeStyle='small')
-        virtual.mode = SegmentedButton((126, 0, 125, 20),
-                                       [{'title': _loc('Smooth', '連続')},
-                                        {'title': _loc('Step', '段差')}],
+        virtual.mode = SegmentedButton((126, 0, 210, 20),
+                                       [{'title': _loc(english, japanese)}
+                                        for _, english, japanese in VIRTUAL_MODE_TITLES],
                                        callback=self.virtualModeFromInspector_, sizeStyle='small')
-        virtual.side = SegmentedButton((257, 0, 169, 20),
+        virtual.side = SegmentedButton((340, 0, 130, 20),
                                        [{'title': _loc('Left', '左')},
                                         {'title': _loc('Right', '右')},
                                         {'title': _loc('Both', '両方')}],
                                        callback=self.virtualSideFromInspector_, sizeStyle='small')
-        virtual.link = Button((432, 0, 105, 20), _loc('Linked', '左右連動'),
+        virtual.link = Button((474, 0, 100, 20), _loc('Linked', '左右連動'),
                               callback=self.virtualLinkFromInspector_, sizeStyle='small')
         virtual.directionLabel = TextBox((6, 29, 32, 14), _loc('Axis', '方向'), sizeStyle='small')
         virtual.direction = PopUpButton((40, 23, 100, 20),
@@ -1530,6 +1583,8 @@ class VariableStrokeTool(SelectTool):
                 continue
             changed = dict(match)
             changed[key] = value
+            if key == 'mode':
+                _set_virtual_mode(other, changed)
             if key == 'side' and value != 'both':
                 inactive = 'right' if value == 'left' else 'left'
                 for end in ('before', 'after'):
@@ -1597,8 +1652,8 @@ class VariableStrokeTool(SelectTool):
         self._redraw()
 
     def virtualModeFromInspector_(self, sender):
-        if not self._updating_ui and sender.get() in (0, 1):
-            self._virtual_set_common('mode', ('continuous', 'step')[sender.get()])
+        if not self._updating_ui and 0 <= sender.get() < len(VIRTUAL_MODE_NAMES):
+            self._virtual_set_common('mode', VIRTUAL_MODE_NAMES[sender.get()])
 
     def virtualSideFromInspector_(self, sender):
         if not self._updating_ui and sender.get() in (0, 1, 2):
@@ -1615,6 +1670,29 @@ class VariableStrokeTool(SelectTool):
             return
         direction = ('normal', 'horizontal', 'vertical', 'angle')[sender.get()]
         self._virtual_set_common('direction', direction)
+
+    @objc.python_method
+    def _drag_section_end(self, drag, point):
+        """Move one end of a section along the stroke, across nodes if need be."""
+        path = drag['path']
+        nearest = self._nearest_virtual_position(path, point)
+        spec = next((item for item in virtual_nodes(path) if item['id'] == drag['id']), None)
+        if nearest is None or spec is None:
+            return
+        position = (nearest[1], min(max(nearest[2], 0.005), 0.995))
+        start, end = (spec['segment'], spec['t']), (spec['endSegment'], spec['endT'])
+        if drag['role'] == 'start':
+            start = position
+        else:
+            end = position
+        if start[0] == end[0] and abs(start[1]-end[1]) < 0.002:
+            return
+        if not path.closed and start > end:
+            return  # the ends keep their order along an open stroke
+        changed = _moved_section(spec, start, end)
+        if self._virtual_change(path, changed):
+            _invalidate(drag['layer'], [path])
+            self._redraw()
 
     @objc.python_method
     def _virtual_tangent(self, path, spec):
@@ -2094,7 +2172,15 @@ class VariableStrokeTool(SelectTool):
                 field.enable(False)
                 field.set('')
             return
-        tab.mode.set(0 if spec['mode'] == 'continuous' else 1)
+        tab.mode.set(VIRTUAL_MODE_NAMES.index(spec['mode']))
+        mode = spec['mode']
+        tab.beforeLabel.set(_loc('Before', '以前') if mode == 'whole' else
+                            _loc('Inside', '区間') if mode == 'section' else
+                            _loc('Before', '手前'))
+        tab.afterLabel.set(_loc('After', '以降') if mode == 'whole' else _loc('After', '先'))
+        if not self._virtual_error and mode == 'whole' and \
+                self._virtual_selected and self._virtual_selected[0].closed:
+            tab.message.set(_loc('A step on a closed path', '閉じたパスでは段差になります'))
         tab.side.set({'left': 0, 'right': 1, 'both': 2}[spec['side']])
         tab.link.setTitle(_loc('Linked', '左右連動') if spec['linked'] else
                           _loc('Unlinked', '左右別々'))
@@ -2106,7 +2192,8 @@ class VariableStrokeTool(SelectTool):
         for end in ('before', 'after'):
             for side in ('left', 'right'):
                 field = getattr(tab, end + side.title())
-                field.enable(selected and (end == 'before' or spec['mode'] == 'step')
+                field.enable(selected and (end == 'before' or
+                                           spec['mode'] in ('step', 'whole'))
                              and (spec['side'] == side or spec['side'] == 'both')
                              and (not spec['linked'] or side == 'left'
                                   or spec['side'] != 'both'))
@@ -2473,7 +2560,7 @@ class VariableStrokeTool(SelectTool):
                 changed[end][side] = value
                 if changed['side'] == 'both' and changed['linked']:
                     changed[end]['left'] = changed[end]['right'] = value
-                if changed['mode'] == 'continuous':
+                if changed['mode'] in ('continuous', 'section'):
                     changed['after'] = dict(changed['before'])
             return self._virtual_change(path, changed)
 
@@ -2936,10 +3023,8 @@ class VariableStrokeTool(SelectTool):
                     diamond.stroke()
                 if not selected:
                     continue
-                for end in (('before', 'after') if widget['spec']['mode'] == 'step'
-                            else ('before',)):
-                    shift = (-5.0 if end == 'before' else 5.0) / scale \
-                        if widget['spec']['mode'] == 'step' else 0.0
+                for end, shift in _virtual_handle_ends(widget):
+                    shift /= scale
                     shift_vector = (widget['tangent'][0]*shift, widget['tangent'][1]*shift)
                     shifted_center = add(center, shift_vector)
                     for side, point in zip(('left', 'right'), widget[end]):
@@ -3086,6 +3171,7 @@ class VariableStrokeTool(SelectTool):
                         layer.beginChanges()
                         self._drag = {'kind': 'virtual-position', 'layer': layer,
                                       'path': path, 'id': spec['id'],
+                                      'role': widget['role'],
                                       'segment': spec['segment']}
                         self._select_tab('virtual')
                         self._last_ui_state = None
@@ -3095,10 +3181,8 @@ class VariableStrokeTool(SelectTool):
                             not (self._virtual_selected[0] == path and
                                  self._virtual_selected[1] == spec['id']):
                         continue
-                    for end in (('before', 'after') if spec['mode'] == 'step'
-                                else ('before',)):
-                        shift = (-5.0 if end == 'before' else 5.0) / self._scale() \
-                            if spec['mode'] == 'step' else 0.0
+                    for end, shift in _virtual_handle_ends(widget):
+                        shift /= self._scale()
                         translation = (widget['tangent'][0]*shift,
                                        widget['tangent'][1]*shift)
                         for side, tip in zip(('left', 'right'), widget[end]):
@@ -3394,6 +3478,9 @@ class VariableStrokeTool(SelectTool):
                 _invalidate(drag['layer'], [path])
                 self._redraw()
             return
+        if drag.get('kind') == 'virtual-position' and drag['role'] in ('start', 'end'):
+            self._drag_section_end(drag, (loc.x, loc.y))
+            return
         if drag.get('kind') == 'virtual-position':
             nearest = self._nearest_virtual_position(
                 drag['path'], (loc.x, loc.y), segment_index=drag['segment'])
@@ -3429,7 +3516,7 @@ class VariableStrokeTool(SelectTool):
                     changed[end][side] = round(pct, 1)
                     if changed['side'] == 'both' and changed['linked']:
                         changed[end]['left'] = changed[end]['right'] = round(pct, 1)
-                    if changed['mode'] == 'continuous':
+                    if changed['mode'] in ('continuous', 'section'):
                         changed['after'] = dict(changed['before'])
                     if self._virtual_change(drag['path'], changed):
                         _invalidate(drag['layer'], [drag['path']])
