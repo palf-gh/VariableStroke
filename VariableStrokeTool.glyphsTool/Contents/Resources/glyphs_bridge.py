@@ -649,6 +649,26 @@ def _kept_sections(layer):
     return {str(key): str(value) for key, value in dict(kept or {}).items()}
 
 
+_PARSED_SECTIONS = collections.OrderedDict()  # kept JSON -> [(entry, start, end)]
+
+
+def _parsed_sections(text):
+    """Entries of one path's kept JSON, parsed once: every redraw of every path
+    looks through the copies of all the layer's other paths."""
+    parsed = _PARSED_SECTIONS.get(text)
+    if parsed is None:
+        try:
+            parsed = [(dict(entry), entry.get('anchorStart'), entry.get('anchorEnd'))
+                      for entry in json.loads(text)]
+        except (TypeError, ValueError, AttributeError):
+            parsed = []
+        with _CACHE_LOCK:
+            _PARSED_SECTIONS[text] = parsed
+            while len(_PARSED_SECTIONS) > _CACHE_SIZE:
+                _PARSED_SECTIONS.popitem(last=False)
+    return parsed
+
+
 def _joined_sections(path, layer, kept, owner, anchor_ids):
     """Sections kept for strokes joined into this path: those of a path id no
     path on the layer has any more, on a segment with one of this path's anchors."""
@@ -657,12 +677,8 @@ def _joined_sections(path, layer, kept, owner, anchor_ids):
     for key, text in kept.items():
         if key == owner:
             continue
-        try:
-            entries = [dict(entry) for entry in json.loads(text)]
-        except (TypeError, ValueError):
-            continue
-        entries = [entry for entry in entries
-                   if entry.get('anchorStart') in anchors or entry.get('anchorEnd') in anchors]
+        entries = [dict(entry) for entry, start, end in _parsed_sections(text)
+                   if start in anchors or end in anchors]
         if entries:
             found[key] = entries
     if found:
@@ -1348,14 +1364,22 @@ def apply_profile(segments, specs, profile, closed=False):
     return result, corrected
 
 
-def virtual_widgets(path, defaults=None):
+def virtual_widgets(path, defaults=None, items=None):
     """Canvas positions for virtual sections, using the same nibs as expansion.
 
     A section has two widgets, at its start and end; their 'before' and 'after'
     edges are both those of the stretch it scales."""
     from variable_stroke_core import nib_edges, normal
-    segments = segments_for_path(path, defaults)
-    specs = virtual_nodes(path, len(segments))
+    try:
+        if not path.attributes.get(VIRTUAL_KEY):
+            return []  # (sections of a joined stroke are taken over by the outline)
+    except (AttributeError, TypeError):
+        return []
+    items = path_nodes(path) if items is None else items
+    segments = segments_for_path(path, defaults, items)
+    specs = virtual_nodes(path, len(segments), items)
+    if not specs:
+        return []
     # A width profile scales the stroke around each virtual node: its 100 % is
     # the profiled width there (see apply_profile).
     segments, profiled = apply_profile(segments, specs, path_profile(path), bool(path.closed))

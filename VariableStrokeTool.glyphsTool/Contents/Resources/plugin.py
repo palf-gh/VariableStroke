@@ -3000,9 +3000,9 @@ class VariableStrokeTool(SelectTool):
     def _draw_virtual_handles(self, strokes, defaults, scale):
         color = NSColor.colorWithCalibratedRed_green_blue_alpha_(0.58, 0.24, 0.78, 1.0)
         radius = 4.0 / scale
-        for path, _ in strokes:
+        for path, items in strokes:
             try:
-                widgets = virtual_widgets(path, defaults)
+                widgets = virtual_widgets(path, defaults, items)
             except ValueError:
                 continue
             for widget in widgets:
@@ -3159,9 +3159,9 @@ class VariableStrokeTool(SelectTool):
                 self._refresh_ui()
                 self._redraw()
                 return
-            for path, _ in strokes:
+            for path, items in strokes:
                 try:
-                    widgets = virtual_widgets(path, defaults)
+                    widgets = virtual_widgets(path, defaults, items)
                 except ValueError:
                     continue
                 for widget in widgets:
