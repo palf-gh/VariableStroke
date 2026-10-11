@@ -2196,23 +2196,69 @@ def _outline(path, defaults, items):
 
 
 def _sibling_crossings(path):
-    """The crossing layouts (see crossing_layout) of this path in the glyph's
-    other masters, () without crossing rounding: where a crossing lands on
-    another outline piece in some master, every master lays those pieces out
-    alike (see _crossing_runs' ranges)."""
+    """Per other master of the glyph, (crossing layout, where its roundings
+    end): () without crossing rounding. Where a crossing lands on another
+    outline piece in some master, every master lays those pieces out alike
+    (see _crossing_runs' ranges); where a rounding ends in another piece,
+    every master refits the edge up to it alike (see joined_outline)."""
     if crossing_spec(path) is None:
         return ()
-    layouts = []
-    for other in _sibling_path_objects(path):
+    bases = []
+    for other in [path] + _sibling_path_objects(path):
         try:
-            if not enabled(other):
+            if other is not path and not enabled(other):
                 continue
             items = path_nodes(other)
-            layouts.append(_gathered_outline(other, _resolve(None, other), items,
-                                             base_only=True)[5])
+            bases.append((other, _gathered_outline(other, _resolve(None, other), items,
+                                                   base_only=True)))
         except Exception:
             continue
-    return tuple(layouts)
+    if not bases or bases[0][0] is not path:
+        return ()
+    layouts = [base[5] for _, base in bases]
+    result = []
+    for k, (other, base) in enumerate(bases[1:], 1):
+        ranges = _crossing_ranges(base[5], layouts[:k] + layouts[k+1:])
+        result.append((base[5], _rounding_slots(other, base, ranges)))
+    return tuple(result)
+
+
+_SLOTS = collections.OrderedDict()  # (id(base outline), spec, ranges): (base, slots)
+
+
+def _rounding_slots(path, base, ranges):
+    """Where the roundings of `path` (with its base outline) end, as
+    joined_outline's `slots`, frozen."""
+    spec = crossing_spec(path)
+    if spec is None:
+        return ()
+    frozen_ranges = None if ranges is None else tuple(tuple(map(tuple, item)) for item in ranges)
+    key = (id(base), spec, frozen_ranges)
+    with _CACHE_LOCK:
+        found = _SLOTS.get(key)
+    if found is not None and found[0] is base:
+        return found[1]
+    contours, crossings = base[0], base[4]
+    part, fillets = _joining(contours, crossings, spec)
+    slots = {}
+    if part:
+        joined_outline(contours, crossings, part, fillets, ranges=ranges, slots=slots)
+    result = tuple(sorted(slots.items()))
+    _remember(_SLOTS, 256, key, (base, result))
+    return result
+
+
+def _joining(contours, crossings, spec):
+    """(crossings to join at, {crossing: rounding}) of a crossing spec."""
+    loops = {tuple(corners): part for _, corners, part in crossing_loops(contours, crossings)}
+    part, fillets = set(), {}
+    for corners, values in spec:
+        if corners in loops:
+            part.update(loops[corners])
+            values = dict(values)
+            rounding = values['radius'] if 'radius' in values else values
+            fillets.update((x, rounding) for x in corners)
+    return part, fillets
 
 
 def _crossing_ranges(own, others):
@@ -2333,17 +2379,11 @@ def _gathered_outline(path, defaults, items, hint=(), base_only=False, detect=Fa
         contours, collected, edges, cap_points, crossings, layout = base
         rounding = {}
         if crossing is not None:
-            loops = {tuple(corners): part for _, corners, part in
-                     crossing_loops(contours, crossings)}
-            part, fillets = set(), {}
-            for corners, values in crossing:
-                if corners in loops:
-                    part.update(loops[corners])
-                    values = dict(values)
-                    spec = values['radius'] if 'radius' in values else values
-                    fillets.update((x, spec) for x in corners)
-            contours = joined_outline(contours, crossings, part, fillets,
-                                      ranges=_crossing_ranges(layout, hint), report=rounding)
+            part, fillets = _joining(contours, crossings, crossing)
+            contours = joined_outline(
+                contours, crossings, part, fillets,
+                ranges=_crossing_ranges(layout, [other[0] for other in hint]),
+                report=rounding, others=[dict(other[1]) for other in hint])
         # Slot 3 keeps the outline as GSPaths once built (see _outline_paths);
         # slot 5 where the crossings were (see crossing_layout), slot 6 the
         # rounded corners (see crossing_hole_widgets).

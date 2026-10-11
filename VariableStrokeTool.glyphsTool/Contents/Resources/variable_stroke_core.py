@@ -2510,7 +2510,8 @@ def crossing_loops(contours, crossings=None):
     return loops
 
 
-def joined_outline(contours, crossings, part, fillets=None, ranges=None, report=None):
+def joined_outline(contours, crossings, part, fillets=None, ranges=None, report=None,
+                   slots=None, others=()):
     """Join the outline where it crosses itself at the crossings in `part`
     (see crossing_loops), as one would draw the loop by hand: one outer
     contour and the hole as a contour of its own, without the overlap.
@@ -2527,6 +2528,15 @@ def joined_outline(contours, crossings, part, fillets=None, ranges=None, report=
     at the same crossings interpolate. `report`, a dict, gets per rounded
     crossing {'corner', 'start', 'end' (the ends of the rounding), 'in', 'out'
     (the edges' directions there), 'middle', 'before', 'after', 'tension'}.
+
+    A rounding uses up edge pieces up to where it ends, and masters rounding
+    by other lengths end in other pieces: blended point by point, one
+    master's used-up piece would meet another's kept one. `slots`, a dict,
+    gets per rounded crossing the pieces (index in the run arriving, in the
+    run leaving) its ends lie in; `others` are the other masters' (each such
+    a dict). From the node starting the furthest piece any master reaches
+    to the rounding's end, every master has one cubic fitted to its edge
+    (and pieces of no size to the corner), so the blends stay on the edge.
     """
     fillets = fillets or {}
     part = set(part)
@@ -2584,6 +2594,40 @@ def joined_outline(contours, crossings, part, fillets=None, ranges=None, report=
         if trim_end[r] > 0:
             trim_end[r] = lengths[r] - _onto_node(lengths[r] - trim_end[r], nodes)
     cut = [_cut_run(pieces, trim_start[r], trim_end[r]) for r, (pieces, _) in enumerate(runs)]
+    own = {}
+    for after, r in rounded.items():
+        x = runs[r][1][0]
+        own[x] = (_slot_at(runs[r][0], lengths[r] - trim_end[r]),
+                  _slot_at(runs[after][0], trim_start[after]))
+    if slots is not None:
+        slots.update(own)
+    regions = {}
+    for after, r in rounded.items():
+        x = runs[r][1][0]
+        reached = [own[x]] + [other[x] for other in others if x in other]
+        # Arriving: the furthest piece from the corner is the lowest; leaving, the highest.
+        low = min(item[0] for item in reached)
+        high = max(item[1] for item in reached)
+        arriving, leaving = runs[r][0], runs[after][0]
+        p1, d1, p2, d2 = cut[r][1], cut[r][2], cut[after][3], cut[after][4]
+        h1, h2 = _rounding_handles(p1, d1, p2, d2, trim_end[r], trim_start[after],
+                                   tensions[after])
+        arc = ('cubic', (p1, add(p1, mul(d1, h1)), sub(p2, mul(d2, h2)), p2))
+        start = sum(_piece_samples(piece)[-1][1] for piece in arriving[:low])
+        end = sum(_piece_samples(piece)[-1][1] for piece in leaving[:high + 1])
+        regions[after] = (arc, _extreme_region(
+            arriving, start, lengths[r] - trim_end[r], arc, leaving, trim_start[after],
+            end, crossings[x][0]))
+        # The edges from the node before the rounding and to the node after it
+        # are in the region's cubics now: their pieces have no size there.
+        m = _piece_point(arriving[low], 0.0)
+        n = _piece_point(leaving[high], 1.0)
+        # (Each keeps its kind: which pieces a master's rounding reaches does
+        # not change the structure.)
+        cut[r] = (list(cut[r][0][:low]) + [(kind, (m,) * len(points)) for kind, points
+                                            in arriving[low:]],) + tuple(cut[r][1:])
+        cut[after] = ([(kind, (n,) * len(points)) for kind, points in leaving[:high + 1]] +
+                      list(cut[after][0][high + 1:]),) + tuple(cut[after][1:])
     joined = {}
     for order in _cycle_orders(runs, starts, first_run, events):
         if all(not _junction_open(crossings[runs[r][1][0]], runs[r][1][1]) for r in order):
@@ -2593,10 +2637,8 @@ def joined_outline(contours, crossings, part, fillets=None, ranges=None, report=
             x, strand = runs[order[k-1]][1]
             if r in rounded:
                 p1, d1, p2, d2 = cut[order[k-1]][1], cut[order[k-1]][2], cut[r][3], cut[r][4]
-                h1, h2 = _rounding_handles(p1, d1, p2, d2, trim_end[order[k-1]],
-                                           trim_start[r], tensions[r])
-                arc = ('cubic', (p1, add(p1, mul(d1, h1)), sub(p2, mul(d2, h2)), p2))
-                contour.extend(_split_at_extreme(arc, crossings[x][0]))
+                arc, region = regions[r]
+                contour.extend(region)
                 if report is not None:
                     report[x] = {'corner': crossings[x][0], 'start': p1, 'end': p2,
                                  'in': d1, 'out': d2, 'middle': cubic(*arc[1], 0.5),
@@ -2615,48 +2657,77 @@ def joined_outline(contours, crossings, part, fillets=None, ranges=None, report=
     return result
 
 
-def _split_at_extreme(arc, corner):
-    """The rounding cubic as two, split where it runs upright (vertical or
-    horizontal) furthest towards the corner: there the hole has its extreme,
-    which wants a node. The shape stays the same. Without such a point inside
-    it, the second cubic is one of no size at its end (the outline keeps one
-    structure)."""
-    pts = arc[1]
-    toward = sub(corner, mul(add(pts[0], pts[3]), 0.5))
-    best = None
+def _extreme_region(arriving, start, keep_to, arc, leaving, keep_from, end, corner):
+    """Three cubics for the hole's outline from the node before a rounding
+    (`start` along the run `arriving`) through the rounding `arc` to the node
+    after it (`end` along `leaving`), meeting at the outline's extremes
+    towards the corner there: where it is furthest that way horizontally
+    (running upright) and vertically (running level).
+
+    Every master then has nodes at the same places of the hole (its
+    extremes, the nodes the edges had), whatever lengths it rounds by, and
+    blends of masters stay smooth. An extreme at the region's end leaves the
+    piece there of no size; each cubic is fitted to the outline it replaces."""
+    samples = []  # (distance along the region, point, direction)
+    position = 0.0
+
+    def take(pieces, lo, hi):
+        nonlocal position
+        at = 0.0
+        for piece in pieces:
+            size = _piece_samples(piece)[-1][1]
+            if size > 1e-9 and at + size >= lo - 1e-9 and at <= hi + 1e-9:
+                table = _piece_samples(piece)
+                a = _t_at_length(table, max(lo - at, 0.0))
+                b = _t_at_length(table, min(hi - at, size))
+                for i in range(25):
+                    t = a + (b - a) * i / 24.0
+                    point = _piece_point(piece, t)
+                    if samples:
+                        position += length(sub(point, samples[-1][1]))
+                    samples.append((position, point, _piece_tangent(piece, t)))
+            at += size
+    take(arriving, start, keep_to)
+    take([arc], 0.0, _piece_samples(arc)[-1][1])
+    take(leaving, keep_from, end)
+    if len(samples) < 2:
+        point = samples[0][1] if samples else arc[1][0]
+        return [('cubic', (point,) * 4)] * 3
+    first, last = samples[0], samples[-1]
+    toward = sub(corner, mul(add(arc[1][0], arc[1][3]), 0.5))
+    marks = []
     for axis in (0, 1):
-        values = [cubic_derivative(*pts, i / 48.0)[axis] for i in range(49)]
-        for i in range(48):
-            if values[i] * values[i+1] >= 0:
-                continue
-            lo, hi = i / 48.0, (i + 1) / 48.0
-            for _ in range(40):
-                middle = (lo + hi) / 2.0
-                if cubic_derivative(*pts, lo)[axis] * cubic_derivative(*pts, middle)[axis] <= 0:
-                    hi = middle
-                else:
-                    lo = middle
-            t = (lo + hi) / 2.0
-            if 0.02 < t < 0.98:
-                point = cubic(*pts, t)
-                reach = point[0]*toward[0] + point[1]*toward[1]
-                if best is None or reach > best[0]:
-                    best = (reach, t, axis)
-    if best is None:
-        return [arc, ('cubic', (pts[3],) * 4)]
-    _, t, axis = best
-    first, second = _split_cubic(pts, t)
-    # Exactly upright at the new node: both handles level with it.
-    node = first[3]
-    first = (first[0], first[1], _upright(first[2], node, axis), node)
-    second = (node, _upright(second[1], node, axis), second[2], second[3])
-    return [('cubic', first), ('cubic', second)]
+        sign = 1.0 if toward[axis] >= 0 else -1.0
+        best = max(sample[1][axis] * sign for sample in samples)
+        # The middle of a stretch at the extreme (an upright straight edge).
+        tied = [k for k, sample in enumerate(samples) if sample[1][axis] * sign >= best - 1e-6]
+        marks.append((tied[len(tied) // 2], axis))
+    marks.sort()
+    ends = [(0, None)] + marks + [(len(samples) - 1, None)]
+    cubics = []
+    for (k0, axis0), (k1, axis1) in zip(ends, ends[1:]):
+        p0, p3 = samples[k0][1], samples[k1][1]
+        if k1 <= k0 or length(sub(p3, p0)) < 1e-6:
+            cubics.append(('cubic', (p0,) * 4))
+            continue
+        d0 = _upright_direction(samples[k0][2], axis0)
+        d1 = _upright_direction(samples[k1][2], axis1)
+        inner = samples[k0 + 1:k1]
+        span = samples[k1][0] - samples[k0][0]
+        us = [(sample[0] - samples[k0][0]) / span for sample in inner]
+        cubics.append(('cubic', _handles(p0, p3, d0, d1, [sample[1] for sample in inner],
+                                         us, length(sub(p3, p0)))))
+    return cubics
 
 
-def _upright(handle, node, axis):
-    """`handle` moved onto the line through `node` along which the curve runs
-    there (x of the node kept for axis 0, y for axis 1)."""
-    return (node[0], handle[1]) if axis == 0 else (handle[0], node[1])
+def _upright_direction(direction, axis):
+    """`direction` turned upright (axis 0: an x extreme) or level (axis 1),
+    keeping its sense; unchanged for no axis."""
+    if axis is None:
+        return direction
+    if axis == 0:
+        return (0.0, 1.0 if direction[1] >= 0 else -1.0)
+    return (1.0 if direction[0] >= 0 else -1.0, 0.0)
 
 
 ROUNDING_NODE_CATCH = 2.0  # units: a rounding's end this close to a node goes onto it
@@ -2668,6 +2739,18 @@ def _onto_node(distance, nodes):
     near = [node for node in nodes if abs(node - distance) <= ROUNDING_NODE_CATCH and
             node > EPS]
     return min(near, key=lambda node: abs(node - distance)) if near else distance
+
+
+def _slot_at(pieces, distance):
+    """The index of the piece `distance` along a run lies in, as _cut_run
+    finds it."""
+    position = 0.0
+    for i, piece in enumerate(pieces):
+        size = _piece_samples(piece)[-1][1]
+        if distance <= position + size:
+            return i
+        position += size
+    return len(pieces) - 1
 
 
 def _rounding_handles(p1, d1, p2, d2, first, second, tension):
