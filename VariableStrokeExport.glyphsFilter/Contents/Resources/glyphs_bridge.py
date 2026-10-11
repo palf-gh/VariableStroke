@@ -2779,6 +2779,9 @@ class _RecordedLayer(object):
         for path, (attributes, nodes) in zip(self.paths, self._original):
             set_attributes = {key: value for key, value in path.attributes.items()
                               if attributes.get(key, _MISSING) != value}
+            # Settings a source does not have are taken off (see _interpolate_layer).
+            set_attributes.update((key, _MISSING) for key in attributes
+                                  if key not in path.attributes)
             node_changes = []
             for position, (node, before) in enumerate(zip(path.nodes, nodes)):
                 updates = {key: value for key, value in node.userData.items()
@@ -2804,7 +2807,10 @@ def _apply_interpolation(layer, recorded):
         layer.userData[key] = value
     for path, (attributes, node_changes) in zip(list(layer.paths), paths):
         for key, value in attributes.items():
-            path.attributes[key] = value
+            if value is _MISSING:
+                _pop(path.attributes, key)
+            else:
+                path.attributes[key] = value
         if node_changes:
             nodes = list(path.nodes)
             for position, updates, removed, final in node_changes:
@@ -3029,12 +3035,26 @@ def forget_interpolations():
         _BLENDS.clear()
 
 
+def _is_own_layer(glyph, layer):
+    """True when `layer` is one of the glyph's own layers (not a copy)."""
+    try:
+        layers = glyph.layers
+        layers = list(layers.values()) if isinstance(layers, dict) else list(layers)
+    except Exception:
+        return False
+    return any(other is layer for other in layers)
+
+
 def interpolate_layer(layer, glyph, interpolation, cache_key=None, glyph_key=None):
     """Carry the strokes over to `layer` (see _interpolate_layer) and keep the
     blended master outlines for its strokes (see _BLENDS). With `cache_key`, a
     result computed for the same key and path structure is written again
     without reading the sources. `glyph_key` names the glyph's current state
     (identity, last change) so the masters' outlines are read once per edit."""
+    if _is_own_layer(glyph, layer):
+        # A master's own layer (Variable Font Preview hands those over at a
+        # master): what it holds is the master's design, never to be written.
+        return False
     if cache_key is not None:
         with _CACHE_LOCK:
             cached = _INTERPOLATIONS.get(cache_key)
@@ -3198,6 +3218,9 @@ def _interpolate_layer(layer, glyph, interpolation, glyph_key=None):
     sources = []
     interpolation = dict(interpolation or {})
     shape = tuple(len(path.nodes) for path in layer.paths)
+    # Masters that take no part (factor 0) give nothing, not even their settings.
+    interpolation = {layer_id: factor for layer_id, factor in interpolation.items()
+                     if abs(float(factor)) > 1e-9} or interpolation
     for layer_id, factor in interpolation.items():
         record = _source_record(glyph, layer_id, glyph_key)
         if record is not None and tuple(item['count'] for item in record['paths']) != shape:
@@ -3225,13 +3248,19 @@ def _interpolate_layer(layer, glyph, interpolation, glyph_key=None):
                   record['paths'][index]['count'] == len(path.nodes)]
         if len(others) != len(sources):
             continue
-        template = next((other for _, other, _ in others if other['enabled']), None)
-        if template is None:
+        # Settings that switch (cap shapes, a cap curve on or off) come from the
+        # source the layer is nearest to.
+        enabled_sources = [(factor, other) for _, other, factor in others if other['enabled']]
+        if not enabled_sources:
             continue
+        template = max(enabled_sources, key=lambda item: item[0])[1]
         if path.attributes.get(BLEND_KEY):
             path.attributes[BLEND_KEY] = ''  # copied from a source: not this blend
-        for key, value in template['attributes'].items():
-            path.attributes[key] = value
+        for key in _STROKE_ATTRIBUTES:
+            if key in template['attributes']:
+                path.attributes[key] = template['attributes'][key]
+            else:
+                _pop(path.attributes, key)  # left over from another source
         # A hole joined in one source is joined here, its values blended (no
         # length where unset, an older radius as both lengths).
         hole_sources = [(hole_settings(_Attributes(other['attributes'])), factor)

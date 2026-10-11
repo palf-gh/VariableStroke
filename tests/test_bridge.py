@@ -1089,6 +1089,30 @@ class BridgeTests(unittest.TestCase):
         bridge._BEVELLED_ELSEWHERE.clear()
         self.assertEqual(len(bridge.curves_for_path(mitered.paths[0])[0]), 6)
 
+    def test_interpolated_layer_takes_switches_from_the_nearest_master_only(self):
+        def master(curve):
+            path = Path([Node(0, 0), Node(0, 100)])
+            for node in path.nodes:
+                node.userData.clear()
+            path.attributes[bridge.CAP_END_KEY] = 'angle'
+            if curve:
+                path.attributes[bridge.CAP_END_CURVE_ON_KEY] = True
+            return Layer([path])
+        light, wide = master(True), master(False)
+        glyph = types.SimpleNamespace(layers={'light': light, 'wide': wide},
+                                      userData={bridge.GLYPH_KEY: True})
+        for weights in ({'light': 0.0, 'wide': 1.0}, {'light': 0.3, 'wide': 0.7}):
+            target = master(True)  # Glyphs copies a source's attributes onto it
+            self.assertTrue(bridge.interpolate_layer(target, glyph, weights))
+            self.assertFalse(bridge.cap_curve_enabled(target.paths[0], True), weights)
+        target = master(False)
+        bridge.interpolate_layer(target, glyph, {'light': 0.8, 'wide': 0.2})
+        self.assertTrue(bridge.cap_curve_enabled(target.paths[0], True))
+        # A master's own layer handed over (Variable Font Preview) is left alone.
+        self.assertFalse(bridge.interpolate_layer(wide, glyph, {'light': 0.0, 'wide': 1.0}))
+        self.assertNotIn(bridge.CAP_END_CURVE_ON_KEY, wide.paths[0].attributes)
+        self.assertNotIn(bridge.LAYER_STATE_KEY, wide.userData)
+
     def test_interpolated_bevel_blends_the_cut(self):
         def master(bevel):
             path = Path([Node(0, 0), Node(0, 100), Node(100, 100)])
