@@ -754,11 +754,17 @@ class GeometryTests(unittest.TestCase):
             end = (400 + 300*math.cos(angle), 300*math.sin(angle))
             segments = [('line', ((0, 0), (400, 0)), 60, 60), ('line', ((400, 0), end), 60, 60)]
             left, right = node_edges(segments)[1]
+            # Inside the turn the sides are cut where they really cross, which
+            # races away from the node as the corner gets sharp: no jump beyond
+            # how far that crossing itself moves.
+            half = math.radians(180 - (step * 0.1 + 0.05)) / 2.0
+            inner = 30.0 / math.tan(half) if half > 1e-6 else 0.0
             if previous:
                 jump = max(math.hypot(left[0]-previous[0][0], left[1]-previous[0][1]),
                            math.hypot(right[0]-previous[1][0], right[1]-previous[1][1]))
-                self.assertLess(jump, 2.0, 'jump at %.1f degrees' % (step * 0.1))
-            previous = (left, right)
+                self.assertLess(jump, 2.0 + 2.0 * abs(inner - previous[2]),
+                                'jump at %.1f degrees' % (step * 0.1))
+            previous = (left, right, inner)
 
     def test_corner_handles_round_trip(self):
         # Moving an arc end to a new trim must reproduce that trim when the radius

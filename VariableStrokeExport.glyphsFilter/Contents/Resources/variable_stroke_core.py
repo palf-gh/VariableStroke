@@ -17,6 +17,7 @@ def unit(a):
     d = length(a)
     return (a[0] / d, a[1] / d) if d > EPS else (1.0, 0.0)
 def normal(a): return (-a[1], a[0])
+def _dot(a, b): return a[0]*b[0] + a[1]*b[1]
 
 
 def move_outline_vertices(contours, edges, offsets, handle_offsets=None):
@@ -1071,8 +1072,26 @@ def _join(a, b, width):
         q = sub(b.start, a.end)
         tangent_point = add(a.end, mul(ta, (q[0]*tb[1] - q[1]*tb[0]) / denominator))
     point, a_tb, b_ta = tangent_point, a.tb, b.ta
+    # Inside a sharp corner the sides cross far from the node: they are cut
+    # where they really cross, however far that is (see `inner` below).
+    inner = None
+    if a.kind == 'line' and b.kind == 'line':
+        back, on = -_dot(sub(point, a.end), ta), _dot(sub(point, b.start), tb)
+        a_size, b_size = length(sub(a.end, a.start)), length(sub(b.end, b.start))
+        if back > 0 and on > 0 and a_size > EPS and b_size > EPS:
+            inner = (point, a.tb, b.ta, max(back / a_size, on / b_size))
     if a.kind == 'cubic' or b.kind == 'cubic':
         crossing = _side_crossing(a, b, ta, tb, reach)
+        if crossing is None or crossing[0] > reach:
+            span = sum(length(sub(q, p)) for side in (a, b)
+                       for p, q in zip(side.polyline(8), side.polyline(8)[1:]))
+            far = _side_crossing(a, b, ta, tb, span)
+            if far is not None:
+                far = _refined_crossing(a, b, far)
+            if far is not None and far[2] < a.tb - 1e-6 and far[3] > b.ta + 1e-6:
+                used = max((a.tb - far[2]) / max(a.tb - a.ta, EPS),
+                           (far[3] - b.ta) / max(b.tb - b.ta, EPS))
+                inner = (far[1], far[2], far[3], used)
         if crossing is not None:
             cost, hit, hit_a_tb, hit_b_ta = crossing
             # 0 within `reach` along the sides, 1 at twice that: blend, don't switch.
@@ -1090,16 +1109,27 @@ def _join(a, b, width):
     limit = MITER_FAR_LIMIT * width / 2.0 if a.kind != b.kind else reach
     if distance > limit:
         point = add(middle, mul(sub(point, middle), limit / distance))
+    if inner is not None and inner[3] < 1.0:
+        # The true crossing; only where it nears the end of a side (one part
+        # all but swallowed by the other) it gives way to the point held near
+        # the node, smoothly.
+        w = min(max((inner[3] - 0.75) / 0.25, 0.0), 1.0)
+        w = w*w*(3-2*w)
+        point = add(mul(inner[0], 1-w), mul(point, w))
+        a_tb = inner[1]*(1-w) + a_tb*w
+        b_ta = inner[2]*(1-w) + b_ta*w
     a_controls = (a.override_piece or a.piece())[1] if a.kind == 'cubic' else None
     b_controls = (b.override_piece or b.piece())[1] if b.kind == 'cubic' else None
     a_trim = ((a_tb-a.ta)/(a.tb-a.ta) if a_controls is not None and a.tb-a.ta > EPS
               else 1.0)
     b_trim = ((b_ta-b.ta)/(b.tb-b.ta) if b_controls is not None and b.tb-b.ta > EPS
               else 0.0)
+    # The true crossing inside a corner is on both sides: cut them there.
+    exact = inner is not None and length(sub(point, inner[0])) < max(0.5, 0.01*width)
     a_on_curve = (a_controls is not None and a_trim < 1-1e-4 and
-                  length(sub(a.at(a_tb), point)) < max(0.5, 0.01*width))
+                  (exact or length(sub(a.at(a_tb), point)) < max(0.5, 0.01*width)))
     b_on_curve = (b_controls is not None and b_trim > 1e-4 and
-                  length(sub(b.at(b_ta), point)) < max(0.5, 0.01*width))
+                  (exact or length(sub(b.at(b_ta), point)) < max(0.5, 0.01*width)))
     if a.kind != b.kind and not \
             (a_on_curve or b_on_curve):
         # Only a miter built from tangent extensions needs a visual bound.
@@ -1194,6 +1224,28 @@ def _side_crossing(a, b, ta, tb, reach):
             b_ta = b.ta + (b.tb-b.ta) * (j-1+u) / count if j >= 1 else b.ta
             best = (cost, point, a_tb, b_ta)
     return best
+
+
+def _refined_crossing(a, b, crossing):
+    """A crossing of sides a and b found on their polylines (see
+    _side_crossing), moved onto the sides themselves by Newton steps on their
+    parameters. Thick strokes' sides bend away from their chords by units."""
+    cost, point, s, t = crossing
+    for _ in range(8):
+        pa, pb = a.at(s), b.at(t)
+        f = sub(pa, pb)
+        if length(f) < 1e-6:
+            break
+        step = 1e-4
+        da = mul(sub(a.at(min(s + step, 1.0)), a.at(max(s - step, 0.0))), 0.5 / step)
+        db = mul(sub(b.at(min(t + step, 1.0)), b.at(max(t - step, 0.0))), 0.5 / step)
+        determinant = -da[0]*db[1] + da[1]*db[0]
+        if abs(determinant) < EPS:
+            break
+        s -= (-f[0]*db[1] + f[1]*db[0]) / determinant
+        t -= (da[0]*f[1] - da[1]*f[0]) / determinant
+        s, t = min(max(s, a.ta), a.tb), min(max(t, b.ta), b.tb)
+    return (cost, mul(add(a.at(s), b.at(t)), 0.5), s, t)
 
 
 def _side_contour(sides, widths, closed, joined=False, breaks=(), zero=()):
