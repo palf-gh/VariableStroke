@@ -77,6 +77,20 @@ class GeometryTests(unittest.TestCase):
         self.assertEqual(first, straight)
         self.assertEqual(second[1], ((15.0, 30.0),) * 4)
 
+    def test_rounding_end_near_a_node_goes_onto_it(self):
+        contours = outline_curves(LOOP)
+        every = contour_crossings(contours, holes_only=False)
+        _, corners, part = crossing_loops(contours, every)[0]
+        # The hole's edges are 130 long to the next corner: 129 ends on it.
+        report = {}
+        joined_outline(contours, every, part, {x: {'before': 129, 'after': 40} for x in corners},
+                       report=report)
+        self.assertAlmostEqual(report[corners[0]]['before'], 130.0)
+        report = {}
+        joined_outline(contours, every, part, {x: {'before': 127, 'after': 40} for x in corners},
+                       report=report)
+        self.assertAlmostEqual(report[corners[0]]['before'], 127.0)
+
     def test_joined_loop_keeps_one_structure_for_any_radius_or_width(self):
         def kinds(contours):
             return [[kind for kind, _ in contour] for contour in contours]

@@ -2573,6 +2573,16 @@ def joined_outline(contours, crossings, part, fillets=None, ranges=None, report=
             share = lengths[r] / wanted if wanted > EPS else 0.0
             trim_start[r] *= share
             trim_end[r] *= share
+        # A rounding ending just short of (or past) a node of its edge ends on
+        # it: no sliver of an edge left between the node and the rounding.
+        nodes, position = [], 0.0
+        for piece in runs[r][0][:-1]:
+            position += _piece_samples(piece)[-1][1]
+            nodes.append(position)
+        if trim_start[r] > 0:
+            trim_start[r] = _onto_node(trim_start[r], nodes)
+        if trim_end[r] > 0:
+            trim_end[r] = lengths[r] - _onto_node(lengths[r] - trim_end[r], nodes)
     cut = [_cut_run(pieces, trim_start[r], trim_end[r]) for r, (pieces, _) in enumerate(runs)]
     joined = {}
     for order in _cycle_orders(runs, starts, first_run, events):
@@ -2647,6 +2657,17 @@ def _upright(handle, node, axis):
     """`handle` moved onto the line through `node` along which the curve runs
     there (x of the node kept for axis 0, y for axis 1)."""
     return (node[0], handle[1]) if axis == 0 else (handle[0], node[1])
+
+
+ROUNDING_NODE_CATCH = 2.0  # units: a rounding's end this close to a node goes onto it
+
+
+def _onto_node(distance, nodes):
+    """`distance` along a run moved onto the nearest of `nodes` (distances
+    of the nodes between its pieces) within ROUNDING_NODE_CATCH."""
+    near = [node for node in nodes if abs(node - distance) <= ROUNDING_NODE_CATCH and
+            node > EPS]
+    return min(near, key=lambda node: abs(node - distance)) if near else distance
 
 
 def _rounding_handles(p1, d1, p2, d2, first, second, tension):

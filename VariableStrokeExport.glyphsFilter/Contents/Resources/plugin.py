@@ -3,7 +3,7 @@ import objc
 from GlyphsApp import Glyphs
 from GlyphsApp.plugins import FilterWithoutDialog
 from glyphs_bridge import (convert_layer, convert_glyph, master_incompatibilities,
-                           describe_incompatibility)
+                           describe_incompatibility, drop_empty_segments)
 from outline_union import union_layer_outlines
 from export_settings import remove_overlap_enabled
 
@@ -49,9 +49,12 @@ class VariableStrokeExport(FilterWithoutDialog):
         else:
             convert_layer(layer, keep_marks=not inEditView)
             # A variable export hands over the master layers themselves; a union
-            # there would change each master's contours on its own.
-            if not inEditView and remove_overlap_enabled() and not _is_master_layer(layer):
-                union_layer_outlines(layer)
+            # there would change each master's contours on its own, and their
+            # segments of no length keep the masters compatible.
+            if not inEditView and not _is_master_layer(layer):
+                drop_empty_segments(layer)
+                if remove_overlap_enabled():
+                    union_layer_outlines(layer)
 
     @objc.signature(b'v@:@@')
     def processFont_withArguments_(self, font, arguments):

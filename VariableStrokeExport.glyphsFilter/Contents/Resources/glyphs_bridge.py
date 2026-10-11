@@ -2417,8 +2417,12 @@ def generated_paths(path, defaults=None, contours=None, upright=True):
                 new_path.nodes.append(GSNode(points[3], CURVE))
             else:
                 new_path.nodes.append(GSNode(points[1], LINE))
-        # Glyphs closes from its last node back to the first. No extra zero edge.
-        if len(new_path.nodes) > 1 and xy(new_path.nodes[-1]) == start:
+        # Glyphs closes from its last node back to the first. No extra zero edge,
+        # also where rounding left the contour's end a hair off its start (which
+        # would give one master a node more than the others).
+        last = xy(new_path.nodes[-1]) if len(new_path.nodes) > 1 else None
+        if last is not None and abs(last[0] - start[0]) < 1e-6 and \
+                abs(last[1] - start[1]) < 1e-6:
             if contour[-1][0] == 'cubic':
                 new_path.nodes[0].type = CURVE
             new_path.nodes.pop()
@@ -3608,6 +3612,36 @@ def node_contour(path):
             segments.append(('line', (start, point)))
         start, controls = point, []
     return segments
+
+
+def drop_empty_segments(layer):
+    """Remove segments of no length from this plugin's outlines in `layer`.
+
+    The outlines keep such segments so every master has the same structure
+    (a bevel or rounding of no size, an edge a rounding used up). A static
+    instance, already interpolated, has no use for them: they are duplicate
+    points there. Returns how many were removed."""
+    removed = 0
+    for index, shape in enumerate(list(layer.shapes)):
+        if not isinstance(shape, GSPath) or not is_outline(shape) or not shape.closed:
+            continue
+        segments = node_contour(shape)
+        kept = [segment for segment in segments
+                if any(abs(point[0] - segment[1][0][0]) > 1e-3 or
+                       abs(point[1] - segment[1][0][1]) > 1e-3 for point in segment[1][1:])]
+        if not kept or len(kept) == len(segments):
+            continue
+        # What was left of a segment of almost no length: the next starts where
+        # the one before ends.
+        for k, (kind, points) in enumerate(kept):
+            previous = kept[k-1][1][-1]
+            if points[0] != previous:
+                kept[k] = (kind, (previous,) + tuple(points[1:]))
+        replacement = generated_paths(shape, contours=[kept], upright=False)[0]
+        layer.shapes.remove(shape)
+        layer.shapes.insert(index, replacement)
+        removed += len(segments) - len(kept)
+    return removed
 
 
 def copied_contours(layer, selected):

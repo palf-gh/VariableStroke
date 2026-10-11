@@ -945,6 +945,25 @@ class BridgeTests(unittest.TestCase):
         self.assertEqual(len(kinds[0]), 2)
         self.assertEqual(kinds[0], kinds[1])
 
+    def test_contour_ending_a_hair_off_its_start_gets_no_extra_node(self):
+        source = Path([Node(0, 0)])
+        contour = [('line', ((0, 0), (100, 0))), ('line', ((100, 0), (100, 100))),
+                   ('line', ((100, 100), (1e-13, -1e-13)))]
+        path = bridge.generated_paths(source, contours=[contour], upright=False)[0]
+        self.assertEqual(len(path.nodes), 3)
+
+    def test_static_instances_drop_segments_of_no_length(self):
+        source = Path([Node(0, 0)])
+        contour = [('line', ((0, 0), (100, 0))), ('line', ((100, 0), (100, 0))),
+                   ('cubic', ((100, 0), (100, 0), (100, 0), (100, 0))),
+                   ('line', ((100, 0), (100, 100))), ('line', ((100, 100), (0, 0)))]
+        layer = Layer(bridge.generated_paths(source, contours=[contour], upright=False))
+        self.assertEqual(bridge.drop_empty_segments(layer), 2)
+        self.assertEqual([bridge.xy(node) for node in layer.paths[0].nodes],
+                         [(0, 0), (100, 0), (100, 100)])
+        self.assertTrue(bridge.is_outline(layer.paths[0]))
+        self.assertEqual(bridge.drop_empty_segments(layer), 0)
+
     def test_outlines_run_counterclockwise_with_clockwise_counters(self):
         def area(path):
             points = [(node.position.x, node.position.y) for node in path.nodes]
