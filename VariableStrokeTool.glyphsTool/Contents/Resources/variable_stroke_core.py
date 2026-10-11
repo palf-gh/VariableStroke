@@ -1269,10 +1269,12 @@ def _side_contour(sides, widths, closed, joined=False, breaks=(), zero=()):
 
 
 def _bevel_breaks(lefts, rights, node_of, bevels, closed):
-    """Joins to cut on the outer side: ({side: {k: angle or None}}, {side: set
-    of k}) for 'bevel' (or ('bevel', page angle of the cut)) and for 'zero' (a
-    bevel in another master), k being the join of side k and side k+1;
-    `node_of(sides, k)` names its node in `bevels`."""
+    """Joins to cut on the outer side: ({side: {k: angle, ('clip', limit) or
+    None}}, {side: set of k}) for 'bevel' (or ('bevel', page angle of the
+    cut)), ('clip', limit) (a miter cut off `limit` half-widths out, see
+    _clipped_miter) and for 'zero' (a cut in another master), k being the
+    join of side k and side k+1; `node_of(sides, k)` names its node in
+    `bevels`."""
     cut = {'left': {}, 'right': {}}
     zero = {'left': set(), 'right': set()}
     if not bevels:
@@ -1294,6 +1296,8 @@ def _bevel_breaks(lefts, rights, node_of, bevels, closed):
             spec = bevels[node]
             if spec == 'zero':
                 zero[name].add(k)
+            elif isinstance(spec, (tuple, list)) and spec and spec[0] == 'clip':
+                cut[name][k] = ('clip', float(spec[1]))
             else:
                 angle = spec[1] if isinstance(spec, (tuple, list)) and len(spec) > 1 else None
                 cut[name][k] = None if angle is None else float(angle)
@@ -1302,8 +1306,56 @@ def _bevel_breaks(lefts, rights, node_of, bevels, closed):
 
 def _apply_bevel_angles(sides, widths, cuts):
     for k, angle in cuts.items():
-        if angle is not None:
+        if isinstance(angle, tuple):
+            _clipped_miter(sides[k], sides[(k+1) % len(sides)], angle[1], widths[k])
+        elif angle is not None:
             _angled_bevel(sides[k], sides[(k+1) % len(sides)], angle, widths[k])
+
+
+def _clipped_miter(a, b, limit, width):
+    """A miter cut off `limit` half-widths out from the node (as in Affinity
+    Designer): both edges go straight on along their end tangents, to their
+    crossing where that is nearer, else to the cut across the corner's middle
+    direction there, which the cut line (of no size at a full point) joins.
+    0 is a bevel; the edges are never taken back."""
+    node = mul(add(a.pts[-1], b.pts[0]), 0.5)
+    ta, tb = a.tangent(a.tb), b.tangent(b.ta)
+    out = sub(ta, tb)  # the incoming side runs on, the outgoing one back
+    if length(out) < EPS:
+        return
+    out = unit(out)
+    distance = max(float(limit), 0.0) * width / 2.0
+    ends = []
+    for origin, tangent in ((a.end, ta), (b.start, mul(tb, -1.0))):
+        along = _dot(tangent, out)
+        if along < 0.05:
+            ends.append(origin)  # running away from the cut: keep the bevel's end
+            continue
+        reach = (distance - _dot(sub(origin, node), out)) / along
+        ends.append(add(origin, mul(tangent, max(reach, 0.0))))
+    # Where the edges cross before the cut, they meet there: a full point.
+    denominator = ta[0]*tb[1] - ta[1]*tb[0]
+    if abs(denominator) > 1e-9:
+        q = sub(b.start, a.end)
+        s = (q[0]*tb[1] - q[1]*tb[0]) / denominator
+        u = (q[0]*ta[1] - q[1]*ta[0]) / denominator
+        miter = add(a.end, mul(ta, s))
+        if s >= 0 and u <= 0 and _dot(sub(miter, node), out) <= distance:
+            ends = [miter, miter]
+    for side, at_end, point in ((a, True, ends[0]), (b, False, ends[1])):
+        if length(sub(point, side.end if at_end else side.start)) < 1e-9:
+            continue
+        if side.kind == 'cubic':
+            # Straight on along the end tangent, the curve itself kept: bending
+            # the curve to reach the point would swell the stroke.
+            controls = (side.override_piece or side.piece())[1]
+            straight = _straight_extension(controls, at_end, point)
+            side.override_piece = ('cubic', straight if straight is not None else
+                                   _bend_join_endpoint(controls, at_end, point))
+        if at_end:
+            side.end = point
+        else:
+            side.start = point
 
 
 def _angled_bevel(a, b, angle, width):

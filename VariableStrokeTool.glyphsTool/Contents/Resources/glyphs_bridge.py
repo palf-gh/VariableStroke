@@ -85,6 +85,10 @@ GLYPH_KEY = 'com.codex.VariableStroke.glyphEnabled'
 GLYPH_CORNERS_KEY = 'com.codex.VariableStroke.glyphHasCorners'
 JOIN_KEY = 'com.codex.VariableStroke.join'  # per node: 'bevel'; absent means miter
 BEVEL_ANGLE_KEY = 'com.codex.VariableStroke.bevelAngle'  # page degrees; absent: automatic
+# Per mitered node: how far out the miter may reach, in half stroke widths from
+# the node; beyond, it is cut off (as Affinity Designer's miter limit). Absent:
+# the miter is held near the node in one point, as before.
+MITER_LIMIT_KEY = 'com.codex.VariableStroke.miterLimit'
 # Per bevelled node: the width and height percent after the corner (the
 # segment leaving the node); absent, the stroke goes on as thick as before it.
 AFTER_SCALE_KEY = 'com.codex.VariableStroke.scaleAfter'
@@ -514,7 +518,7 @@ def width(node, path=None, base=None):
 def after_data(data):
     """A bevelled node's values for the segment after its corner (see
     AFTER_SCALE_KEY), or None where the stroke goes on as before it."""
-    if data is None or join_of(data) != 'bevel':
+    if not join_of(data):
         return None
     width, height = data.get(AFTER_SCALE_KEY), data.get(AFTER_HEIGHT_SCALE_KEY)
     if width is None and height is None:
@@ -1833,7 +1837,7 @@ def copy_stroke_settings(source, target):
     corner_keys = (CORNER_ON_KEY, CORNER_KEY, CORNER_INNER_KEY,
                    CORNER_TENSION_KEY, CORNER_INNER_TENSION_KEY,
                    CORNER_RATIO_KEY, CORNER_INNER_RATIO_KEY, JOIN_KEY, BEVEL_ANGLE_KEY,
-                   AFTER_SCALE_KEY, AFTER_HEIGHT_SCALE_KEY)
+                   AFTER_SCALE_KEY, AFTER_HEIGHT_SCALE_KEY, MITER_LIMIT_KEY)
     for index, (position, item) in enumerate(zip(target_positions, target_nodes)):
         node = item[0]
         width, height, offset_value, rotation_value = samples[index] if matching_nodes else \
@@ -1957,10 +1961,25 @@ def note_corner(node, key=GLYPH_CORNERS_KEY):
 
 
 def join_of(data):
-    """'bevel' for a node whose outer corner is cut, else None (miter)."""
+    """'bevel' for a node whose outer corner is cut, 'clip' for a miter with a
+    limit (cut off beyond it, see MITER_LIMIT_KEY), else None (a plain miter)."""
     try:
-        return 'bevel' if data is not None and data.get(JOIN_KEY) == 'bevel' else None
+        if data is None:
+            return None
+        if data.get(JOIN_KEY) == 'bevel':
+            return 'bevel'
+        return 'clip' if miter_limit_of(data) is not None else None
     except (AttributeError, TypeError):
+        return None
+
+
+def miter_limit_of(data):
+    """A node's miter limit in half stroke widths, or None."""
+    try:
+        value = data.get(MITER_LIMIT_KEY) if data is not None else None
+        value = float(value) if value is not None else None
+        return max(value, 0.0) if value is not None and math.isfinite(value) else None
+    except (AttributeError, TypeError, ValueError):
         return None
 
 
@@ -2024,8 +2043,12 @@ def bevel_specs(path, items=None):
     items = path_nodes(path) if items is None else items
     specs = []
     for _, _, _, data in _on_curve(items, bool(path.closed)):
-        angle = bevel_angle_of(data) if join_of(data) else None
-        specs.append(('bevel', angle) if angle is not None else join_of(data))
+        join = join_of(data)
+        if join == 'clip':
+            specs.append(('clip', miter_limit_of(data)))
+        else:
+            angle = bevel_angle_of(data) if join else None
+            specs.append(('bevel', angle) if angle is not None else join)
     if all(spec is not None for spec in specs):
         return specs
     if not _glyph_has_corners(path, GLYPH_BEVELS_KEY):
@@ -2899,7 +2922,7 @@ def _source_values(path, defaults, key=None):
     Glyphs once per edit of the glyph (by `key`) instead of once per instance:
     {'width', 'height', 'nodes': {position: (w, h, offset, rotation, corner
     spec or None, left offset, right offset, 4 corner handles, join, bevel angle,
-    (width, height) after a bevel or None)}}."""
+    (width, height) after a bevel or None, miter limit or None)}}."""
     if key is not None:
         key = ('values',) + tuple(key)
         with _CACHE_LOCK:
@@ -2919,7 +2942,8 @@ def _source_values(path, defaults, key=None):
             corner_offset_of(data, 'left'), corner_offset_of(data, 'right'),
             corner_handle_of(data, 'left', True), corner_handle_of(data, 'left', False),
             corner_handle_of(data, 'right', True), corner_handle_of(data, 'right', False),
-            join_of(data), bevel_angle_of(data), _after_size(data, base_w, base_h))
+            join_of(data), bevel_angle_of(data), _after_size(data, base_w, base_h),
+            miter_limit_of(data))
     values = {'width': base_w, 'height': base_h, 'nodes': nodes}
     if key is not None:
         _remember(_SOURCE_OUTLINES, _SOURCE_OUTLINES_SIZE, key, values)
@@ -3224,7 +3248,7 @@ def _interpolate_layer(layer, glyph, interpolation, glyph_key=None):
                 continue
             nodes = [(entry['nodes'][position], factor) for entry, factor in values]
             # (w, h, offset, rotation, corner spec or None, 2 offsets, 4 handles, join,
-            #  bevel angle, (w, h) after a bevel or None)
+            #  bevel angle, (w, h) after a bevel or None, miter limit or None)
             node.userData[SCALE_KEY] = sum(f * v[0] for v, f in nodes) / base_w * 100.0
             node.userData[HEIGHT_SCALE_KEY] = sum(f * v[1] for v, f in nodes) / base_h * 100.0
             node.userData[OFFSET_KEY] = sum(f * v[2] for v, f in nodes)
@@ -3250,11 +3274,19 @@ def _interpolate_layer(layer, glyph, interpolation, glyph_key=None):
                 node.userData[CORNER_RATIO_KEY] = corner['ratio']
                 node.userData[CORNER_INNER_RATIO_KEY] = corner['inner_ratio']
             # A bevel in any source: the blended master outlines have its cut
-            # (see _blend_contours); expanding the values gives it in full.
-            if any(v[11] for v, _ in nodes):
+            # (see _blend_contours); expanding the values gives it in full. A
+            # miter limit blends among the sources that have one.
+            if any(v[11] == 'bevel' for v, _ in nodes):
                 node.userData[JOIN_KEY] = 'bevel'
             elif JOIN_KEY in node.userData:
                 del node.userData[JOIN_KEY]
+            limits = [(v[14], f) for v, f in nodes if v[14] is not None]
+            if limits and not any(v[11] == 'bevel' for v, _ in nodes):
+                total = sum(f for _, f in limits)
+                node.userData[MITER_LIMIT_KEY] = sum(l * f for l, f in limits) / total \
+                    if total > 1e-9 else limits[0][0]
+            elif MITER_LIMIT_KEY in node.userData:
+                del node.userData[MITER_LIMIT_KEY]
             # An angle set in every source blends; one automatic cut keeps it automatic.
             angles = [(v[12], f) for v, f in nodes]
             if any(v[11] for v, _ in nodes) and all(a is not None for a, _ in angles):

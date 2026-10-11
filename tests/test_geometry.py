@@ -747,6 +747,30 @@ class GeometryTests(unittest.TestCase):
         self.assertAlmostEqual((y0 - 300) * math.cos(math.radians(30)) -
                                x0 * math.sin(math.radians(30)), 0, places=3)
 
+    def test_miter_limit_cuts_the_point_off_as_affinity_does(self):
+        # A V of two lines meeting at the node (200, 40); half width 15.
+        segs = [('line', ((0, 100), (200, 40)), 30, 30), ('line', ((200, 40), (0, -20)), 30, 30)]
+        def tip(limit):
+            contour = outline_curves(segs, bevels=[None, ('clip', limit), None])[0]
+            return contour[0][1][1], contour[1][1][1]  # the ends of the cut line
+        a, b = tip(0)  # 0: a bevel
+        bevel = outline_curves(segs, bevels=[None, 'bevel', None])[0]
+        self.assertEqual((a, b), (bevel[0][1][1], bevel[1][1][1]))
+        for limit in (1, 2, 3):  # cut across the corner `limit` half widths out
+            a, b = tip(limit)
+            self.assertAlmostEqual(a[0], 200 + limit * 15, places=6)
+            self.assertAlmostEqual(b[0], 200 + limit * 15, places=6)
+        a, b = tip(10)  # beyond the full miter: a point, the cut line of no size
+        self.assertEqual(a, b)
+        self.assertAlmostEqual(a[1], 40.0, places=6)
+        # The cut moves smoothly into the point.
+        previous = None
+        for step in range(0, 81):
+            a, b = tip(step / 10.0)
+            if previous is not None:
+                self.assertLess(length(sub(a, previous)), 2.0)
+            previous = a
+
     def test_corner_moves_continuously(self):
         previous = None
         for step in range(0, 1700):

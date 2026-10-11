@@ -51,7 +51,8 @@ from glyphs_bridge import (CAP_START_KEY, CAP_END_KEY, CAP_START_ANGLE_KEY, CAP_
                            copy_stroke_settings, compare_string_suffix, forget_interpolations,
                            _content_mark, JOIN_KEY, GLYPH_BEVELS_KEY, join_of,
                            BEVEL_ANGLE_KEY, bevel_angle_of,
-                           AFTER_SCALE_KEY, AFTER_HEIGHT_SCALE_KEY,
+                           AFTER_SCALE_KEY, AFTER_HEIGHT_SCALE_KEY, MITER_LIMIT_KEY,
+                           miter_limit_of,
                            CROSSING_HOLES_KEY, crossing_hole_widgets, set_crossing_hole,
                            set_hole_values, hole_settings,
                            master_incompatibilities, describe_incompatibility)
@@ -552,7 +553,7 @@ _NODE_KEYS = (SCALE_KEY, HEIGHT_SCALE_KEY, OFFSET_KEY, CORNER_OFFSET_LEFT_KEY,
               CORNER_ON_KEY, CORNER_KEY, CORNER_INNER_KEY,
               CORNER_TENSION_KEY, CORNER_INNER_TENSION_KEY,
               CORNER_RATIO_KEY, CORNER_INNER_RATIO_KEY, JOIN_KEY, BEVEL_ANGLE_KEY,
-              AFTER_SCALE_KEY, AFTER_HEIGHT_SCALE_KEY)
+              AFTER_SCALE_KEY, AFTER_HEIGHT_SCALE_KEY, MITER_LIMIT_KEY)
 _MISSING = object()
 # Node fields of the live corner and the userData key each one writes.
 CORNER_FIELDS = {'radius': CORNER_KEY, 'innerRadius': CORNER_INNER_KEY,
@@ -560,7 +561,7 @@ CORNER_FIELDS = {'radius': CORNER_KEY, 'innerRadius': CORNER_INNER_KEY,
                  'ratio': CORNER_RATIO_KEY, 'innerRatio': CORNER_INNER_RATIO_KEY}
 # Node fields of the size after a bevelled corner and the key each one writes.
 AFTER_FIELDS = {'scaleAfter': AFTER_SCALE_KEY, 'heightScaleAfter': AFTER_HEIGHT_SCALE_KEY}
-NODE_FIELDS = ('scale', 'heightScale', 'offset', 'rotation', 'bevelAngle') + \
+NODE_FIELDS = ('scale', 'heightScale', 'offset', 'rotation', 'bevelAngle', 'miterLimit') + \
     tuple(CORNER_FIELDS) + tuple(AFTER_FIELDS)
 
 
@@ -658,6 +659,8 @@ def _parse_field(name, text):
         return value if math.isfinite(value) and 0 < value < 10000 else None
     if name in ('rotation', 'bevelAngle'):
         return value % 180.0 if math.isfinite(value) else None
+    if name == 'miterLimit':
+        return value if math.isfinite(value) and 0 <= value < 1000 else None
     if name in ('startAngle', 'endAngle'):
         return value % 360.0
     if name in ('radius', 'innerRadius', 'holeBefore', 'holeAfter'):
@@ -680,6 +683,18 @@ def _apply_field(name, value, paths, nodes):
     elif name == 'height':
         for path in paths:
             path.attributes[STROKE_HEIGHT_KEY] = value
+    elif name == 'miterLimit':
+        # A limit makes the corner a miter cut off beyond it; empty: a plain miter.
+        for node in nodes:
+            if value is None:
+                if node.userData.get(MITER_LIMIT_KEY) is not None:
+                    del node.userData[MITER_LIMIT_KEY]
+            else:
+                node.userData[MITER_LIMIT_KEY] = value
+                if node.userData.get(JOIN_KEY) is not None:
+                    del node.userData[JOIN_KEY]
+        if value is not None and nodes and paths:
+            note_corner(paths[0], GLYPH_BEVELS_KEY)
     elif name in AFTER_FIELDS:
         # An empty field: the stroke goes on after the corner as before it.
         for node in nodes:
@@ -748,6 +763,9 @@ def _field_is(name, value, paths, nodes):
                    (value is None or join_of(node.userData)) for node in nodes)
     if name in AFTER_FIELDS:
         return all(node.userData.get(AFTER_FIELDS[name]) == value for node in nodes)
+    if name == 'miterLimit':
+        return all(miter_limit_of(node.userData) == value and
+                   join_of(node.userData) != 'bevel' for node in nodes)
     if name in ('scale', 'heightScale', 'offset', 'rotation'):
         key = {'scale': SCALE_KEY, 'heightScale': HEIGHT_SCALE_KEY, 'offset': OFFSET_KEY,
                'rotation': ROTATION_KEY}[name]
@@ -1280,7 +1298,10 @@ class VariableStrokeTool(SelectTool):
                                              sizeStyle='small')
         node.heightScaleAfterField = SteppingEditText((181, 24, 43, 19), sizeStyle='small')
         node.heightScaleAfterUnit = TextBox((226, 28, 12, 14), '%', sizeStyle='small')
-        node.afterHint = TextBox((246, 28, 340, 14), '', sizeStyle='small')
+        node.limitLabel = TextBox((262, 28, 70, 14), _loc('Miter limit', 'マイター上限'),
+                                  sizeStyle='small')
+        node.miterLimitField = SteppingEditText((334, 24, 43, 19), sizeStyle='small')
+        node.afterHint = TextBox((386, 28, 210, 14), '', sizeStyle='small')
 
         caps = [{'imageObject': _cap_icon(value), 'width': 21} for value in CAP_VALUES]
         cap = group.capsTab = Group((0, TAB_TOP, -0, 48))
@@ -1455,6 +1476,7 @@ class VariableStrokeTool(SelectTool):
                   ('scale', node.scaleField), ('heightScale', node.heightScaleField),
                   ('offset', node.offsetField), ('rotation', node.rotationField),
                   ('bevelAngle', node.bevelAngleField),
+                  ('miterLimit', node.miterLimitField),
                   ('scaleAfter', node.scaleAfterField),
                   ('heightScaleAfter', node.heightScaleAfterField),
                   ('startAngle', cap.startAngle), ('endAngle', cap.endAngle),
@@ -2152,7 +2174,8 @@ class VariableStrokeTool(SelectTool):
                     offset_of(data), rotation_of(data, default_angle), ROTATION_KEY in data,
                     join_of(data), bevel_angle_of(data),
                     _number_or_none(data.get(AFTER_SCALE_KEY)),
-                    _number_or_none(data.get(AFTER_HEIGHT_SCALE_KEY)))
+                    _number_or_none(data.get(AFTER_HEIGHT_SCALE_KEY)),
+                    miter_limit_of(data))
                     for _, data, _ in entries)
             else:
                 details = (tuple((corner_on_of(data),
@@ -2269,13 +2292,18 @@ class VariableStrokeTool(SelectTool):
     @objc.python_method
     def _show_node_tab(self, tab, editable, details):
         (scales, height_scales, offsets, rotations, rotation_overridden, joins, bevel_angles,
-         scales_after, height_scales_after) = \
-            [list(column) for column in zip(*details)] or ([],) * 9
+         scales_after, height_scales_after, limits) = \
+            [list(column) for column in zip(*details)] or ([],) * 10
         tab.join.enable(editable)
         # The angle field: bevels only; empty for the automatic cut (or mixed values).
-        tab.bevelAngleField.enable(editable and bool(joins) and all(joins))
+        bevels = bool(joins) and all(join == 'bevel' for join in joins)
+        tab.bevelAngleField.enable(editable and bevels)
         tab.bevelAngleField.set(('%g' % bevel_angles[0])
-                                if all(joins) and _same(bevel_angles) else '')
+                                if bevels and _same(bevel_angles) else '')
+        # The miter limit: miters only; empty for a plain miter (or mixed values).
+        miters = bool(joins) and all(join != 'bevel' for join in joins)
+        tab.miterLimitField.enable(editable and miters)
+        tab.miterLimitField.set(('%g' % limits[0]) if miters and _same(limits) else '')
         # Mixed selection: neither segment.
         tab.join.set(-1 if len(set(joins)) != 1 else 1 if joins[0] == 'bevel' else 0)
         for field in (tab.scaleField, tab.heightScaleField, tab.offsetField, tab.rotationField):
@@ -2286,14 +2314,15 @@ class VariableStrokeTool(SelectTool):
         tab.rotationField.set(('%g' % rotations[0]) if _same(rotations) else '')
         tab.rotationField.getNSTextField().setTextColor_(
             NSColor.labelColor() if any(rotation_overridden) else NSColor.secondaryLabelColor())
-        # After a bevelled corner: empty where the stroke goes on as before it.
+        # After a cut corner: empty where the stroke goes on as before it.
         bevelled = bool(joins) and all(joins)
         for field, values in ((tab.scaleAfterField, scales_after),
                               (tab.heightScaleAfterField, height_scales_after)):
             field.enable(editable and bevelled)
             field.set(('%g' % values[0]) if bevelled and _same(values) else '')
         tab.afterHint.set('' if bevelled else
-                          _loc('Bevelled corners only', 'ベベルの角のみ'))
+                          _loc('After: bevels and limited miters',
+                               '角の後：ベベルと上限ありのマイター'))
 
     @objc.python_method
     def _show_virtual_tab(self, tab, editable, spec):
@@ -2636,8 +2665,8 @@ class VariableStrokeTool(SelectTool):
             self._live = live = None
         paths, nodes = self._field_targets(name, layer)
         value = _parse_field(name, text)
-        clear_scale = name in ('scale', 'heightScale', 'bevelAngle') + tuple(AFTER_FIELDS) and \
-            not str(text).strip()
+        clear_scale = name in ('scale', 'heightScale', 'bevelAngle', 'miterLimit') + \
+            tuple(AFTER_FIELDS) and not str(text).strip()
         if not paths or (name in NODE_FIELDS and not nodes):
             return
         if commit and str(text) == self._shown.get(name):

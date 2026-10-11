@@ -995,6 +995,28 @@ class BridgeTests(unittest.TestCase):
             self.assertGreater(areas[1], 0)
             self.assertGreater(abs(areas[1]), abs(areas[0]))  # the outer contour
 
+    def test_miter_limit_in_one_master_gives_the_others_a_cut_of_no_size(self):
+        def layer(limit):
+            path = Path([Node(0, 0), Node(200, 60), Node(0, 120)])
+            for node in path.nodes:
+                node.userData.clear()
+            if limit is not None:
+                path.nodes[1].userData[bridge.MITER_LIMIT_KEY] = limit
+            path.attributes[bridge.STROKE_WIDTH_KEY] = 30
+            path.attributes[bridge.STROKE_HEIGHT_KEY] = 30
+            return Layer([path])
+        limited, plain = layer(2), layer(None)
+        glyph = types.SimpleNamespace(layers=[limited, plain],
+                                      userData={bridge.GLYPH_BEVELS_KEY: True})
+        for item in glyph.layers:
+            item.parent = glyph
+        self.assertEqual(bridge.join_of(limited.paths[0].nodes[1].userData), 'clip')
+        self.assertEqual(bridge.bevel_specs(limited.paths[0]), [None, ('clip', 2.0), None])
+        self.assertEqual(bridge.bevel_specs(plain.paths[0]), [None, 'zero', None])
+        kinds = [[[kind for kind, _ in c] for c in bridge.curves_for_path(item.paths[0])]
+                 for item in glyph.layers]
+        self.assertEqual(kinds[0], kinds[1])
+
     def test_bevelled_corner_can_go_on_thicker_or_thinner(self):
         path = Path([Node(0, 100), Node(0, 0), Node(200, 0)])
         for node in path.nodes:
