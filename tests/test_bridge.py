@@ -830,6 +830,71 @@ class BridgeTests(unittest.TestCase):
         self.assertEqual([path.attributes[bridge.CAP_END_KEY] for path in target.paths],
                          ['square', 'square'])
 
+    def test_bevel_cuts_the_outer_corner_and_other_masters_keep_the_structure(self):
+        def layer(bevel):
+            path = Path([Node(0, 0), Node(0, 100), Node(100, 100)])
+            for node in path.nodes:
+                node.userData.clear()
+            if bevel:
+                path.nodes[1].userData[bridge.JOIN_KEY] = 'bevel'
+            path.attributes[bridge.STROKE_WIDTH_KEY] = 20
+            path.attributes[bridge.STROKE_HEIGHT_KEY] = 20
+            return Layer([path])
+        bevelled, mitered = layer(True), layer(False)
+        glyph = types.SimpleNamespace(layers=[bevelled, mitered],
+                                      userData={bridge.GLYPH_BEVELS_KEY: True})
+        for item in glyph.layers:
+            item.parent = glyph
+        cut = bridge.curves_for_path(bevelled.paths[0])[0]
+        self.assertIn(('line', ((-10.0, 100.0), (0.0, 110.0))), cut)  # outside the turn
+        self.assertIn(('line', ((10.0, 90.0), (10.0, 0.0))), cut)  # inside as before
+        sharp = bridge.curves_for_path(mitered.paths[0])[0]
+        self.assertEqual([kind for kind, _ in sharp], [kind for kind, _ in cut])
+        self.assertIn(('line', ((-10.0, 110.0), (-10.0, 110.0))), sharp)
+        # Without the glyph's note, a master on its own stays plain.
+        glyph.userData.clear()
+        bridge._BEVELLED_ELSEWHERE.clear()
+        self.assertEqual(len(bridge.curves_for_path(mitered.paths[0])[0]), 6)
+
+    def test_interpolated_bevel_blends_the_cut(self):
+        def master(bevel):
+            path = Path([Node(0, 0), Node(0, 100), Node(100, 100)])
+            for node in path.nodes:
+                node.userData.clear()
+            if bevel:
+                path.nodes[1].userData[bridge.JOIN_KEY] = 'bevel'
+            return Layer([path])
+        first, second = master(True), master(False)
+        glyph = types.SimpleNamespace(layers={'a': first, 'b': second},
+                                      userData={bridge.GLYPH_KEY: True,
+                                                bridge.GLYPH_BEVELS_KEY: True})
+        target = master(False)
+        self.assertTrue(bridge.interpolate_layer(target, glyph, {'a': 0.5, 'b': 0.5}))
+        self.assertEqual(target.paths[0].nodes[1].userData.get(bridge.JOIN_KEY), 'bevel')
+
+    def test_bevel_angle_is_read_from_the_node_and_blended(self):
+        def master(angle):
+            path = Path([Node(0, 0), Node(0, 100), Node(100, 100)])
+            for node in path.nodes:
+                node.userData.clear()
+            path.nodes[1].userData[bridge.JOIN_KEY] = 'bevel'
+            if angle is not None:
+                path.nodes[1].userData[bridge.BEVEL_ANGLE_KEY] = angle
+            return Layer([path])
+        self.assertEqual(bridge.bevel_specs(master(60).paths[0]), [None, ('bevel', 60.0), None])
+        self.assertEqual(bridge.bevel_specs(master(None).paths[0]), [None, 'bevel', None])
+        first, second = master(40), master(80)
+        glyph = types.SimpleNamespace(layers={'a': first, 'b': second},
+                                      userData={bridge.GLYPH_KEY: True})
+        target = master(None)
+        bridge.interpolate_layer(target, glyph, {'a': 0.5, 'b': 0.5})
+        self.assertAlmostEqual(target.paths[0].nodes[1].userData[bridge.BEVEL_ANGLE_KEY], 60)
+        automatic = master(None)
+        glyph.layers = {'a': first, 'b': automatic}
+        target = master(None)
+        bridge.interpolate_layer(target, glyph, {'a': 0.5, 'b': 0.5})
+        self.assertNotIn(bridge.BEVEL_ANGLE_KEY, target.paths[0].nodes[1].userData)
+
     def test_live_corners_line_up_only_with_layers_of_the_same_design(self):
         def layer(strokes, corner_at=None):
             paths = []

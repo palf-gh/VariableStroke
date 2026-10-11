@@ -345,6 +345,9 @@ def _ellipse_cap(center, nib, tangent, start, left, right):
 
 FIT_TOLERANCE = 1.0
 MITER_LIMIT = 4.0
+# A line meeting a curve keeps its true miter (both edges straight on to their
+# crossing) up to this many half-widths; only near hairpins is it pulled in.
+MITER_FAR_LIMIT = 10.0
 # How many half-widths a cap cut may reach along the stroke: a horizontal cut
 # stays horizontal down to a stroke about 5 degrees from horizontal.
 CUT_LIMIT = 12.0
@@ -1084,8 +1087,9 @@ def _join(a, b, width):
     a_tb = a.tb + (a_tb - a.tb) * fade
     b_ta = b.ta + (b_ta - b.ta) * fade
     distance = length(sub(point, middle))
-    if distance > reach:
-        point = add(middle, mul(sub(point, middle), reach / distance))
+    limit = MITER_FAR_LIMIT * width / 2.0 if a.kind != b.kind else reach
+    if distance > limit:
+        point = add(middle, mul(sub(point, middle), limit / distance))
     a_controls = (a.override_piece or a.piece())[1] if a.kind == 'cubic' else None
     b_controls = (b.override_piece or b.piece())[1] if b.kind == 'cubic' else None
     a_trim = ((a_tb-a.ta)/(a.tb-a.ta) if a_controls is not None and a.tb-a.ta > EPS
@@ -1109,8 +1113,15 @@ def _join(a, b, width):
                       abs(b.start[0]-center[0]))
         y_limit = max(1.35*nib_height, abs(a.end[1]-center[1]),
                       abs(b.start[1]-center[1]))
-        point = (min(center[0]+x_limit, max(center[0]-x_limit, point[0])),
-                 min(center[1]+y_limit, max(center[1]-y_limit, point[1])))
+        bounded = (min(center[0]+x_limit, max(center[0]-x_limit, point[0])),
+                   min(center[1]+y_limit, max(center[1]-y_limit, point[1])))
+        # A sharp corner's miter is far outside that bound, and pulling it in
+        # takes an edge off its own direction (the stroke leaves its
+        # centerline): past half a nib of pulling, the true miter takes over.
+        pulled = length(sub(point, bounded)) / max(max(nib_width, nib_height), EPS)
+        weight = min(max(pulled - 1.0, 0.0), 1.0)
+        weight = weight*weight*(3-2*weight)
+        point = add(mul(bounded, 1-weight), mul(point, weight))
     a.tb, b.ta = a_tb, b_ta
     a.end = b.start = point
     if a_controls is not None:
@@ -1185,7 +1196,10 @@ def _side_crossing(a, b, ta, tb, reach):
     return best
 
 
-def _side_contour(sides, widths, closed, joined=False, breaks=()):
+def _side_contour(sides, widths, closed, joined=False, breaks=(), zero=()):
+    """The pieces of one side. After side k, a break (k in `breaks`) adds the
+    line to the next side's start; `zero` adds a line of no length where the
+    sides were joined (a bevel in another master, see outline_curves)."""
     count = len(sides)
     breaks = set(breaks)
     if not joined:
@@ -1197,7 +1211,78 @@ def _side_contour(sides, widths, closed, joined=False, breaks=()):
         result.append(side.override_piece or side.piece())
         if k in breaks and (closed or k < count-1):
             result.append(('line', (side.end, sides[(k+1) % count].start)))
+        elif k in zero and (closed or k < count-1):
+            result.append(('line', (side.end, side.end)))
     return result
+
+
+def _bevel_breaks(lefts, rights, node_of, bevels, closed):
+    """Joins to cut on the outer side: ({side: {k: angle or None}}, {side: set
+    of k}) for 'bevel' (or ('bevel', page angle of the cut)) and for 'zero' (a
+    bevel in another master), k being the join of side k and side k+1;
+    `node_of(sides, k)` names its node in `bevels`."""
+    cut = {'left': {}, 'right': {}}
+    zero = {'left': set(), 'right': set()}
+    if not bevels:
+        return cut, zero
+    for name, sides in (('left', lefts), ('right', rights)):
+        n = len(sides)
+        for k in range(n if closed else n-1):
+            node = node_of(sides, k)
+            if node is None:
+                continue
+            if closed:
+                node %= len(bevels)
+            if not 0 <= node < len(bevels) or not bevels[node]:
+                continue
+            # The left side is outside of a right turn, the right side of a left one.
+            turns_left = _turns_left(sides[k], sides[(k+1) % n])
+            if turns_left != (name == 'right'):
+                continue
+            spec = bevels[node]
+            if spec == 'zero':
+                zero[name].add(k)
+            else:
+                angle = spec[1] if isinstance(spec, (tuple, list)) and len(spec) > 1 else None
+                cut[name][k] = None if angle is None else float(angle)
+    return cut, zero
+
+
+def _apply_bevel_angles(sides, widths, cuts):
+    for k, angle in cuts.items():
+        if angle is not None:
+            _angled_bevel(sides[k], sides[(k+1) % len(sides)], angle, widths[k])
+
+
+def _angled_bevel(a, b, angle, width):
+    """Turn the bevel between side a's end and side b's start to the page
+    `angle` (degrees), about the middle of the automatic cut: each edge goes
+    straight on along its end tangent to the cut line (or back from it).
+    Cuts nearly along an edge, or reaching too far, keep the automatic cut."""
+    radians = math.radians(angle)
+    direction = (math.cos(radians), math.sin(radians))
+    middle = mul(add(a.end, b.start), 0.5)
+    reach = MITER_FAR_LIMIT * width / 2.0
+
+    def hit(origin, tangent):
+        denominator = direction[0]*tangent[1] - direction[1]*tangent[0]
+        if abs(denominator) < 0.1:
+            return None
+        q = sub(origin, middle)
+        along = (q[0]*direction[1] - q[1]*direction[0]) / denominator
+        return None if abs(along) > reach else add(origin, mul(tangent, along))
+    end = hit(a.end, a.tangent(a.tb))
+    start = hit(b.start, b.tangent(b.ta))
+    if end is None or start is None:
+        return
+    for side, at_end, point in ((a, True, end), (b, False, start)):
+        if side.kind == 'cubic':
+            controls = (side.override_piece or side.piece())[1]
+            side.override_piece = ('cubic', _bend_join_endpoint(controls, at_end, point))
+        if at_end:
+            side.end = point
+        else:
+            side.start = point
 
 
 def _smooth_virtual_join(a, b):
@@ -1381,8 +1466,62 @@ def _fit_join_extension(controls, at_end, target):
     return (p0, p1, p2, p3)
 
 
+def _straight_extension(controls, at_end, target):
+    """One cubic for an edge extended straight along its end tangent to `target`
+    and then the edge itself (a miter): both ends keep their directions, and the
+    handle lengths fit the straight piece and the curve together. None when
+    `target` is not on that tangent line."""
+    p0, p1, p2, p3 = controls
+    end = p3 if at_end else p0
+    tangent = unit(sub(p3, p2) if at_end else sub(p1, p0))
+    offset = sub(target, end)
+    along = offset[0]*tangent[0] + offset[1]*tangent[1]
+    across = abs(offset[0]*tangent[1] - offset[1]*tangent[0])
+    if (along <= 0 if at_end else along >= 0) or across > max(0.5, 0.02*abs(along)):
+        return None
+    curve = [cubic(*controls, i/24.0) for i in range(25)]
+    straight = [add(end, mul(offset, i/8.0)) for i in range(1, 9)]
+    points = curve + straight if at_end else list(reversed(straight)) + curve
+    distances = [0.0]
+    for before, after in zip(points, points[1:]):
+        distances.append(distances[-1] + length(sub(after, before)))
+    total = distances[-1]
+    if total < EPS:
+        return None
+    start, finish = (p0, target) if at_end else (target, p3)
+    d0 = unit(sub(p1, p0)) if at_end else tangent
+    d1 = tangent if at_end else unit(sub(p3, p2))
+    samples, us = points[1:-1], [d/total for d in distances[1:-1]]
+    fitted = _handles(start, finish, d0, d1, samples, us, total)
+    for _ in range(2):
+        lines = [cubic(*fitted, i/64.0) for i in range(65)]
+        us = [min(max(i/64.0, 1e-3), 1-1e-3) for i in _nearest_along(samples, lines)]
+        fitted = _handles(start, finish, d0, d1, samples, us, total)
+    return fitted
+
+
 def _bend_join_endpoint(controls, at_end, target):
-    """Extend one cubic while retaining the width-derived offset interval."""
+    """Extend one cubic while retaining the width-derived offset interval.
+
+    A long extension (a sharp miter) is the edge drawn straight on to the
+    miter: the bent and refitted curve would bulge there, taking the stroke off
+    its centerline. Short ones keep their bend; in between the two blend."""
+    shaped = _shaped_join_endpoint(controls, at_end, target)
+    source_chord = length(sub(controls[-1], controls[0]))
+    if source_chord < EPS:
+        return shaped
+    ratio = length(sub(target, controls[-1] if at_end else controls[0])) / source_chord
+    weight = min(max((ratio-0.2)/0.25, 0.0), 1.0)
+    weight = weight*weight*(3-2*weight)
+    if weight <= 0.0:
+        return shaped
+    straight = _straight_extension(controls, at_end, target)
+    if straight is None:
+        return shaped
+    return tuple(add(mul(a, 1-weight), mul(b, weight)) for a, b in zip(shaped, straight))
+
+
+def _shaped_join_endpoint(controls, at_end, target):
     bent = _bend_curve_endpoint(controls, at_end, target)
     original = controls[-1] if at_end else controls[0]
     source_chord = length(sub(controls[-1], controls[0]))
@@ -1413,6 +1552,15 @@ def _bend_join_endpoint(controls, at_end, target):
                                        (weight, far_weight))
         p1 = add(mul(bent[1], 1-first_weight), mul(fitted[1], first_weight))
         p2 = add(mul(bent[2], 1-second_weight), mul(fitted[2], second_weight))
+        # The moved end keeps the edge's own direction: a join pulled back from
+        # a long miter is off the tangent, and a fitted handle turned towards
+        # the curve there makes the edge wave (an S) on its way back.
+        if at_end:
+            reach = (p3[0]-p2[0])*tangent[0] + (p3[1]-p2[1])*tangent[1]
+            p2 = sub(p3, mul(tangent, max(reach, 0.05*chord_length)))
+        else:
+            reach = (p1[0]-p0[0])*tangent[0] + (p1[1]-p0[1])*tangent[1]
+            p1 = add(p0, mul(tangent, max(reach, 0.05*chord_length)))
         u1 = sub(p1, p0)[0]*direction[0] + sub(p1, p0)[1]*direction[1]
         u2 = sub(p2, p0)[0]*direction[0] + sub(p2, p0)[1]*direction[1]
         if 0 <= u1 <= u2 <= chord_length:
@@ -1786,7 +1934,8 @@ def _independent_outline_curves(left_segments, right_segments, closed, cap_start
                                 cap_end, italic_angle, start_angle, end_angle,
                                 corners, left_map, right_map, left_breaks,
                                 right_breaks, left_smooths, right_smooths,
-                                report, edges, cap_start_curve, cap_end_curve, cap_out):
+                                report, edges, cap_start_curve, cap_end_curve, cap_out,
+                                bevels=None):
     """Build each side from only the virtual nodes that affect that side."""
     slant = math.tan(math.radians(italic_angle or 0.0))
 
@@ -1807,6 +1956,13 @@ def _independent_outline_curves(left_segments, right_segments, closed, cap_start
     if not lefts or not rights:
         return []
     left_breaks, right_breaks = set(left_breaks), set(right_breaks)
+    maps = {id(lefts): left_map, id(rights): right_map}
+    cut, zero = _bevel_breaks(lefts, rights,
+                              lambda sides, k: maps[id(sides)][(k+1) % len(sides)],
+                              bevels, closed)
+    left_breaks |= set(cut['left'])
+    right_breaks |= set(cut['right'])
+    left_zero, right_zero = zero['left'] - left_breaks, zero['right'] - right_breaks
 
     def corner_at(node):
         if node is None or not corners:
@@ -1832,6 +1988,8 @@ def _independent_outline_curves(left_segments, right_segments, closed, cap_start
 
     join_sides(lefts, left_widths, left_breaks, left_smooths)
     join_sides(rights, right_widths, right_breaks, right_smooths)
+    _apply_bevel_angles(lefts, left_widths, cut['left'])
+    _apply_bevel_angles(rights, right_widths, cut['right'])
 
     if edges is not None:
         left_edges = {node: lefts[k].start for k, node in enumerate(left_map[:len(lefts)])
@@ -1848,9 +2006,10 @@ def _independent_outline_curves(left_segments, right_segments, closed, cap_start
         for side in lefts + rights:
             _fillet_side(side)
             _optical_outer_curve(side)
-        outer = _side_contour(lefts, left_widths, True, joined=True, breaks=left_breaks)
+        outer = _side_contour(lefts, left_widths, True, joined=True, breaks=left_breaks,
+                              zero=left_zero)
         inner = _reverse(_side_contour(rights, right_widths, True, joined=True,
-                                       breaks=right_breaks))
+                                       breaks=right_breaks, zero=right_zero))
         outer_vertices = []
         for k in range(len(lefts)):
             inside = _turns_left(lefts[k-1], lefts[k])
@@ -1861,9 +2020,10 @@ def _independent_outline_curves(left_segments, right_segments, closed, cap_start
             k = (n-j) % n
             inside = _turns_left(rights[k-1], rights[k])
             inner_vertices.append(vertex(right_map[k], 'outer' if inside else 'inner', True))
-        for index in sorted((k+1 for k in left_breaks), reverse=True):
+        for index in sorted((k+1 for k in left_breaks | left_zero), reverse=True):
             outer_vertices.insert(index, None)
-        for index in sorted((len(rights)-1-k for k in right_breaks), reverse=True):
+        for index in sorted((len(rights)-1-k for k in right_breaks | right_zero),
+                            reverse=True):
             inner_vertices.insert(index, None)
         return [_round_contour(outer, outer_vertices, report),
                 _round_contour(inner, inner_vertices, report)]
@@ -1897,8 +2057,10 @@ def _independent_outline_curves(left_segments, right_segments, closed, cap_start
     for side in lefts + rights:
         _fillet_side(side)
         _optical_outer_curve(side)
-    left = _side_contour(lefts, left_widths, False, joined=True, breaks=left_breaks)
-    right = _side_contour(rights, right_widths, False, joined=True, breaks=right_breaks)
+    left = _side_contour(lefts, left_widths, False, joined=True, breaks=left_breaks,
+                         zero=left_zero)
+    right = _side_contour(rights, right_widths, False, joined=True, breaks=right_breaks,
+                          zero=right_zero)
     end_cap = _cap_segments(end_center, lefts[-1].w1, end_tangent, cap_end, True,
                             lefts[-1].end, rights[-1].end, lefts[-1].n1, slant,
                             cap_end_curve)
@@ -1924,7 +2086,7 @@ def _independent_outline_curves(left_segments, right_segments, closed, cap_start
     for k in range(1, len(lefts)):
         inside = _turns_left(lefts[k-1], lefts[k])
         left_vertices.append(vertex(left_map[k], 'inner' if inside else 'outer'))
-    for index in sorted((k+1 for k in left_breaks), reverse=True):
+    for index in sorted((k+1 for k in left_breaks | left_zero), reverse=True):
         left_vertices.insert(index, None)
 
     n = len(rights)
@@ -1933,7 +2095,7 @@ def _independent_outline_curves(left_segments, right_segments, closed, cap_start
         k = n-j
         inside = _turns_left(rights[k-1], rights[k])
         right_vertices.append(vertex(right_map[k], 'outer' if inside else 'inner', True))
-    for index in sorted((n-1-k for k in right_breaks), reverse=True):
+    for index in sorted((n-1-k for k in right_breaks | right_zero), reverse=True):
         right_vertices.insert(index, None)
     vertices = (left_vertices + [end] + [None]*(len(end_cap)-1) + right_vertices +
                 [dict(start, flip=True, which='inner') if start else None] +
@@ -1946,7 +2108,7 @@ def outline_curves(segments, closed=False, cap_start='flat', cap_end='flat',
                    corner_radii=None, report=None, edges=None, breaks=(), smooth_virtuals=(),
                    right_segments=None, right_corner_radii=None, left_map=None, right_map=None,
                    right_smooth_virtuals=(), cap_start_curve=None, cap_end_curve=None,
-                   cap_out=None):
+                   cap_out=None, bevels=None, right_bevels=None):
     """Return closed contours of ('line'|'cubic', control points) segments.
 
     Each segment is (kind, points, start, end[, modulation]) where start/end is a
@@ -1959,7 +2121,12 @@ def outline_curves(segments, closed=False, cap_start='flat', cap_end='flat',
     rounded corner: node, which ('outer'|'inner'), corner point, arc midpoint, the
     arc's points p1 c1 c2 p2, the turn angle, both trims and orientation flags.
     `edges`, if a dict, receives node_edges' result from the same joins, so the
-    editor's width handles cost nothing extra.
+    editor's width handles cost nothing extra. `bevels[i]` is 'bevel' to cut the
+    outer side of the corner at node i with a line between the two edges'
+    ends (('bevel', angle) turns that line to a page angle about its middle), 'zero' for a line of no length at the joined corner instead (a
+    bevel in another master: the masters keep one structure), or None. With
+    `right_segments`, `right_bevels` index the original nodes, as
+    `right_corner_radii` do.
     """
     for style in (cap_start, cap_end):
         if style not in CAPS:
@@ -1972,7 +2139,8 @@ def outline_curves(segments, closed=False, cap_start='flat', cap_end='flat',
             breaks.get('left', ()) if isinstance(breaks, dict) else breaks,
             breaks.get('right', ()) if isinstance(breaks, dict) else breaks,
             smooth_virtuals, right_smooth_virtuals, report, edges,
-            cap_start_curve, cap_end_curve, cap_out)
+            cap_start_curve, cap_end_curve, cap_out,
+            right_bevels if right_bevels is not None else bevels)
     slant = math.tan(math.radians(italic_angle or 0.0))
     if isinstance(breaks, dict):
         left_breaks = set(breaks.get('left', ()))
@@ -1993,6 +2161,11 @@ def outline_curves(segments, closed=False, cap_start='flat', cap_end='flat',
         indices.append(index)
     if not lefts:
         return []
+    cut, zero = _bevel_breaks(lefts, rights,
+                              lambda sides, k: indices[(k+1) % len(sides)], bevels, closed)
+    left_breaks = left_breaks | set(cut['left'])
+    right_breaks = right_breaks | set(cut['right'])
+    left_zero, right_zero = zero['left'] - left_breaks, zero['right'] - right_breaks
 
     def corner_of(node):
         if not corner_radii:
@@ -2017,19 +2190,22 @@ def outline_curves(segments, closed=False, cap_start='flat', cap_end='flat',
                     _join(sides[k], sides[(k+1) % n], widths[k])
             for k in smooth_virtuals:
                 _smooth_virtual_join(sides[k], sides[(k+1) % n])
+        _apply_bevel_angles(lefts, widths, cut['left'])
+        _apply_bevel_angles(rights, widths, cut['right'])
         if edges is not None:
             edges.update(_edge_map(lefts, rights, indices, True))
         for side in lefts + rights:
             _fillet_side(side)
             _optical_outer_curve(side)
-        outer = _side_contour(lefts, widths, True, joined=True, breaks=left_breaks)
+        outer = _side_contour(lefts, widths, True, joined=True, breaks=left_breaks,
+                              zero=left_zero)
         inner = _reverse(_side_contour(rights, widths, True, joined=True,
-                                       breaks=right_breaks))
+                                       breaks=right_breaks, zero=right_zero))
         outer_vertices = [closed_vertex(k, False) for k in range(n)]
         inner_vertices = [closed_vertex((n-j) % n, True) for j in range(n)]
-        for index in sorted((k+1 for k in left_breaks), reverse=True):
+        for index in sorted((k+1 for k in left_breaks | left_zero), reverse=True):
             outer_vertices.insert(index, None)
-        for index in sorted((n-1-k for k in right_breaks), reverse=True):
+        for index in sorted((n-1-k for k in right_breaks | right_zero), reverse=True):
             inner_vertices.insert(index, None)
         return [_round_contour(outer, outer_vertices, report),
                 _round_contour(inner, inner_vertices, report)]
@@ -2044,6 +2220,8 @@ def outline_curves(segments, closed=False, cap_start='flat', cap_end='flat',
                 _join(sides[k], sides[k+1], widths[k])
         for k in smooth_virtuals:
             _smooth_virtual_join(sides[k], sides[k+1])
+    _apply_bevel_angles(lefts, widths, cut['left'])
+    _apply_bevel_angles(rights, widths, cut['right'])
     if edges is not None:
         edges.update(_edge_map(lefts, rights, indices, False))
 
@@ -2072,8 +2250,10 @@ def outline_curves(segments, closed=False, cap_start='flat', cap_end='flat',
     for side in lefts + rights:
         _fillet_side(side)
         _optical_outer_curve(side)
-    left = _side_contour(lefts, widths, False, joined=True, breaks=left_breaks)
-    right = _side_contour(rights, widths, False, joined=True, breaks=right_breaks)
+    left = _side_contour(lefts, widths, False, joined=True, breaks=left_breaks,
+                         zero=left_zero)
+    right = _side_contour(rights, widths, False, joined=True, breaks=right_breaks,
+                          zero=right_zero)
     end_cap = _cap_segments(end_center, last.w1, end_tangent, cap_end, True,
                             lefts[-1].end, rights[-1].end, last.n1, slant,
                             cap_end_curve)
@@ -2094,8 +2274,8 @@ def outline_curves(segments, closed=False, cap_start='flat', cap_end='flat',
             cap_end, cap_start, cap_start_curve is not None,
             cap_end_curve is not None)
         n, e = len(lefts), len(end_cap)
-        insertion_points = [k+1 for k in left_breaks] + \
-                           [n+e+n-1-k for k in right_breaks]
+        insertion_points = [k+1 for k in left_breaks | left_zero] + \
+                           [n+e+n-1-k for k in right_breaks | right_zero]
         for index in sorted(insertion_points, reverse=True):
             vertices.insert(index, None)
         contour = _round_contour(contour, vertices, report)

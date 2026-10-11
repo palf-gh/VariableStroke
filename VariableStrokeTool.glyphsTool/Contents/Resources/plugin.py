@@ -49,7 +49,8 @@ from glyphs_bridge import (CAP_START_KEY, CAP_END_KEY, CAP_START_ANGLE_KEY, CAP_
                            corner_handle_of,
                            corner_on_of, corner_spec_of, copied_contours,
                            copy_stroke_settings, compare_string_suffix, forget_interpolations,
-                           _content_mark,
+                           _content_mark, JOIN_KEY, GLYPH_BEVELS_KEY, join_of,
+                           BEVEL_ANGLE_KEY, bevel_angle_of,
                            master_incompatibilities, describe_incompatibility)
 from glyphs_bridge import (VIRTUAL_KEY, virtual_nodes, virtual_widgets, virtual_point,
                            segments_for_path, _virtual_section_angle)
@@ -536,13 +537,14 @@ _NODE_KEYS = (SCALE_KEY, HEIGHT_SCALE_KEY, OFFSET_KEY, CORNER_OFFSET_LEFT_KEY,
               CORNER_OFFSET_RIGHT_KEY) + CORNER_HANDLE_KEYS + (ROTATION_KEY, WIDTH_KEY,
               CORNER_ON_KEY, CORNER_KEY, CORNER_INNER_KEY,
               CORNER_TENSION_KEY, CORNER_INNER_TENSION_KEY,
-              CORNER_RATIO_KEY, CORNER_INNER_RATIO_KEY)
+              CORNER_RATIO_KEY, CORNER_INNER_RATIO_KEY, JOIN_KEY, BEVEL_ANGLE_KEY)
 _MISSING = object()
 # Node fields of the live corner and the userData key each one writes.
 CORNER_FIELDS = {'radius': CORNER_KEY, 'innerRadius': CORNER_INNER_KEY,
                  'tension': CORNER_TENSION_KEY, 'innerTension': CORNER_INNER_TENSION_KEY,
                  'ratio': CORNER_RATIO_KEY, 'innerRatio': CORNER_INNER_RATIO_KEY}
-NODE_FIELDS = ('scale', 'heightScale', 'offset', 'rotation') + tuple(CORNER_FIELDS)
+NODE_FIELDS = ('scale', 'heightScale', 'offset', 'rotation', 'bevelAngle') + \
+    tuple(CORNER_FIELDS)
 
 
 def _same(values):
@@ -615,8 +617,8 @@ def _parse_field(name, text):
         if name == 'virtualAngle':
             return value if math.isfinite(value) else None
         return value if math.isfinite(value) and 0 < value < 10000 else None
-    if name == 'rotation':
-        return value % 180.0
+    if name in ('rotation', 'bevelAngle'):
+        return value % 180.0 if math.isfinite(value) else None
     if name in ('startAngle', 'endAngle'):
         return value % 360.0
     if name in ('radius', 'innerRadius'):
@@ -651,6 +653,17 @@ def _apply_field(name, value, paths, nodes):
     elif name == 'rotation':
         for node in nodes:
             node.userData[ROTATION_KEY] = value
+    elif name == 'bevelAngle':
+        # An empty field is the automatic cut; typing an angle selects the bevel.
+        for node in nodes:
+            if value is None:
+                if node.userData.get(BEVEL_ANGLE_KEY) is not None:
+                    del node.userData[BEVEL_ANGLE_KEY]
+            else:
+                node.userData[BEVEL_ANGLE_KEY] = value
+                node.userData[JOIN_KEY] = 'bevel'
+        if value is not None and nodes and paths:
+            note_corner(paths[0], GLYPH_BEVELS_KEY)
     elif name in CORNER_FIELDS:
         for node in nodes:
             node.userData[CORNER_FIELDS[name]] = value
@@ -673,6 +686,9 @@ def _field_is(name, value, paths, nodes):
     if name in CORNER_FIELDS:
         return all(corner_on(node) and node.userData.get(CORNER_FIELDS[name]) == value
                    for node in nodes)
+    if name == 'bevelAngle':
+        return all(node.userData.get(BEVEL_ANGLE_KEY) == value and
+                   (value is None or join_of(node.userData)) for node in nodes)
     if name in ('scale', 'heightScale', 'offset', 'rotation'):
         key = {'scale': SCALE_KEY, 'heightScale': HEIGHT_SCALE_KEY, 'offset': OFFSET_KEY,
                'rotation': ROTATION_KEY}[name]
@@ -1188,6 +1204,13 @@ class VariableStrokeTool(SelectTool):
         node.rotationLabel = TextBox((296, 4, 33, 14), _loc('Ang', '角度'), sizeStyle='small')
         node.rotationField = SteppingEditText((331, 0, 43, 19), sizeStyle='small')
         node.rotationUnit = TextBox((376, 4, 7, 14), '°', sizeStyle='small')
+        node.joinLabel = TextBox((396, 4, 30, 14), _loc('Join', '結合'), sizeStyle='small')
+        node.join = SegmentedButton((428, 0, 112, 20),
+                                    [{'title': _loc('Miter', 'マイター')},
+                                     {'title': _loc('Bevel', 'ベベル')}],
+                                    callback=self.joinFromInspector_, sizeStyle='small')
+        node.bevelAngleField = SteppingEditText((544, 0, 40, 19), sizeStyle='small')
+        node.bevelAngleUnit = TextBox((586, 4, 10, 14), '°', sizeStyle='small')
 
         caps = [{'imageObject': _cap_icon(value), 'width': 21} for value in CAP_VALUES]
         cap = group.capsTab = Group((0, TAB_TOP, -0, 48))
@@ -1351,6 +1374,7 @@ class VariableStrokeTool(SelectTool):
         fields = [('width', group.widthField), ('height', group.heightField),
                   ('scale', node.scaleField), ('heightScale', node.heightScaleField),
                   ('offset', node.offsetField), ('rotation', node.rotationField),
+                  ('bevelAngle', node.bevelAngleField),
                   ('startAngle', cap.startAngle), ('endAngle', cap.endAngle),
                   ('radius', corner.outerField), ('innerRadius', corner.innerField),
                   ('tension', corner.tensionField), ('innerTension', corner.innerTensionField),
@@ -2040,7 +2064,8 @@ class VariableStrokeTool(SelectTool):
                     scale_of(data) if SCALE_KEY in data or HEIGHT_SCALE_KEY not in data
                     else None,
                     height_scale_of(data) if HEIGHT_SCALE_KEY in data else None,
-                    offset_of(data), rotation_of(data, default_angle), ROTATION_KEY in data)
+                    offset_of(data), rotation_of(data, default_angle), ROTATION_KEY in data,
+                    join_of(data), bevel_angle_of(data))
                     for _, data, _ in entries)
             else:
                 details = (tuple((corner_on_of(data),
@@ -2153,8 +2178,15 @@ class VariableStrokeTool(SelectTool):
 
     @objc.python_method
     def _show_node_tab(self, tab, editable, details):
-        scales, height_scales, offsets, rotations, rotation_overridden = \
-            [list(column) for column in zip(*details)] or ([], [], [], [], [])
+        scales, height_scales, offsets, rotations, rotation_overridden, joins, bevel_angles = \
+            [list(column) for column in zip(*details)] or ([], [], [], [], [], [], [])
+        tab.join.enable(editable)
+        # The angle field: bevels only; empty for the automatic cut (or mixed values).
+        tab.bevelAngleField.enable(editable and bool(joins) and all(joins))
+        tab.bevelAngleField.set(('%g' % bevel_angles[0])
+                                if all(joins) and _same(bevel_angles) else '')
+        # Mixed selection: neither segment.
+        tab.join.set(-1 if len(set(joins)) != 1 else 1 if joins[0] == 'bevel' else 0)
         for field in (tab.scaleField, tab.heightScaleField, tab.offsetField, tab.rotationField):
             field.enable(editable)
         tab.scaleField.set(('%g' % scales[0]) if _same(scales) else '')
@@ -2490,7 +2522,7 @@ class VariableStrokeTool(SelectTool):
             self._live = live = None
         paths, nodes = self._field_targets(name, layer)
         value = _parse_field(name, text)
-        clear_scale = name in ('scale', 'heightScale') and not str(text).strip()
+        clear_scale = name in ('scale', 'heightScale', 'bevelAngle') and not str(text).strip()
         if not paths or (name in NODE_FIELDS and not nodes):
             return
         if commit and str(text) == self._shown.get(name):
@@ -2595,6 +2627,32 @@ class VariableStrokeTool(SelectTool):
             finally:
                 layer.endChanges()
         _invalidate(layer, [path])
+        self._last_ui_state = None
+        self._refresh_ui()
+        self._redraw()
+
+    def joinFromInspector_(self, sender):
+        """Miter or bevel the corners of the selected nodes (all nodes if none)."""
+        if self._updating_ui or sender.get() not in (0, 1):
+            return
+        bevel = sender.get() == 1
+        layer = self._layer()
+        paths = self._edit_paths(layer)
+        nodes = self._target_nodes(layer, paths) if paths else []
+        if not nodes:
+            return
+        layer.beginChanges()
+        try:
+            for node in nodes:
+                if bevel:
+                    node.userData[JOIN_KEY] = 'bevel'
+                elif node.userData.get(JOIN_KEY) is not None:
+                    del node.userData[JOIN_KEY]
+            if bevel:
+                note_corner(paths[0], GLYPH_BEVELS_KEY)
+        finally:
+            layer.endChanges()
+        _invalidate(layer, paths)
         self._last_ui_state = None
         self._refresh_ui()
         self._redraw()

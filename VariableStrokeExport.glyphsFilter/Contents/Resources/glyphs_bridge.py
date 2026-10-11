@@ -81,6 +81,9 @@ GLYPH_KEY = 'com.codex.VariableStroke.glyphEnabled'
 # Set on a glyph once any of its nodes has a live corner, so glyphs without
 # corners skip looking at their other masters (see corner_specs).
 GLYPH_CORNERS_KEY = 'com.codex.VariableStroke.glyphHasCorners'
+JOIN_KEY = 'com.codex.VariableStroke.join'  # per node: 'bevel'; absent means miter
+BEVEL_ANGLE_KEY = 'com.codex.VariableStroke.bevelAngle'  # page degrees; absent: automatic
+GLYPH_BEVELS_KEY = 'com.codex.VariableStroke.glyphHasBevels'
 GENERATED_KEY = 'com.codex.VariableStroke.generated'  # legacy in-layer outlines
 # Marks outlines this plugin produced, so they are never taken for centerlines
 # again (a layer prepared twice, an interpolated or exported copy).
@@ -1790,7 +1793,7 @@ def copy_stroke_settings(source, target):
         _pop(attributes, PROFILE_KEY)
     corner_keys = (CORNER_ON_KEY, CORNER_KEY, CORNER_INNER_KEY,
                    CORNER_TENSION_KEY, CORNER_INNER_TENSION_KEY,
-                   CORNER_RATIO_KEY, CORNER_INNER_RATIO_KEY)
+                   CORNER_RATIO_KEY, CORNER_INNER_RATIO_KEY, JOIN_KEY, BEVEL_ANGLE_KEY)
     for index, (position, item) in enumerate(zip(target_positions, target_nodes)):
         node = item[0]
         width, height, offset_value, rotation_value = samples[index] if matching_nodes else \
@@ -1823,6 +1826,8 @@ def copy_stroke_settings(source, target):
                 data[key] = source_data[key]
     if any(corner_on_of(item[3]) for item in source_nodes):
         note_corner(target)
+    if any(join_of(item[3]) for item in source_nodes):
+        note_corner(target, GLYPH_BEVELS_KEY)
     if virtuals:
         virtual_nodes(target, len(target_segments), target_items)
     return True
@@ -1880,7 +1885,7 @@ def _glyph_of(item):
     return item
 
 
-def _glyph_has_corners(path):
+def _glyph_has_corners(path, key=GLYPH_CORNERS_KEY):
     # A path's glyph is its layer's parent: walking up with hasattr() (see
     # _glyph_of) asks the Objective-C runtime for a missing method each step.
     layer = getattr(path, 'parent', None)
@@ -1889,25 +1894,44 @@ def _glyph_has_corners(path):
         return False
     try:
         data = glyph.pyobjc_instanceMethods.userData()
-        return bool(data is not None and data.objectForKey_(GLYPH_CORNERS_KEY))
+        return bool(data is not None and data.objectForKey_(key))
     except AttributeError:
         pass  # plain objects (tests)
     except Exception:
         return False
     try:
-        return bool(glyph.userData.get(GLYPH_CORNERS_KEY))
+        return bool(glyph.userData.get(key))
     except Exception:
         return False
 
 
-def note_corner(node):
-    """Remember that this node's glyph uses live corners (see corner_specs)."""
+def note_corner(node, key=GLYPH_CORNERS_KEY):
+    """Remember that this node's glyph uses live corners (see corner_specs), or
+    with GLYPH_BEVELS_KEY bevel joins (see bevel_specs)."""
     glyph = _glyph_of(node)
     try:
-        if glyph is not None and not glyph.userData.get(GLYPH_CORNERS_KEY):
-            glyph.userData[GLYPH_CORNERS_KEY] = True
+        if glyph is not None and not glyph.userData.get(key):
+            glyph.userData[key] = True
     except Exception:
         pass
+
+
+def join_of(data):
+    """'bevel' for a node whose outer corner is cut, else None (miter)."""
+    try:
+        return 'bevel' if data is not None and data.get(JOIN_KEY) == 'bevel' else None
+    except (AttributeError, TypeError):
+        return None
+
+
+def bevel_angle_of(data):
+    """The page angle of a node's bevel cut, or None for the automatic cut."""
+    try:
+        value = data.get(BEVEL_ANGLE_KEY) if data is not None else None
+        value = float(value) if value is not None else None
+        return value % 180.0 if value is not None and math.isfinite(value) else None
+    except (AttributeError, TypeError, ValueError):
+        return None
 
 
 # On-curve indices with a live corner in another layer, by (glyph, last
@@ -1917,7 +1941,11 @@ _ROUNDED_ELSEWHERE = collections.OrderedDict()
 _ROUNDED_ELSEWHERE_SIZE = 4096
 
 
-def _rounded_elsewhere(path, count):
+def _rounded_elsewhere(path, count, cache=None, marked=None):
+    """On-curve indices of `path` marked (by `marked(data)`, a live corner by
+    default) in another layer of the glyph with the same paths."""
+    cache = _ROUNDED_ELSEWHERE if cache is None else cache
+    marked = corner_on_of if marked is None else marked
     key = None
     with PROFILE.section('    corners: parents'):
         layer = getattr(path, 'parent', None)
@@ -1934,16 +1962,37 @@ def _rounded_elsewhere(path, count):
         key = None  # plain objects (tests), detached copies: read every time
     if key is not None:
         with _CACHE_LOCK:
-            if key in _ROUNDED_ELSEWHERE:
-                _ROUNDED_ELSEWHERE.move_to_end(key)
-                return _ROUNDED_ELSEWHERE[key]
+            if key in cache:
+                cache.move_to_end(key)
+                return cache[key]
     with PROFILE.section('corners in other masters'):
         result = frozenset(k for sibling in _sibling_paths(path, count)
                            for k, (_, _, _, data) in enumerate(sibling)
-                           if corner_on_of(data))
+                           if marked(data))
     if key is not None:
-        _remember(_ROUNDED_ELSEWHERE, _ROUNDED_ELSEWHERE_SIZE, key, result)
+        _remember(cache, _ROUNDED_ELSEWHERE_SIZE, key, result)
     return result
+
+
+_BEVELLED_ELSEWHERE = collections.OrderedDict()  # as _ROUNDED_ELSEWHERE
+
+
+def bevel_specs(path, items=None):
+    """Join per on-curve node for outline_curves' `bevels`: 'bevel', 'zero' where
+    another master of the glyph bevels it (a cut of no length keeps the masters
+    compatible), None (miter); None for the whole path without bevels."""
+    items = path_nodes(path) if items is None else items
+    specs = []
+    for _, _, _, data in _on_curve(items, bool(path.closed)):
+        angle = bevel_angle_of(data) if join_of(data) else None
+        specs.append(('bevel', angle) if angle is not None else join_of(data))
+    if all(spec is not None for spec in specs):
+        return specs
+    if not _glyph_has_corners(path, GLYPH_BEVELS_KEY):
+        return specs if any(specs) else None
+    elsewhere = _rounded_elsewhere(path, len(specs), _BEVELLED_ELSEWHERE, join_of)
+    specs = [spec or ('zero' if k in elsewhere else None) for k, spec in enumerate(specs)]
+    return specs if any(specs) else None
 
 
 def corner_specs(path, items=None):
@@ -2014,7 +2063,7 @@ def _outline_fingerprint(path, defaults, items):
     return (nodes, attributes, store, closed,
             (defaults.width, defaults.height, defaults.italic_angle, defaults.nib_angle),
             None if profile is None else repr((profile['points'], profile.get('divisions'))),
-            repr(corner_specs(path, items)))
+            repr(corner_specs(path, items)), repr(bevel_specs(path, items)))
 
 
 def _outline(path, defaults, items):
@@ -2056,6 +2105,7 @@ def _gathered_outline(path, defaults, items):
                                                    path_profile(path), bool(path.closed))
         with PROFILE.section('  inputs: corners'):
             source_corners = corner_specs(path, items)
+            source_bevels = bevel_specs(path, items)
         source_offsets = [(corner_offset_of(data, 'left'), corner_offset_of(data, 'right'))
                           for _, _, _, data in _on_curve(items, closed)]
         source_handles = [tuple(corner_handle_of(data, side, incoming)
@@ -2077,6 +2127,13 @@ def _gathered_outline(path, defaults, items):
             segments, breaks, smooths, corners, node_map = expanded_virtual_segments(
                 source_segments, specs, source_corners, closed)
             right_segments = right_smooths = right_map = left_map = None
+        if source_bevels is None:
+            bevels = None
+        elif independent:
+            bevels = tuple(source_bevels)
+        else:
+            bevels = tuple(source_bevels[index] if index is not None and
+                           index < len(source_bevels) else None for index in node_map)
         segments = tuple(segments)
         key = ('curves', segments, right_segments, closed, caps, angles, cap_curves,
                defaults.italic_angle, tuple(sorted(breaks['left'])),
@@ -2085,7 +2142,7 @@ def _gathered_outline(path, defaults, items):
                tuple(left_map) if independent else (),
                tuple(right_map) if independent else (),
                tuple(None if c is None else tuple(sorted(c.items())) for c in corners),
-               tuple(source_offsets), tuple(source_handles))
+               tuple(source_offsets), tuple(source_handles), bevels)
 
     def compute():
         collected, edges, cap_points = [], {}, {}
@@ -2099,7 +2156,9 @@ def _gathered_outline(path, defaults, items):
                                   left_map=left_map, right_map=right_map,
                                   right_smooth_virtuals=right_smooths if independent else (),
                                   cap_start_curve=cap_curves[0],
-                                  cap_end_curve=cap_curves[1], cap_out=cap_points)
+                                  cap_end_curve=cap_curves[1], cap_out=cap_points,
+                                  bevels=None if independent else bevels,
+                                  right_bevels=bevels if independent else None)
         if any(delta != (0.0, 0.0) for pair in source_offsets for delta in pair) or \
                 any(delta != (0.0, 0.0) for handles in source_handles for delta in handles):
             if independent:
@@ -2564,7 +2623,7 @@ def _source_values(path, defaults, key=None):
     """A master path's stroke values as interpolation blends them, read from
     Glyphs once per edit of the glyph (by `key`) instead of once per instance:
     {'width', 'height', 'nodes': {position: (w, h, offset, rotation, corner
-    spec or None, left offset, right offset, 4 corner handles)}}."""
+    spec or None, left offset, right offset, 4 corner handles, join, bevel angle)}}."""
     if key is not None:
         key = ('values',) + tuple(key)
         with _CACHE_LOCK:
@@ -2583,7 +2642,8 @@ def _source_values(path, defaults, key=None):
             rotation_of(data, defaults.nib_angle), corner_spec_of(data),
             corner_offset_of(data, 'left'), corner_offset_of(data, 'right'),
             corner_handle_of(data, 'left', True), corner_handle_of(data, 'left', False),
-            corner_handle_of(data, 'right', True), corner_handle_of(data, 'right', False))
+            corner_handle_of(data, 'right', True), corner_handle_of(data, 'right', False),
+            join_of(data), bevel_angle_of(data))
     values = {'width': base_w, 'height': base_h, 'nodes': nodes}
     if key is not None:
         _remember(_SOURCE_OUTLINES, _SOURCE_OUTLINES_SIZE, key, values)
@@ -2874,7 +2934,8 @@ def _interpolate_layer(layer, glyph, interpolation, glyph_key=None):
             if node.type == OFFCURVE:
                 continue
             nodes = [(entry['nodes'][position], factor) for entry, factor in values]
-            # (w, h, offset, rotation, corner spec or None, 2 offsets, 4 handles)
+            # (w, h, offset, rotation, corner spec or None, 2 offsets, 4 handles, join,
+            #  bevel angle)
             node.userData[SCALE_KEY] = sum(f * v[0] for v, f in nodes) / base_w * 100.0
             node.userData[HEIGHT_SCALE_KEY] = sum(f * v[1] for v, f in nodes) / base_h * 100.0
             node.userData[OFFSET_KEY] = sum(f * v[2] for v, f in nodes)
@@ -2899,6 +2960,18 @@ def _interpolate_layer(layer, glyph, interpolation, glyph_key=None):
                 node.userData[CORNER_INNER_TENSION_KEY] = corner['inner_tension']
                 node.userData[CORNER_RATIO_KEY] = corner['ratio']
                 node.userData[CORNER_INNER_RATIO_KEY] = corner['inner_ratio']
+            # A bevel in any source: the blended master outlines have its cut
+            # (see _blend_contours); expanding the values gives it in full.
+            if any(v[11] for v, _ in nodes):
+                node.userData[JOIN_KEY] = 'bevel'
+            elif JOIN_KEY in node.userData:
+                del node.userData[JOIN_KEY]
+            # An angle set in every source blends; one automatic cut keeps it automatic.
+            angles = [(v[12], f) for v, f in nodes]
+            if any(v[11] for v, _ in nodes) and all(a is not None for a, _ in angles):
+                node.userData[BEVEL_ANGLE_KEY] = _blend_angles(angles)
+            elif BEVEL_ANGLE_KEY in node.userData:
+                del node.userData[BEVEL_ANGLE_KEY]
             if WIDTH_KEY in node.userData:
                 del node.userData[WIDTH_KEY]
         blends = getattr(layer, 'blends', None)

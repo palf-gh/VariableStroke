@@ -735,6 +735,72 @@ class GeometryTests(unittest.TestCase):
                     self.assertAlmostEqual(out[0]*into[1] - out[1]*into[0], 0.0, places=6)
                     self.assertGreater(out[0]*into[0] + out[1]*into[1], 0.0)
 
+    def test_sharp_miter_reaches_its_crossing_and_keeps_the_stroke_centred(self):
+        # A line meeting a curve at a sharp angle: both edges go straight on to
+        # their crossing, so near the corner the centerline stays in the middle.
+        segments = [('line', ((331, 948), (569, 262)), (40, 20, 0), (40, 20, 0)),
+                    ('cubic', ((569, 262), (530, 309), (462, 348), (384, 348)),
+                     (40, 20, 0), (40, 20, 0))]
+        contour = outline_curves(segments)[0]
+        tip = contour[0][1][1]
+        self.assertAlmostEqual(tip[0], 619.4, delta=0.5)
+        self.assertAlmostEqual(tip[1], 175.1, delta=0.5)
+        # The outer edge keeps its distance from the centerline up to the corner
+        # (the inner side there is the line's edge, trimmed at the crossing).
+        outer_points = [cubic(*contour[1][1], i/400.0) for i in range(401)]
+
+        def distance(t):
+            center = cubic(*segments[1][1], t)
+            return min(math.dist(center, p) for p in outer_points)
+        reference = distance(0.3)
+        for t in (0.02, 0.05, 0.1, 0.2):
+            self.assertAlmostEqual(distance(t), reference, delta=0.08*reference)
+
+    def test_moderate_miter_stays_within_its_bound(self):
+        # The SVG corner of test_svg_open_path_keeps_inside_gentler_than_outside:
+        # pulled in by less than half a nib, it keeps its bound.
+        nib = (95, 140, 0)
+        segments = [('line', ((0, 0), (0, 457)), nib, nib),
+                    ('cubic', ((0, 457), (31, 419), (114, 385), (142, 377)), nib, nib)]
+        contour = outline_curves(segments)[0]
+        self.assertAlmostEqual(contour[0][1][1][1], 552, delta=1)
+
+    def test_bevel_cuts_only_the_outer_side(self):
+        segments = [('line', ((0, 0), (0, 100)), 20, 20), ('line', ((0, 100), (100, 100)), 20, 20)]
+        plain = outline_curves(segments)[0]
+        cut = outline_curves(segments, bevels=[None, 'bevel', None])[0]
+        zero = outline_curves(segments, bevels=[None, 'zero', None])[0]
+        self.assertEqual(len(cut), len(plain) + 1)
+        self.assertIn(('line', ((-10.0, 100.0), (0.0, 110.0))), cut)
+        self.assertEqual([kind for kind, _ in zero], [kind for kind, _ in cut])
+        self.assertIn(('line', ((-10.0, 110.0), (-10.0, 110.0))), zero)
+        # Turning the other way, the right side is outside.
+        mirrored = [('line', ((0, 0), (0, 100)), 20, 20),
+                    ('line', ((0, 100), (-100, 100)), 20, 20)]
+        cut = outline_curves(mirrored, bevels=[None, 'bevel', None])[0]
+        self.assertIn(('line', ((0.0, 110.0), (10.0, 100.0))), cut)
+
+    def test_bevel_angle_turns_the_cut_about_its_middle(self):
+        segments = [('line', ((0, 0), (0, 100)), 20, 20), ('line', ((0, 100), (100, 100)), 20, 20)]
+        def rounded(contour):
+            return [(kind, tuple((round(x, 6), round(y, 6)) for x, y in points))
+                    for kind, points in contour]
+        automatic = rounded(outline_curves(segments, bevels=[None, 'bevel', None])[0])
+        self.assertEqual(rounded(outline_curves(segments, bevels=[None, ('bevel', 45), None])[0]),
+                         automatic)  # the automatic cut of a right angle runs at 45°
+        cut = outline_curves(segments, bevels=[None, ('bevel', 60), None])[0]
+        (x0, y0), (x1, y1) = cut[1][1]
+        self.assertAlmostEqual(math.degrees(math.atan2(y1-y0, x1-x0)) % 180, 60)
+        # through the middle of the automatic cut, each edge ending on it
+        self.assertAlmostEqual((y0-105)*math.cos(math.radians(60)) -
+                               (x0+5)*math.sin(math.radians(60)), 0)
+        self.assertAlmostEqual(x0, -10)
+        self.assertAlmostEqual(y1, 110)
+        self.assertEqual(cut[0][1][1], cut[1][1][0])
+        # A cut along an edge cannot meet it: the automatic cut stays.
+        self.assertEqual(rounded(outline_curves(segments, bevels=[None, ('bevel', 90), None])[0]),
+                         automatic)
+
     def test_bad_width(self):
         with self.assertRaises(ValueError):
             outline([('line', ((0, 0), (10, 0)), 0, 10)])
