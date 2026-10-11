@@ -2280,3 +2280,476 @@ def outline_curves(segments, closed=False, cap_start='flat', cap_end='flat',
             vertices.insert(index, None)
         contour = _round_contour(contour, vertices, report)
     return [contour]
+
+
+# Crossing fillets: a stroke whose outline crosses itself (the loop of す)
+# leaves sharp corners where one part's edge runs into another's, e.g. the
+# loop's hole against the straight stroke it crosses. Overlaying a patch would
+# show its own edges when interpolated, so the outline itself is reconnected.
+CROSSING_SAMPLES = 24
+CROSSING_END = 1e-4  # crossings this close to a piece's end are at a node: skipped
+CROSSING_MIN_SINE = 0.02  # near-tangent edges do not make a corner
+# A sliver between nearly parallel edges is not a counter: its rounding fades
+# out between these corner angles (degrees) and keeps a corner of no size.
+CROSSING_SLIVER = (20.0, 45.0)
+
+
+def _flat_piece(piece, count=CROSSING_SAMPLES):
+    kind, pts = piece
+    if kind == 'line':
+        return [(0.0, pts[0]), (1.0, pts[1])]
+    return [(i / float(count), cubic(*pts, i / float(count))) for i in range(count+1)]
+
+
+def _bounds(points):
+    xs, ys = [p[0] for _, p in points], [p[1] for _, p in points]
+    return min(xs), min(ys), max(xs), max(ys)
+
+
+def _refine_crossing(a, b, s, t):
+    """Newton steps on a(s) = b(t) from a polyline estimate."""
+    for _ in range(12):
+        pa, pb = _piece_point(a, s), _piece_point(b, t)
+        f = sub(pa, pb)
+        if length(f) < 1e-9:
+            break
+        da, db = _derivative(a[0], a[1], s), _derivative(b[0], b[1], t)
+        det = -da[0]*db[1] + da[1]*db[0]
+        if abs(det) < EPS:
+            break
+        ds = (-f[0]*db[1] + f[1]*db[0]) / det
+        dt = (da[0]*f[1] - da[1]*f[0]) / det
+        s, t = min(max(s - ds, 0.0), 1.0), min(max(t - dt, 0.0), 1.0)
+    return s, t
+
+
+def _piece_crossings(a, b, flat_a, flat_b):
+    """[(s, t)] where piece a at s crosses piece b at t."""
+    hits = []
+    for (s0, p0), (s1, p1) in zip(flat_a, flat_a[1:]):
+        for (t0, q0), (t1, q1) in zip(flat_b, flat_b[1:]):
+            hit = _segment_intersection(p0, p1, q0, q1)
+            if hit is None:
+                continue
+            s, t = _refine_crossing(a, b, s0 + (s1-s0)*hit[1], t0 + (t1-t0)*hit[2])
+            if length(sub(_piece_point(a, s), _piece_point(b, t))) > 0.01:
+                continue
+            if all(abs(s-s2) > 1e-4 or abs(t-t2) > 1e-4 for s2, t2 in hits):
+                hits.append((s, t))
+    return hits
+
+
+def _winding(polygons, point):
+    total = 0
+    x, y = point
+    for polygon in polygons:
+        for (x0, y0), (x1, y1) in zip(polygon, polygon[1:] + polygon[:1]):
+            if y0 <= y < y1 and (x1-x0)*(y-y0) - (x-x0)*(y1-y0) > 0:
+                total += 1
+            elif y1 <= y < y0 and (x1-x0)*(y-y0) - (x-x0)*(y1-y0) < 0:
+                total -= 1
+    return total
+
+
+def contour_crossings(contours, holes_only=True):
+    """Where a stroke's outline crosses itself with a hole on one side: [(point,
+    (contour, piece, t), (contour, piece, t), fillet)] in contour order.
+    `holes_only` leaves out corners open to the outside (a fork's notch).
+    Leaving strand 1 for strand 2 there (and 2 for 1) reconnects the outline
+    keeping its direction; `fillet` names the corner facing the hole, 12 (the
+    end of strand 1 into strand 2) or 21. The other corner is inside the
+    overlap of both parts, so it stays sharp and out of sight."""
+    flats = [[_flat_piece(piece) for piece in contour] for contour in contours]
+    polygons = [[p for flat in contour for _, p in flat[:-1]] for contour in flats]
+    boxes = [[_bounds(flat) for flat in contour] for contour in flats]
+    places = [(c, i) for c, contour in enumerate(contours) for i in range(len(contour))
+              if length(sub(_piece_point(contour[i], 1.0), _piece_point(contour[i], 0.0)))
+              > 1e-6 or contour[i][0] == 'cubic']
+    result = []
+    for k, (c1, i1) in enumerate(places):
+        a, box_a = contours[c1][i1], boxes[c1][i1]
+        for c2, i2 in places[k+1:]:
+            n = len(contours[c1])
+            if c1 == c2 and (i2 - i1 == 1 or (i1 == 0 and i2 == n-1)):
+                continue  # neighbours meet at their shared node
+            b, box_b = contours[c2][i2], boxes[c2][i2]
+            if box_a[0] > box_b[2] or box_b[0] > box_a[2] or \
+                    box_a[1] > box_b[3] or box_b[1] > box_a[3]:
+                continue
+            for s, t in _piece_crossings(a, b, flats[c1][i1], flats[c2][i2]):
+                if min(s, 1-s, t, 1-t) < CROSSING_END:
+                    continue
+                d1, d2 = _piece_tangent(a, s), _piece_tangent(b, t)
+                sine = d1[0]*d2[1] - d1[1]*d2[0]
+                if abs(sine) < CROSSING_MIN_SINE:
+                    continue
+                point = _piece_point(a, s)
+                bisector = unit(sub(d2, d1))  # between strand 1 arriving and 2 leaving
+                # Both corners have the same angle: step in far enough to clear the edges.
+                half = math.sqrt(max(0.0, (1.0 + d1[0]*d2[0] + d1[1]*d2[1]) / 2.0))
+                reach = min(0.75 / max(half, 0.05), 10.0)
+                w12 = _winding(polygons, add(point, mul(bisector, reach)))
+                w21 = _winding(polygons, sub(point, mul(bisector, reach)))
+                if w12 == 0 and abs(w21) == 2:
+                    fillet = 12
+                elif w21 == 0 and abs(w12) == 2:
+                    fillet = 21
+                else:
+                    continue
+                result.append((point, (c1, i1, s), (c2, i2, t), fillet))
+    result.sort(key=lambda item: (item[1], item[2]))
+    if holes_only and result:
+        holes = set()
+        for _, members, _, kind in _crossing_cycles(contours, result):
+            if kind == 'hole':
+                holes.update(members)
+        result = [crossing for x, crossing in enumerate(result) if x in holes]
+    return result
+
+
+def _area(points):
+    return 0.5 * sum(x0*y1 - x1*y0 for (x0, y0), (x1, y1) in zip(points, points[1:] + points[:1]))
+
+
+def _cycle_kind(points, polygons, ink):
+    """'hole' (against the ink), 'outer' (with the ink, outside beyond it) or
+    'overlap' (with the ink, ink beyond it: where two parts overlap)."""
+    if _area(points) * ink < 0:
+        return 'hole'
+    best, middle, direction = -1.0, None, None
+    for p0, p1 in zip(points, points[1:] + points[:1]):
+        size = length(sub(p1, p0))
+        if size > best:
+            best, middle, direction = size, mul(add(p0, p1), 0.5), unit(sub(p1, p0))
+    if middle is None:
+        return 'outer'
+    # The ink is left of a counter-clockwise contour: step to the other side.
+    outward = (direction[1], -direction[0]) if ink > 0 else (-direction[1], direction[0])
+    return 'outer' if _winding(polygons, add(middle, mul(outward, 0.5))) == 0 else 'overlap'
+
+
+def _junction_open(crossing, strand):
+    """True when leaving `strand` (0, 1) at the crossing turns its open corner
+    (the one facing a hole or the outside), False for the corner in the overlap."""
+    return crossing[3] == (12 if strand == 0 else 21)
+
+
+def _crossing_cycles(contours, crossings, chosen=None):
+    """Reconnect the outline at the crossings given (or those `chosen`):
+    [(outline points of a resulting contour, [crossings whose open corner it
+    turns], [crossings whose overlap corner it turns], kind (see _cycle_kind))]."""
+    events = _crossing_events(crossings, chosen)
+    runs, starts, first_run = _crossing_runs(contours, events, crossings, None)
+    polygons = [[p for piece in contour for _, p in _flat_piece(piece)[:-1]]
+                for contour in contours]
+    ink = sum(_area(polygon) for polygon in polygons)
+    cycles = []
+    for order in _cycle_orders(runs, starts, first_run, events):
+        points, open_members, overlap_members = [], [], []
+        for r in order:
+            pieces, (x, strand) = runs[r]
+            for piece in pieces:
+                points.extend(p for _, p in _flat_piece(piece)[:-1])
+            (open_members if _junction_open(crossings[x], strand) else
+             overlap_members).append(x)
+        cycles.append((points, sorted(open_members), sorted(overlap_members),
+                       _cycle_kind(points, polygons, ink)))
+    return cycles
+
+
+def _crossing_events(crossings, chosen=None):
+    events = {}  # contour: [(piece, t, crossing, strand)]
+    for x, (_, first, second, _) in enumerate(crossings):
+        if chosen is not None and x not in chosen:
+            continue
+        for strand, (c, i, t) in enumerate((first, second)):
+            events.setdefault(c, []).append((i, t, x, strand))
+    return events
+
+
+def _cycle_orders(runs, starts, first_run, events):
+    """The runs of each reconnected contour, in order."""
+    orders, seen = [], set()
+    for c in sorted(events):
+        for r in range(first_run[c], len(runs)):
+            if r in seen:
+                continue
+            order = []
+            while r not in seen:
+                seen.add(r)
+                order.append(r)
+                x, strand = runs[r][1]
+                r = starts[(x, 1 - strand)]
+            orders.append(order)
+    return orders
+
+
+def crossing_loops(contours, crossings=None):
+    """The holes a stroke makes by crossing itself, each with the part of the
+    outline that would be joined to round it: [(outline points of the hole,
+    [crossings at its corners], [crossings of its loop])]. A loop's crossings
+    are those around the overlap behind the hole's corners (for す, the four
+    corners where the loop runs across the straight stroke); `crossings` are
+    contour_crossings(contours, holes_only=False)."""
+    if crossings is None:
+        crossings = contour_crossings(contours, holes_only=False)
+    if not crossings:
+        return []
+    cycles = _crossing_cycles(contours, crossings)
+    behind = {}  # crossing: the overlap's crossings behind its corner
+    for _, _, overlap_members, kind in cycles:
+        if kind == 'overlap':
+            for x in overlap_members:
+                behind[x] = overlap_members
+    loops = []
+    for points, open_members, _, kind in cycles:
+        if kind == 'hole' and open_members:
+            part = sorted({y for x in open_members for y in behind.get(x, [x])} |
+                          set(open_members))
+            loops.append((points, open_members, part))
+    return loops
+
+
+def joined_outline(contours, crossings, part, fillets=None, ranges=None, tension=100.0):
+    """Join the outline where it crosses itself at the crossings in `part`
+    (see crossing_loops), as one would draw the loop by hand: one outer
+    contour and the hole as a contour of its own, without the overlap.
+
+    At a corner left sharp the edges are not cut at their crossing: each goes
+    on to the end of its piece, inside the other part's ink, and a line joins
+    them there, so the corner is wherever the edges cross in any blend of the
+    masters. `fillets` {crossing: radius} rounds the hole's corners instead:
+    those are cut at the crossing and joined by one cubic (of no size at
+    radius 0). `ranges` lay out pieces a crossing lands on in some master only
+    (see _crossing_runs). Masters joined at the same crossings interpolate.
+    """
+    fillets = fillets or {}
+    part = set(part)
+    if not part:
+        return contours
+    events = _crossing_events(crossings, part)
+    polygons = [[p for piece in contour for _, p in _flat_piece(piece)[:-1]]
+                for contour in contours]
+    ends = _overshoots(contours, events, crossings, fillets, polygons)
+    built = _crossing_runs(contours, events, crossings, ranges, ends)
+    if built is None:  # the ranges do not fit this master: lay it out on its own
+        built = _crossing_runs(contours, events, crossings, None, ends)
+    runs, starts, first_run = built
+    tension = max(float(tension), 0.0) / 100.0
+    lengths = [sum(_piece_samples(piece)[-1][1] for piece in pieces) for pieces, _ in runs]
+    trim_start, trim_end, turns = [0.0]*len(runs), [0.0]*len(runs), {}
+    for r, (pieces, (x, strand)) in enumerate(runs):
+        if x not in fillets or not _junction_open(crossings[x], strand):
+            continue
+        after = starts[(x, 1 - strand)]
+        t_in = _piece_tangent(pieces[-1], 1.0)
+        t_out = _piece_tangent(runs[after][0][0], 0.0)
+        cross = t_in[0]*t_out[1] - t_in[1]*t_out[0]
+        dot = t_in[0]*t_out[0] + t_in[1]*t_out[1]
+        turn = math.atan2(abs(cross), dot)
+        fade = (math.degrees(math.pi - turn) - CROSSING_SLIVER[0]) / \
+            (CROSSING_SLIVER[1] - CROSSING_SLIVER[0])
+        fade = min(max(fade, 0.0), 1.0)
+        turn = min(turn, math.radians(FILLET_MAX_TURN))
+        trim_end[r] = trim_start[after] = \
+            max(float(fillets[x] or 0.0), 0.0) * fade*fade*(3-2*fade) * math.tan(turn / 2.0)
+        turns[after] = turn
+    for r in range(len(runs)):
+        # A run gives its ends at most its whole length, shared by what they ask.
+        wanted = trim_start[r] + trim_end[r]
+        if wanted > lengths[r]:
+            share = lengths[r] / wanted if wanted > EPS else 0.0
+            trim_start[r] *= share
+            trim_end[r] *= share
+    cut = [_cut_run(pieces, trim_start[r], trim_end[r]) for r, (pieces, _) in enumerate(runs)]
+    joined = {}
+    for order in _cycle_orders(runs, starts, first_run, events):
+        if all(not _junction_open(crossings[runs[r][1][0]], runs[r][1][1]) for r in order):
+            continue  # the overlap of both parts: inside the ink, left out
+        contour = []
+        for k, r in enumerate(order):
+            x, strand = runs[order[k-1]][1]
+            if r in turns:
+                before = cut[order[k-1]]
+                turn = turns[r]
+                p1, d1, p2, d2 = before[1], before[2], cut[r][3], cut[r][4]
+                first, second = trim_end[order[k-1]], trim_start[r]
+                f = (4.0/3.0 * math.tan(turn/4.0) / math.tan(turn/2.0)) \
+                    if turn > 1e-6 else 2.0/3.0
+                contour.append(('cubic', (p1, add(p1, mul(d1, first * f * tension)),
+                                          sub(p2, mul(d2, second * f * tension)), p2)))
+            elif x not in fillets:
+                contour.append(('line', (cut[order[k-1]][1], cut[r][3])))
+            contour.extend(cut[r][0])
+        joined.setdefault(min(c for c in events), []).append(contour)
+    result = []
+    for c, contour in enumerate(contours):
+        if c not in events:
+            result.append(contour)
+        elif c == min(events):
+            result.extend(joined.get(c, []))
+    return result
+
+
+def _overshoots(contours, events, crossings, fillets, polygons):
+    """(contour, piece, t, point) where each strand of a sharp corner ends:
+    the edge arriving at the corner goes on past the crossing, the edge
+    leaving it starts before, both inside the overlap of the two parts: to
+    the end of the piece, or half way to the next crossing on it. A join
+    line that would leave the ink is pulled back towards the crossing.
+    {(crossing, strand): (t, point)}; fillet corners stay at the crossing."""
+    ends = {}
+    for c, marks in events.items():
+        marks = sorted(marks)
+        for k, (i, t, x, strand) in enumerate(marks):
+            point = crossings[x][0]
+            if x in fillets:
+                ends[(x, strand)] = (t, point)
+                continue
+            forward = _junction_open(crossings[x], strand)  # arriving here: go on
+            others = [mark[1] for mark in marks if mark[0] == i and
+                      (mark[1] > t if forward else mark[1] < t)]
+            limit = (min(others) if others else 1.0) if forward else \
+                (max(others) if others else 0.0)
+            target = limit if not others else (t + limit) / 2.0
+            ends[(x, strand)] = (target, _piece_point(contours[c][i], target), t, c, i)
+    result = {}
+    for (x, strand), value in ends.items():
+        if len(value) == 2:
+            result[(x, strand)] = value
+            continue
+        if (x, strand) in result:
+            continue
+        other = 1 - strand
+        mine, theirs = value, ends[(x, other)]
+        # The arriving strand's end and the leaving one's start are joined.
+        for _ in range(6):
+            p, q = mine[1], theirs[1]
+            if all(_winding(polygons, add(mul(p, 1-u), mul(q, u))) != 0
+                   for u in (0.0, 0.25, 0.5, 0.75, 1.0)):
+                break
+            mine = _pulled(contours, mine)
+            theirs = _pulled(contours, theirs)
+        result[(x, strand)] = (mine[0], mine[1])
+        result[(x, other)] = (theirs[0], theirs[1])
+    return result
+
+
+def _pulled(contours, end):
+    target, _, t, c, i = end
+    target = (target + t) / 2.0
+    return (target, _piece_point(contours[c][i], target), t, c, i)
+
+
+def _as_cubic(piece):
+    kind, pts = piece
+    if kind == 'cubic':
+        return piece
+    a, b = pts
+    return ('cubic', (a, add(a, mul(sub(b, a), 1/3.0)), add(a, mul(sub(b, a), 2/3.0)), b))
+
+
+def _crossing_runs(contours, events, crossings, ranges, ends=None):
+    """(runs, starts, first run per contour): runs are (pieces, (crossing,
+    strand) at the end) from one crossing to the next along a contour, and
+    starts[(crossing, strand)] the run leaving there. `ends[(crossing,
+    strand)]` = (t, point) moves where the run arriving there ends or the one
+    leaving starts (see _overshoots); otherwise both are at the crossing.
+
+    `ranges[x]` gives, per strand of crossing x, the (first, last) piece it
+    lands on in any master: a run then has a slot for every piece its two
+    crossings may land on, and the slots a crossing has not reached in this
+    master are pieces of no size at the run's end, inside the overlap of both
+    parts or at a rounded corner, out of sight. None when this master's
+    crossings do not fit the ranges."""
+    runs, starts, first_run = [], {}, {}
+    for c in sorted(events):
+        contour, marks = contours[c], sorted(events[c])
+        n = len(contour)
+        first_run[c] = len(runs)
+        for k, (i0, t0, x0, s0) in enumerate(marks):
+            i1, t1, x1, s1 = marks[(k+1) % len(marks)]
+            once = len(marks) == 1 or (i1 == i0 and t1 <= t0)  # all the way round
+            p0, p1 = crossings[x0][0], crossings[x1][0]
+            if ends is not None:
+                t0, p0 = ends.get((x0, s0), (t0, p0))
+                t1, p1 = ends.get((x1, s1), (t1, p1))
+            if i1 == i0 and not once:
+                pieces = [_sub_piece(contour[i0], t0, t1)]
+            else:
+                pieces = [_sub_piece(contour[i0], t0, 1.0)]
+                pieces += [contour[(i0+1+m) % n] for m in range((i1-i0-1) % n)]
+                pieces.append(_sub_piece(contour[i1], 0.0, t1))
+            pieces[0] = _with_end(pieces[0], False, p0)
+            pieces[-1] = _with_end(pieces[-1], True, p1)
+            if ranges is not None:
+                lo0, hi1 = ranges[x0][s0][0], ranges[x1][s1][1]
+                front, back = (i0 - lo0) % n, (hi1 - i1) % n
+                slots = (hi1 - lo0) % n + 1 + (n if once else 0)
+                if front + len(pieces) + back != slots or front > n // 2 or back > n // 2:
+                    return None
+                if ranges[x0][s0] != (i0, i0) or ranges[x1][s1] != (i1, i1):
+                    # Slots that hold a piece in one master and none in another
+                    # must be one kind in all of them.
+                    pieces = [_as_cubic(piece) for piece in pieces]
+                pieces = _padded(pieces, front, False)
+                pieces = _padded(pieces, back, True)
+            starts[(x0, s0)] = len(runs)
+            runs.append((pieces, (x1, s1)))
+    return runs, starts, first_run
+
+
+def _padded(pieces, extra, at_end):
+    """`pieces` with `extra` pieces of no size at their start or end."""
+    if not extra:
+        return pieces
+    point = pieces[-1][1][-1] if at_end else pieces[0][1][0]
+    filler = [('cubic', (point,) * 4)] * extra
+    return pieces + filler if at_end else filler + pieces
+
+
+def _cut_run(pieces, trim_start, trim_end):
+    """Pieces of a run without `trim_start` / `trim_end` of its length at its
+    ends, and (pieces, end point, end direction, start point, start direction).
+    A piece the trim uses up stays as one of no length at the trim's point,
+    so the structure does not depend on how far the trims reach."""
+    samples = [_piece_samples(piece) for piece in pieces]
+    lengths = [sample[-1][1] for sample in samples]
+    total = sum(lengths)
+    keep_from, keep_to = trim_start, max(trim_start, total - trim_end)
+
+    def locate(distance):
+        position = 0.0
+        for i, size in enumerate(lengths):
+            if distance <= position + size or i == len(lengths) - 1:
+                local = min(max(distance - position, 0.0), size)
+                t = _t_at_length(samples[i], local) if size > EPS else 0.0
+                return i, t
+            position += size
+    i0, t0 = locate(keep_from)
+    i1, t1 = locate(keep_to)
+    if (i1, t1) < (i0, t0):
+        i1, t1 = i0, t0
+    start = _piece_point(pieces[i0], t0)
+    end = _piece_point(pieces[i1], t1)
+    result = []
+    for i, piece in enumerate(pieces):
+        kind, pts = piece
+        if i < i0 or i > i1:
+            point = start if i < i0 else end
+            result.append((kind, (point,) * len(pts)))
+        elif i0 == i1 == i or (i == i0 and t0 > 0.0) or (i == i1 and t1 < 1.0):
+            a, b = (t0 if i == i0 else 0.0), (t1 if i == i1 else 1.0)
+            result.append(_sub_piece(piece, a, b) if b > a else (kind, ((start if i == i0
+                          else end),) * len(pts)))
+        else:
+            result.append(piece)
+    return (result, end, _piece_tangent(pieces[i1], t1), start,
+            _piece_tangent(pieces[i0], t0))
+
+
+def _with_end(piece, at_end, point):
+    kind, pts = piece
+    pts = list(pts)
+    pts[-1 if at_end else 0] = point
+    return (kind, tuple(pts))

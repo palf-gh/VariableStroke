@@ -70,7 +70,8 @@ class SelectorTests(unittest.TestCase):
         method = ast.FunctionDef(name=method.name, args=method.args, body=method.body,
                                  decorator_list=[], returns=None)
         namespace = {'profiles': lambda font: {}, 'sorted_profiles': lambda library: [],
-                     'profile_id': lambda path: None}
+                     'profile_id': lambda path: None, '_SELECTED_HOLE': [None],
+                     '_hole_radius': lambda path: None}
         exec(compile(ast.fix_missing_locations(ast.Module(body=[method], type_ignores=[])),
                      str(PLUGIN), 'exec'), namespace)
 
@@ -82,6 +83,7 @@ class SelectorTests(unittest.TestCase):
             _virtual_error = ''
             _sampling = False
             _sample_error = ''
+            _hole_path = None
             _fields = {}
             infoBoxWindow = types.SimpleNamespace(group=types.SimpleNamespace(
                 virtualTab='virtual', nodeTab='node', capsTab='caps', cornerTab='corner',
@@ -101,7 +103,7 @@ class SelectorTests(unittest.TestCase):
             def _show_corner_tab(self, *args): self.called.append(('corner', len(args)))
             def _show_profile_tab(self, *args): self.called.append(('profile', len(args)))
 
-        for tab, argc in (('virtual', 3), ('node', 3), ('caps', 3), ('corner', 4),
+        for tab, argc in (('virtual', 3), ('node', 3), ('caps', 3), ('corner', 5),
                           ('profile', 4)):
             with self.subTest(tab=tab):
                 inspector = Inspector(tab)
@@ -431,9 +433,9 @@ class SelectorTests(unittest.TestCase):
     def test_panel_shows_one_tab_below_the_stroke_row(self):
         source = PLUGIN.read_text()
         self.assertIn('group.tabs = SegmentedButton(', source)
-        for tab in ('nodeTab', 'cornerTab'):
-            self.assertIn('group.' + tab + ' = Group((0, TAB_TOP, -0, 24))', source)
-        self.assertIn('group.capsTab = Group((0, TAB_TOP, -0, 48))', source)
+        self.assertIn('group.nodeTab = Group((0, TAB_TOP, -0, 24))', source)
+        for tab in ('capsTab', 'cornerTab'):
+            self.assertIn('group.' + tab + ' = Group((0, TAB_TOP, -0, 48))', source)
         self.assertIn('group.virtualTab = Group((0, TAB_TOP, -0, 72))', source)
         self.assertIn("('virtual', 'Virtual', '仮想')", source)
         self.assertIn('group.profileTab = Group((0, TAB_TOP, -0, 48))', source)

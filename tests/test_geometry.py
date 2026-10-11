@@ -6,10 +6,70 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from variable_stroke_core import (outline, outline_curves, node_edges, nib_edges,
                                   move_outline_vertices, outline_direction_at_vertex,
                                   cap_curve_geometry, cap_curve_coordinates,
-                                  _Side, _join, sub, unit, length, cubic)
+                                  _Side, _join, sub, unit, length, cubic,
+                                  contour_crossings, crossing_loops, joined_outline,
+                                  _winding, _flat_piece)
+
+
+# A stroke down, left, up and right across itself: a square hole whose corner
+# at (-10, 240) is where the last stroke runs into the first.
+LOOP = [('line', ((0, 400), (0, 100)), 20, 20), ('line', ((0, 100), (-150, 100)), 20, 20),
+        ('line', ((-150, 100), (-150, 250)), 20, 20),
+        ('line', ((-150, 250), (150, 250)), 20, 20)]
+
+
+def _windings(contours, points):
+    polygons = [[p for piece in contour for _, p in _flat_piece(piece)[:-1]]
+                for contour in contours]
+    return [_winding(polygons, point) for point in points]
 
 
 class GeometryTests(unittest.TestCase):
+    def test_loop_is_found_with_the_crossings_around_its_overlap(self):
+        contours = outline_curves(LOOP)
+        every = contour_crossings(contours, holes_only=False)
+        loops = crossing_loops(contours, every)
+        self.assertEqual(len(loops), 1)
+        points, corners, part = loops[0]
+        self.assertEqual([every[x][0] for x in corners], [(-10.0, 240.0)])
+        self.assertEqual(len(part), 4)  # the corners of the overlap behind the hole
+        xs, ys = [p[0] for p in points], [p[1] for p in points]
+        self.assertEqual((min(xs), max(xs), min(ys), max(ys)), (-140.0, -10.0, 110.0, 240.0))
+
+    def test_joined_loop_is_one_outline_and_its_hole(self):
+        contours = outline_curves(LOOP)
+        every = contour_crossings(contours, holes_only=False)
+        _, corners, part = crossing_loops(contours, every)[0]
+        sharp = joined_outline(contours, every, part)
+        self.assertEqual(len(sharp), 2)  # the outline and the hole, no overlap
+        for contour in sharp:  # every contour stays closed and connected
+            for piece, following in zip(contour, contour[1:] + contour[:1]):
+                self.assertLess(length(sub(piece[1][-1], following[1][0])), 1e-6)
+        grid = [(x, y) for x in range(-170, 170, 4) for y in range(80, 420, 4)]
+        self.assertEqual([w != 0 for w in _windings(sharp, grid)],
+                         [w != 0 for w in _windings(contours, grid)])
+        rounded = joined_outline(contours, every, part, {x: 15 for x in corners})
+        inside_corner, hole, ink = (-12, 238), (-60, 180), (0, 300)
+        self.assertEqual(_windings(contours, [inside_corner])[0], 0)
+        after = _windings(rounded, (inside_corner, hole, ink))
+        self.assertNotEqual(after[0], 0)  # the corner of the hole is filled
+        self.assertEqual(after[1], 0)
+        self.assertNotEqual(after[2], 0)
+
+    def test_joined_loop_keeps_one_structure_for_any_radius_or_width(self):
+        def kinds(contours):
+            return [[kind for kind, _ in contour] for contour in contours]
+        def joined(width, radius):
+            segments = [(kind, pts, width, width) for kind, pts, _, _ in LOOP]
+            contours = outline_curves(segments)
+            every = contour_crossings(contours, holes_only=False)
+            _, corners, part = crossing_loops(contours, every)[0]
+            return joined_outline(contours, every, part, {x: radius for x in corners})
+        reference = kinds(joined(20, 0))
+        for radius in (0, 5, 40, 400):
+            for width in (10, 20, 40):
+                self.assertEqual(kinds(joined(width, radius)), reference, (radius, width))
+
     def test_corner_slide_uses_line_before_curve_and_curve_handle_otherwise(self):
         point = (10, 10)
         curve = ('cubic', ((0, 0), (2, 8), (8, 6), point))

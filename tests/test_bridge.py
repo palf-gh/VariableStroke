@@ -1,4 +1,5 @@
 import importlib
+import math
 import sys
 import types
 import unittest
@@ -830,6 +831,135 @@ class BridgeTests(unittest.TestCase):
         self.assertEqual([path.attributes[bridge.CAP_END_KEY] for path in target.paths],
                          ['square', 'square'])
 
+    def test_joined_hole_in_one_master_joins_the_others_with_no_rounding(self):
+        def layer():
+            path = Path([Node(0, 400), Node(0, 100), Node(-150, 100), Node(-150, 250),
+                         Node(150, 250)])
+            for node in path.nodes:
+                node.userData.clear()
+            path.attributes[bridge.STROKE_WIDTH_KEY] = 20
+            path.attributes[bridge.STROKE_HEIGHT_KEY] = 20
+            return Layer([path])
+        rounded, plain = layer(), layer()
+        glyph = types.SimpleNamespace(layers=[rounded, plain], userData={})
+        for item in glyph.layers:
+            item.parent = glyph
+        self.assertEqual(len(bridge.curves_for_path(plain.paths[0])), 1)  # nothing joined
+        hole = bridge.crossing_hole_widgets(rounded.paths[0])[0]
+        bridge.set_crossing_hole(rounded.paths[0], hole['corners'], True, radius=15)
+        self.assertEqual(bridge.crossing_spec(rounded.paths[0]), ((hole['corners'], 15.0),))
+        self.assertEqual(bridge.crossing_spec(plain.paths[0]), ((hole['corners'], 0.0),))
+        round_contours = bridge.curves_for_path(rounded.paths[0])
+        plain_contours = bridge.curves_for_path(plain.paths[0])
+        self.assertEqual(len(round_contours), 2)  # the outline and the hole
+        self.assertEqual([[kind for kind, _ in c] for c in round_contours],
+                         [[kind for kind, _ in c] for c in plain_contours])
+        # Without the glyph's note, a master on its own stays as it was.
+        glyph.userData.clear()
+        self.assertIsNone(bridge.crossing_spec(plain.paths[0]))
+
+    def test_holes_are_found_and_switched_one_by_one(self):
+        path = Path([Node(0, 400), Node(0, 100), Node(-150, 100), Node(-150, 250),
+                     Node(150, 250)])
+        for node in path.nodes:
+            node.userData.clear()
+        path.attributes[bridge.STROKE_WIDTH_KEY] = 20
+        path.attributes[bridge.STROKE_HEIGHT_KEY] = 20
+        layer = Layer([path])
+        layer.parent = types.SimpleNamespace(layers=[layer], userData={})
+        holes = bridge.crossing_hole_widgets(path)
+        self.assertEqual(len(holes), 1)
+        self.assertFalse(holes[0]['on'])
+        xs = [p[0] for p in holes[0]['points']]
+        ys = [p[1] for p in holes[0]['points']]
+        self.assertEqual((round(min(xs)), round(max(xs)), round(min(ys)), round(max(ys))),
+                         (-140, -10, 110, 240))  # the square inside the loop
+        handle = holes[0]['handles'][0]
+        self.assertEqual(handle['corner'], (-10.0, 240.0))
+        self.assertAlmostEqual(handle['angle'], math.pi / 2)
+        for value in (0.0, 12.0, 30.0):  # the handle gives back its radius
+            self.assertAlmostEqual(bridge.hole_radius_at(
+                handle, bridge.hole_handle_point(handle, value)), value)
+        bridge.set_crossing_hole(path, holes[0]['corners'], True)
+        hole = bridge.crossing_hole_widgets(path)[0]
+        self.assertTrue(hole['on'])
+        self.assertEqual(hole['radius'], bridge.DEFAULT_CORNER_RADIUS)
+        bridge.set_hole_radius(path, hole['corners'], 8)
+        self.assertEqual(bridge.crossing_hole_widgets(path)[0]['radius'], 8)
+        self.assertEqual(len(bridge.curves_for_path(path)), 2)
+        bridge.set_crossing_hole(path, hole['corners'], False)
+        self.assertFalse(bridge.crossing_hole_widgets(path)[0]['on'])
+        self.assertNotIn(bridge.CROSSING_HOLES_KEY, path.attributes)
+        self.assertEqual(len(bridge.curves_for_path(path)), 1)
+
+    def test_crossing_on_another_outline_piece_in_one_master_keeps_one_structure(self):
+        # The loop of す: in the bold master the loop runs back across the
+        # straight stroke past an outline node, onto the next piece.
+        def master(width, tail):
+            nodes = [Node(400, 800), Node(400, 470),
+                     Node(400, 380, 'offcurve'), Node(360, 330, 'offcurve'),
+                     Node(310, 330, 'curve'),
+                     Node(250, 330, 'offcurve'), Node(230, 400, 'offcurve'),
+                     Node(240, 440, 'curve'),
+                     Node(255, 510, 'offcurve'), Node(330, 540, 'offcurve'),
+                     Node(380, 520, 'curve'),
+                     Node(430, 500, 'offcurve'), Node(tail, 450, 'offcurve'),
+                     Node(tail, 400, 'curve'),
+                     Node(tail, 250, 'offcurve'), Node(400, 150, 'offcurve'),
+                     Node(330, 80, 'curve')]
+            path = Path(nodes)
+            for node in nodes:
+                node.userData.clear()
+            path.attributes[bridge.STROKE_WIDTH_KEY] = width
+            path.attributes[bridge.STROKE_HEIGHT_KEY] = width
+            return Layer([path])
+        light, bold = master(30, 440), master(70, 470)
+        glyph = types.SimpleNamespace(layers=[light, bold], userData={})
+        for item in glyph.layers:
+            item.parent = glyph
+        hole = bridge.crossing_hole_widgets(light.paths[0])[0]
+        for item in glyph.layers:
+            bridge.set_crossing_hole(item.paths[0], hole['corners'], True, radius=25)
+        layouts = [bridge.crossing_layout(item.paths[0]) for item in glyph.layers]
+        self.assertEqual(len(layouts[0]), len(layouts[1]))
+        self.assertNotEqual(layouts[0], layouts[1])  # a crossing moved to the next piece
+        kinds = [[[kind for kind, _ in contour]
+                  for contour in bridge.curves_for_path(item.paths[0])]
+                 for item in glyph.layers]
+        self.assertEqual(len(kinds[0]), 2)
+        self.assertEqual(kinds[0], kinds[1])
+
+    def test_outlines_run_counterclockwise_with_clockwise_counters(self):
+        def area(path):
+            points = [(node.position.x, node.position.y) for node in path.nodes]
+            return sum(x0*y1 - x1*y0 for (x0, y0), (x1, y1) in
+                       zip(points, points[1:] + points[:1])) / 2.0
+        def stroke(nodes, closed):
+            path = Path([Node(x, y) for x, y in nodes], closed=closed)
+            for node in path.nodes:
+                node.userData.clear()
+            path.attributes[bridge.STROKE_WIDTH_KEY] = 20
+            path.attributes[bridge.STROKE_HEIGHT_KEY] = 20
+            Layer([path])
+            return path
+        for nodes in ([(0, 0), (0, 100)], [(0, 100), (0, 0)], [(0, 0), (100, 50)]):
+            outline = bridge.generated_paths(stroke(nodes, False))
+            self.assertGreater(area(outline[0]), 0)
+        # The preview keeps the outline as built: Glyphs would draw counter-
+        # clockwise overlaps merged while editing.
+        preview = Layer([stroke([(0, 0), (0, 100)], False)])
+        bridge.expand_layer(preview, glyph_on=True)
+        self.assertLess(area(preview.paths[0]), 0)
+        converted = Layer([stroke([(0, 0), (0, 100)], False)])
+        bridge.expand_layer(converted, glyph_on=True, upright=True)
+        self.assertGreater(area(converted.paths[0]), 0)
+        square = [(0, 0), (100, 0), (100, 100), (0, 100)]
+        for nodes in (square, list(reversed(square))):
+            areas = sorted(area(p) for p in bridge.generated_paths(stroke(nodes, True)))
+            self.assertLess(areas[0], 0)  # the counter
+            self.assertGreater(areas[1], 0)
+            self.assertGreater(abs(areas[1]), abs(areas[0]))  # the outer contour
+
     def test_bevel_cuts_the_outer_corner_and_other_masters_keep_the_structure(self):
         def layer(bevel):
             path = Path([Node(0, 0), Node(0, 100), Node(100, 100)])
@@ -1553,8 +1683,8 @@ class BridgeTests(unittest.TestCase):
             instance.paths[0], bridge.path_nodes(instance.paths[0])))
         bridge.expand_layer(instance, True, defaults, blends=True)
         expected = []
-        for pa, pb in zip(bridge.generated_paths(a.paths[0]),
-                          bridge.generated_paths(b.paths[0])):
+        for pa, pb in zip(bridge.generated_paths(a.paths[0], upright=False),
+                          bridge.generated_paths(b.paths[0], upright=False)):
             expected.append([(0.75*na.position.x + 0.25*nb.position.x,
                               0.75*na.position.y + 0.25*nb.position.y)
                              for na, nb in zip(pa.nodes, pb.nodes)])

@@ -7,7 +7,9 @@ import threading
 import time
 import uuid
 from GlyphsApp import GSPath, GSNode, LINE, CURVE, OFFCURVE
-from variable_stroke_core import (outline_curves, ellipse_nib_edges, sub, add, mul,
+from variable_stroke_core import (outline_curves, joined_outline, contour_crossings,
+                                  crossing_loops, ellipse_nib_edges, sub, add, mul,
+                                  _area, _flat_piece, _reverse, _piece_tangent,
                                   move_outline_vertices,
                                   outline_direction_at_vertex, DEFAULT_CAP_CURVE)
 import width_profile
@@ -84,6 +86,12 @@ GLYPH_CORNERS_KEY = 'com.codex.VariableStroke.glyphHasCorners'
 JOIN_KEY = 'com.codex.VariableStroke.join'  # per node: 'bevel'; absent means miter
 BEVEL_ANGLE_KEY = 'com.codex.VariableStroke.bevelAngle'  # page degrees; absent: automatic
 GLYPH_BEVELS_KEY = 'com.codex.VariableStroke.glyphHasBevels'
+# Per path: the holes a stroke makes by crossing itself that are joined and
+# rounded, [{'corners': [crossing indices in contour order], 'radius': r}]
+# (see crossing_loops); the joining is shared by the masters, the radius each
+# master's own.
+CROSSING_HOLES_KEY = 'com.codex.VariableStroke.crossingHoles'
+GLYPH_CROSSINGS_KEY = 'com.codex.VariableStroke.glyphHasCrossings'
 GENERATED_KEY = 'com.codex.VariableStroke.generated'  # legacy in-layer outlines
 # Marks outlines this plugin produced, so they are never taken for centerlines
 # again (a layer prepared twice, an interpolated or exported copy).
@@ -98,7 +106,8 @@ LEGACY_HAIRLINE_KEY = 'com.codex.VariableStroke.hairline'
 # Path attributes that define the stroke (copied onto interpolated layers).
 _STROKE_ATTRIBUTES = (PATH_KEY, CAP_START_KEY, CAP_END_KEY, CAP_START_ANGLE_KEY,
                       CAP_END_ANGLE_KEY, CAP_START_CURVE_KEY, CAP_END_CURVE_KEY,
-                      CAP_START_CURVE_ON_KEY, CAP_END_CURVE_ON_KEY, PROFILE_KEY)
+                      CAP_START_CURVE_ON_KEY, CAP_END_CURVE_ON_KEY, PROFILE_KEY,
+                      CROSSING_HOLES_KEY)
 
 # Outline geometry is recomputed constantly (Glyphs' preview, handle drawing,
 # hit tests) for unchanged input, so results are kept by their exact input.
@@ -1776,11 +1785,13 @@ def copy_stroke_settings(source, target):
     attributes[STROKE_WIDTH_KEY] = source_width
     attributes[STROKE_HEIGHT_KEY] = source_height
     for key in (CAP_START_KEY, CAP_END_KEY, CAP_START_ANGLE_KEY, CAP_END_ANGLE_KEY,
-                CAP_START_CURVE_ON_KEY, CAP_END_CURVE_ON_KEY):
+                CAP_START_CURVE_ON_KEY, CAP_END_CURVE_ON_KEY, CROSSING_HOLES_KEY):
         if key in source.attributes:
             attributes[key] = source.attributes[key]
         else:
             _pop(attributes, key)
+    if hole_radii(source):
+        note_corner(target, GLYPH_CROSSINGS_KEY)
     for at_end, key in ((False, CAP_START_CURVE_KEY), (True, CAP_END_CURVE_KEY)):
         if key in source.attributes:
             attributes[key] = [list(point) for point in cap_curve_of(source, at_end)]
@@ -1995,6 +2006,82 @@ def bevel_specs(path, items=None):
     return specs if any(specs) else None
 
 
+def hole_radii(path):
+    """{corners (tuple of crossing indices): radius} of the holes a path joins
+    and rounds (see CROSSING_HOLES_KEY)."""
+    try:
+        value = path.attributes.get(CROSSING_HOLES_KEY)
+    except AttributeError:
+        return {}
+    result = {}
+    try:
+        for entry in value or ():
+            corners = tuple(sorted(int(x) for x in entry['corners']))
+            radius = float(entry.get('radius') or 0.0)
+            if corners:
+                result[corners] = max(radius, 0.0) if math.isfinite(radius) else 0.0
+    except (AttributeError, KeyError, TypeError, ValueError):
+        return {}
+    return result
+
+
+def _set_hole_radii(path, radii):
+    if radii:
+        path.attributes[CROSSING_HOLES_KEY] = [
+            {'corners': list(corners), 'radius': radius}
+            for corners, radius in sorted(radii.items())]
+    else:
+        _pop(path.attributes, CROSSING_HOLES_KEY)
+
+
+class _Attributes(object):
+    """A recorded attributes dict standing in for its path (see hole_radii)."""
+    def __init__(self, attributes):
+        self.attributes = attributes
+
+
+def _sibling_path_objects(path):
+    """The same path in the glyph's other layers with the same paths (node
+    counts), as _sibling_paths takes part in matching them."""
+    layer = getattr(path, 'parent', None)
+    glyph = getattr(layer, 'parent', None) if layer is not None else None
+    if glyph is None:
+        return []
+    try:
+        paths = list(layer.paths)
+        index = _index_of(paths, path)
+        layers = list(glyph.layers)
+    except Exception:
+        return []
+    layer_id = getattr(layer, 'layerId', None)
+    shape = [len(other.nodes) for other in paths]
+    result = []
+    for other_layer in layers:
+        if other_layer is layer or (layer_id is not None and
+                                    getattr(other_layer, 'layerId', None) == layer_id):
+            continue
+        other_paths = list(other_layer.paths)
+        if [len(other.nodes) for other in other_paths] == shape and index < len(other_paths):
+            result.append(other_paths[index])
+    return result
+
+
+def crossing_spec(path):
+    """((corners, radius), ...) of the holes the outline is joined at, or None.
+    A hole joined in another master is joined here too, rounded by 0 when
+    this master has no radius for it: the masters keep one structure."""
+    own = hole_radii(path)
+    if not own and not _glyph_has_corners(path, GLYPH_CROSSINGS_KEY):
+        return None
+    holes = set(own)
+    if _glyph_has_corners(path, GLYPH_CROSSINGS_KEY):
+        for other in _sibling_path_objects(path):
+            holes.update(hole_radii(other))
+    if not holes:
+        return None
+    return tuple((corners, own.get(corners, 0.0)) for corners in sorted(holes))
+
+
 def corner_specs(path, items=None):
     """Live corner per on-curve node. A corner that is on in any other master of
     the glyph gets a zero-size arc here, so masters keep compatible outlines while
@@ -2042,7 +2129,7 @@ def corner_widgets(path, defaults=None, items=None):
 _OUTLINES = collections.OrderedDict()
 
 
-def _outline_fingerprint(path, defaults, items):
+def _outline_fingerprint(path, defaults, items, hint=()):
     """What a stroke's outline is made from, as one hashable value, or None.
 
     Nodes (positions, types, userData), the path's attributes, the layer's kept
@@ -2063,21 +2150,23 @@ def _outline_fingerprint(path, defaults, items):
     return (nodes, attributes, store, closed,
             (defaults.width, defaults.height, defaults.italic_angle, defaults.nib_angle),
             None if profile is None else repr((profile['points'], profile.get('divisions'))),
-            repr(corner_specs(path, items)), repr(bevel_specs(path, items)))
+            repr(corner_specs(path, items)), repr(bevel_specs(path, items)),
+            crossing_spec(path), hint)
 
 
 def _outline(path, defaults, items):
     """(segments, cached geometry, original-node map) of a path."""
     with PROFILE.section('outline inputs (segments, corners)'):
+        hint = _sibling_crossings(path)
         with PROFILE.section('  inputs: fingerprint'):
-            fingerprint = _outline_fingerprint(path, defaults, items)
+            fingerprint = _outline_fingerprint(path, defaults, items, hint)
         found = _OUTLINES.get(fingerprint) if fingerprint is not None else None
     if found is not None:
         if PROFILE.enabled:
             PROFILE.add('    outline inputs: reused', 0.0)
         return found
     writes = _BOOKKEEPING[0]
-    result = _gathered_outline(path, defaults, items)
+    result = _gathered_outline(path, defaults, items, hint)
     if fingerprint is not None and _BOOKKEEPING[0] == writes:
         # (A run that bound virtual anchors read the path before them.)
         with _CACHE_LOCK:
@@ -2087,7 +2176,44 @@ def _outline(path, defaults, items):
     return result
 
 
-def _gathered_outline(path, defaults, items):
+def _sibling_crossings(path):
+    """The crossing layouts (see crossing_layout) of this path in the glyph's
+    other masters, () without crossing rounding: where a crossing lands on
+    another outline piece in some master, every master lays those pieces out
+    alike (see _crossing_runs' ranges)."""
+    if crossing_spec(path) is None:
+        return ()
+    layouts = []
+    for other in _sibling_path_objects(path):
+        try:
+            if not enabled(other):
+                continue
+            items = path_nodes(other)
+            layouts.append(_gathered_outline(other, _resolve(None, other), items,
+                                             base_only=True)[5])
+        except Exception:
+            continue
+    return tuple(layouts)
+
+
+def _crossing_ranges(own, others):
+    """Per crossing and strand, the (first, last) piece it lands on in this
+    master and the others with the same crossings on the same contours."""
+    shape = tuple((first[0], second[0]) for first, second in own)
+    layouts = [own] + [layout for layout in others
+                       if tuple((first[0], second[0]) for first, second in layout) == shape]
+    if len(layouts) < 2:
+        return None
+    return [tuple((min(layout[x][strand][1] for layout in layouts),
+                   max(layout[x][strand][1] for layout in layouts)) for strand in (0, 1))
+            for x in range(len(own))]
+
+
+def _gathered_outline(path, defaults, items, hint=(), base_only=False, detect=False):
+    """(segments, cached geometry, original-node map) of a path; with
+    `base_only` its outline before any crossing rounding: (contours, report,
+    edges, cap points, crossings, crossing layout), the crossings found also
+    without crossing rounding when `detect` is set."""
     with PROFILE.section('outline inputs (segments, corners)'):
         with PROFILE.section('  inputs: segments'):
             source_segments = segments_for_path(path, defaults, items)
@@ -2106,6 +2232,7 @@ def _gathered_outline(path, defaults, items):
         with PROFILE.section('  inputs: corners'):
             source_corners = corner_specs(path, items)
             source_bevels = bevel_specs(path, items)
+            crossing = crossing_spec(path)
         source_offsets = [(corner_offset_of(data, 'left'), corner_offset_of(data, 'right'))
                           for _, _, _, data in _on_curve(items, closed)]
         source_handles = [tuple(corner_handle_of(data, side, incoming)
@@ -2142,7 +2269,7 @@ def _gathered_outline(path, defaults, items):
                tuple(left_map) if independent else (),
                tuple(right_map) if independent else (),
                tuple(None if c is None else tuple(sorted(c.items())) for c in corners),
-               tuple(source_offsets), tuple(source_handles), bevels)
+               tuple(source_offsets), tuple(source_handles), bevels, crossing)
 
     def compute():
         collected, edges, cap_points = [], {}, {}
@@ -2173,10 +2300,33 @@ def _gathered_outline(path, defaults, items):
                            for expanded_index, original_index in enumerate(node_map)
                            if original_index is not None and original_index < len(source_handles)}
             contours = move_outline_vertices(contours, edges, offsets, handles)
-        # The last slot keeps the outline as GSPaths once built (see _outline_paths).
-        return [contours, collected, edges, None, cap_points]
+        crossings = contour_crossings(contours, holes_only=False) if look else ()
+        layout = tuple(((first[0], first[1]), (second[0], second[1]))
+                       for _, first, second, _ in crossings)
+        return contours, collected, edges, cap_points, crossings, layout
 
-    return segments, _cached(key, compute), node_map
+    look = detect or crossing is not None
+    base = _cached(('base', look) + key, compute)
+    if base_only:
+        return base
+
+    def rounded():
+        contours, collected, edges, cap_points, crossings, layout = base
+        if crossing is not None:
+            loops = {tuple(corners): part for _, corners, part in
+                     crossing_loops(contours, crossings)}
+            part, fillets = set(), {}
+            for corners, radius in crossing:
+                if corners in loops:
+                    part.update(loops[corners])
+                    fillets.update((x, radius) for x in corners)
+            contours = joined_outline(contours, crossings, part, fillets,
+                                      ranges=_crossing_ranges(layout, hint))
+        # Slot 3 keeps the outline as GSPaths once built (see _outline_paths);
+        # slot 5 where the crossings were (see crossing_layout).
+        return [contours, collected, edges, None, cap_points, layout]
+
+    return segments, _cached(key + (crossing, hint), rounded), node_map
 
 
 def curves_for_path(path, defaults=None, report=None, items=None):
@@ -2189,18 +2339,22 @@ def curves_for_path(path, defaults=None, report=None, items=None):
     return contours
 
 
-def _outline_paths(path, defaults, items):
+def _outline_paths(path, defaults, items, upright=False):
     """GSPaths of a centerline's outline. Glyphs prepares the whole layer again
     for every mouse event while a node moves, so the outline of each unchanged
     stroke is built once and handed out as copies (one call instead of one
-    GSNode per point)."""
+    GSNode per point). `upright` turns them counter-clockwise (see
+    generated_paths), for conversion and export."""
     _, cached, _ = _outline(path, _resolve(defaults, path), items)
+    if upright:
+        return generated_paths(path, contours=cached[0], upright=True)
     templates = cached[3]
     if templates is None:
         with PROFILE.section('build outline GSPaths'):
-            templates = cached[3] = generated_paths(path, contours=cached[0])
+            templates = cached[3] = generated_paths(path, contours=cached[0], upright=False)
     if not all(hasattr(template, 'copy') for template in templates):
-        return generated_paths(path, contours=cached[0])  # plain Python paths (tests)
+        # plain Python paths (tests)
+        return generated_paths(path, contours=cached[0], upright=False)
     with PROFILE.section('copy outline GSPaths'):
         copies = [template.copy() for template in templates]
         for copied in copies:
@@ -2209,9 +2363,23 @@ def _outline_paths(path, defaults, items):
     return copies
 
 
-def generated_paths(path, defaults=None, contours=None):
+def _ink_counterclockwise(contours):
+    """Contours turned so the ink runs counter-clockwise (outer contours
+    counter-clockwise, counters clockwise), as Glyphs and font formats expect.
+    A stroke is built along its left side first, which runs clockwise."""
+    ink = sum(_area([point for piece in contour for _, point in _flat_piece(piece, 8)[:-1]])
+              for contour in contours if contour)
+    return [_reverse(contour) for contour in contours] if ink < 0 else list(contours)
+
+
+def generated_paths(path, defaults=None, contours=None, upright=True):
+    """GSPaths of an outline. `upright` turns them as fonts expect (see
+    _ink_counterclockwise); the preview keeps them as built, as Glyphs draws
+    the overlaps of counter-clockwise outlines merged, and while editing the
+    stroke parts are easier to follow apart."""
     result = []
-    for contour in (curves_for_path(path, defaults) if contours is None else contours):
+    contours = curves_for_path(path, defaults) if contours is None else contours
+    for contour in (_ink_counterclockwise(contours) if upright else contours):
         if not contour:
             continue
         new_path = GSPath()
@@ -2354,7 +2522,7 @@ def cleanup_legacy_layer(layer):
     return changed
 
 
-def _expansion_plan(layer, glyph_on=None, defaults=None, blends=False):
+def _expansion_plan(layer, glyph_on=None, defaults=None, blends=False, upright=False):
     if defaults is None:
         defaults = layer_defaults(layer)
     if glyph_on is False:
@@ -2372,10 +2540,11 @@ def _expansion_plan(layer, glyph_on=None, defaults=None, blends=False):
                 contours = _blended_outline(path, items, defaults)
             if contours is not None:
                 with PROFILE.section('build outline GSPaths'):
-                    plan.append((path, generated_paths(path, contours=contours)))
+                    plan.append((path, generated_paths(path, contours=contours,
+                                                       upright=upright)))
                 continue
         try:
-            plan.append((path, _outline_paths(path, defaults, items)))
+            plan.append((path, _outline_paths(path, defaults, items, upright)))
         except ValueError:
             continue
     return plan
@@ -2389,7 +2558,7 @@ def _apply_plan(layer, plan):
     return len(plan)
 
 
-def expand_layer(layer, glyph_on=None, defaults=None, blends=False):
+def expand_layer(layer, glyph_on=None, defaults=None, blends=False, upright=False):
     """Replace every centerline in `layer` by its Bézier outline.
 
     Glyphs calls this on the throwaway copy it prepares for preview, inactive
@@ -2405,8 +2574,11 @@ def expand_layer(layer, glyph_on=None, defaults=None, blends=False):
     `blends`: the layer is an interpolated instance (not a master, brace or
     bracket layer); strokes whose master outlines were blended when Glyphs
     interpolated it (see interpolate_layer) take that blend.
+
+    `upright`: turn the outlines as fonts expect (conversion, export); the
+    preview keeps them as built (see generated_paths).
     """
-    return _apply_plan(layer, _expansion_plan(layer, glyph_on, defaults, blends))
+    return _apply_plan(layer, _expansion_plan(layer, glyph_on, defaults, blends, upright))
 
 
 class _RecordedNode(object):
@@ -2883,6 +3055,13 @@ def _interpolate_layer(layer, glyph, interpolation, glyph_key=None):
             path.attributes[BLEND_KEY] = ''  # copied from a source: not this blend
         for key, value in template['attributes'].items():
             path.attributes[key] = value
+        # A hole joined in one source is joined here, its radius blended (0 where unset).
+        holes = set()
+        for _, other, _ in others:
+            holes.update(hole_radii(_Attributes(other['attributes'])))
+        _set_hole_radii(path, {corners: sum(
+            factor * hole_radii(_Attributes(other['attributes'])).get(corners, 0.0)
+            for _, other, factor in others) for corners in holes})
         if template['profile'] is not None:  # the instance cannot reach the font
             path.attributes[PROFILE_DATA_KEY] = _saved_profile(template['profile'])
         else:
@@ -3046,7 +3225,7 @@ def convert_layer(layer, keep_marks=True):
     if state is False:
         return 0
     cleanup_legacy_layer(layer)
-    count = expand_layer(layer, glyph_on=state)
+    count = expand_layer(layer, glyph_on=state, upright=True)
     if not keep_marks:
         _unmark(layer)
         layer.userData[LAYER_STATE_KEY] = False
@@ -3061,7 +3240,7 @@ def convert_glyph(glyph, keep_marks=True):
     layers = list(glyph.layers)
     for layer in layers:
         cleanup_legacy_layer(layer)
-    plans = [(layer, _expansion_plan(layer, True)) for layer in layers]
+    plans = [(layer, _expansion_plan(layer, True, upright=True)) for layer in layers]
     count = sum(_apply_plan(layer, plan) for layer, plan in plans)
     if not keep_marks:
         for layer in layers:
@@ -3070,6 +3249,94 @@ def convert_glyph(glyph, keep_marks=True):
         for layer in layers:
             layer.userData[LAYER_STATE_KEY] = False
     return count
+
+
+_HOLES = collections.OrderedDict()  # id(base outline): (base outline, holes)
+
+
+def crossing_hole_widgets(path, defaults=None, items=None):
+    """The holes a stroke makes by crossing itself, for the editor: [{'points':
+    the hole's outline, 'corners': its crossings (the key in
+    CROSSING_HOLES_KEY), 'on': joined and rounded, 'radius', 'handles': per
+    corner {'corner', 'direction' into the hole, 'angle' of the corner}}]."""
+    items = path_nodes(path) if items is None else items
+    base = _gathered_outline(path, _resolve(defaults, path), items, base_only=True,
+                             detect=True)
+    with _CACHE_LOCK:
+        found = _HOLES.get(id(base))
+    if found is None or found[0] is not base:
+        found = (base, crossing_loops(base[0], base[4]))  # the base outline is cached
+        _remember(_HOLES, 256, id(base), found)
+    contours, crossings = base[0], base[4]
+    radii = hole_radii(path)
+    result = []
+    for points, corners, _ in found[1]:
+        handles = []
+        for x in corners:
+            point, first, second, opening = crossings[x]
+            d1 = _piece_tangent(contours[first[0]][first[1]], first[2])
+            d2 = _piece_tangent(contours[second[0]][second[1]], second[2])
+            # The open corner lies between one strand arriving and the other leaving.
+            direction = sub(d2, d1) if opening == 12 else sub(d1, d2)
+            size = math.hypot(*direction)
+            if size < 1e-9:
+                continue
+            cosine = -(d1[0]*d2[0] + d1[1]*d2[1])
+            handles.append({'corner': point, 'direction': (direction[0] / size,
+                                                            direction[1] / size),
+                            'angle': math.acos(max(-1.0, min(1.0, cosine)))})
+        key = tuple(corners)
+        result.append({'points': points, 'corners': key, 'on': key in radii,
+                       'radius': radii.get(key), 'handles': handles})
+    return result
+
+
+def hole_handle_point(handle, radius):
+    """Where the rounding of a corner of `radius` is furthest into the hole."""
+    half = math.sin(handle['angle'] / 2.0)
+    reach = radius * (1.0 / half - 1.0) if half > 1e-6 else 0.0
+    return add(handle['corner'], mul(handle['direction'], reach))
+
+
+def hole_radius_at(handle, point):
+    """The radius whose rounding reaches `point` (see hole_handle_point)."""
+    half = math.sin(handle['angle'] / 2.0)
+    along = sub(point, handle['corner'])
+    reach = along[0]*handle['direction'][0] + along[1]*handle['direction'][1]
+    factor = 1.0 / half - 1.0 if half > 1e-6 else 0.0
+    return max(0.0, reach / factor) if factor > 1e-6 else 0.0
+
+
+def set_crossing_hole(path, corners, state, radius=None):
+    """Join and round the hole at `corners` (state True) or leave it; a hole
+    switched on gets `radius`, or the default."""
+    radii = hole_radii(path)
+    corners = tuple(sorted(corners))
+    if state:
+        if corners not in radii:
+            radii[corners] = float(radius if radius is not None else DEFAULT_CORNER_RADIUS)
+    else:
+        radii.pop(corners, None)
+    _set_hole_radii(path, radii)
+    note_corner(path, GLYPH_CROSSINGS_KEY)
+
+
+def set_hole_radius(path, corners, radius):
+    """The radius of a joined hole in this master."""
+    radii = hole_radii(path)
+    corners = tuple(sorted(corners))
+    if corners in radii:
+        radii[corners] = max(float(radius), 0.0)
+        _set_hole_radii(path, radii)
+
+
+def crossing_layout(path, defaults=None, items=None):
+    """The crossings a stroke's outline is joined at (see
+    CROSSING_HOLES_KEY): per crossing, the (contour, piece) of both edges before the
+    reconnection. Masters interpolate only where these are the same: a
+    crossing passing over an outline node in one master lands on another piece."""
+    items = path_nodes(path) if items is None else items
+    return _outline(path, _resolve(defaults, path), items)[1][5]
 
 
 def outline_signature(path, defaults=None, items=None):
@@ -3169,6 +3436,18 @@ def _mismatch_reasons(entries, names):
             values = [layout[segment] for layout in layouts]
             if len(set(values)) > 1:
                 reasons.append(('virtual', segment + 1, _groups(values, names)))
+    if any(crossing_spec(path) is not None for path, _ in entries):
+        layouts = []
+        for path, items in entries:
+            try:
+                layouts.append(crossing_layout(path, None, items))
+            except Exception:
+                layouts.append(None)
+        shapes = [None if layout is None else
+                  tuple((first[0], second[0]) for first, second in layout)
+                  for layout in layouts]
+        if len(set(shapes)) > 1:  # pieces alone are laid out alike (see _crossing_ranges)
+            reasons.append(('crossing', None, _groups(layouts, names)))
     if not reasons:
         # A live corner in one master only usually gets a zero-size twin in the
         # others, so it is named only when nothing else explains the difference.
@@ -3243,6 +3522,12 @@ _CAP_LABELS = {'flat': ('flat', 'フラット'), 'round': ('round', '丸'),
 def _describe_value(kind, value, pick):
     if kind in ('cap curve', 'corner'):
         return 'ON' if value else 'OFF'
+    if kind == 'crossing':
+        if value is None:
+            return '?'
+        where = ', '.join('%d×%d' % (first[1] + 1, second[1] + 1) for first, second in value)
+        return ('%d crossings (outline pieces %s)' % (len(value), where),
+                '交差 %d か所（輪郭区間 %s）' % (len(value), where))[pick]
     if kind == 'cap shape':
         return _CAP_LABELS.get(value, (value, value))[pick]
     if kind == 'profile':
@@ -3270,6 +3555,7 @@ def describe_incompatibility(entry, japanese=False):
              'corner': ('Live corner', 'ライブコーナー'),
              'virtual': ('Virtual nodes', '仮想ノード'),
              'profile': ('Width profile', '線幅プロファイル'),
+             'crossing': ('Crossing rounding', '交差角丸'),
              'outline': ('Outline structure', '輪郭構成')}
     ends = {'start': ('start', '始点'), 'end': ('end', '終点')}
     lines = [('Masters incompatible', 'マスター非互換')[pick] +
