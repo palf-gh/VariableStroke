@@ -1664,9 +1664,12 @@ def _round_contour(contour, vertices, report=None):
 
     Each rounded vertex becomes one cubic whatever the values, so the node
     structure only depends on which nodes are rounded; a straight-through vertex
-    just gets a zero-size arc. Trims are limited to half of each neighbouring
-    piece so arcs never overlap. Rounded vertices are reported (see outline_curves)
-    when `report` is a list.
+    just gets a zero-size arc. An arc may take up to the whole of each
+    neighbouring piece; where the arcs at both ends of a piece would overlap,
+    they share it in proportion to what each asks for and meet on it, where they
+    follow its direction (the piece is left with no length, keeping the
+    structure). Rounded vertices are reported (see outline_curves) when `report`
+    is a list.
     """
     count = len(contour)
     if count < 2 or not any(v is not None for v in vertices):
@@ -1693,22 +1696,34 @@ def _round_contour(contour, vertices, report=None):
         first, second = reach * ratio, reach / ratio
         if vertex.get('flip'):
             first, second = second, first
-        first = min(first, lengths[i-1] / 2.0)
-        second = min(second, lengths[i] / 2.0)
         trim_end[i-1], trim_start[i] = first, second
-        arcs[i] = (turn, first, second, tension_value, vertex, t_in, t_out)
-    trimmed = []
+        arcs[i] = (turn, tension_value, vertex, t_in, t_out)
+    for i in range(count):
+        # Each piece gives its ends at most its whole length, shared by what they ask.
+        wanted = trim_start[i] + trim_end[i]
+        if wanted > lengths[i]:
+            share = lengths[i] / wanted if wanted > EPS else 0.0
+            trim_start[i] *= share
+            trim_end[i] *= share
+    trimmed, starts, ends = [], [], []
     for i, piece in enumerate(contour):
         t0 = _t_at_length(samples[i], trim_start[i]) if trim_start[i] > 0 else 0.0
         t1 = _t_at_length(samples[i], lengths[i] - trim_end[i]) if trim_end[i] > 0 else 1.0
-        trimmed.append(_sub_piece(piece, t0, max(t0, t1)) if (t0 > 0 or t1 < 1) else piece)
+        t1 = max(t0, t1)
+        starts.append(t0)
+        ends.append(t1)
+        trimmed.append(_sub_piece(piece, t0, t1) if (t0 > 0 or t1 < 1) else piece)
     result = []
     for i, piece in enumerate(trimmed):
         if i in arcs:
-            turn, first, second, tension, vertex, t_in, t_out = arcs[i]
+            turn, tension, vertex, t_in, t_out = arcs[i]
+            first, second = trim_end[i-1], trim_start[i]
             before = trimmed[i-1]
             p1, p2 = before[1][-1], piece[1][0]
-            d1, d2 = _piece_tangent(before, 1.0), _piece_tangent(piece, 0.0)
+            # Directions from the untrimmed pieces: a piece both arcs used up
+            # has no length left to take one from.
+            d1 = _piece_tangent(contour[i-1], ends[i-1])
+            d2 = _piece_tangent(contour[i], starts[i])
             # Circular-arc handle proportion (4/3 tan(turn/4) / tan(turn/2)),
             # scaled by each side's trim so uneven sides give an elliptic arc.
             k = (4.0/3.0 * math.tan(turn/4.0) / math.tan(turn/2.0)) if turn > 1e-6 else 2.0/3.0

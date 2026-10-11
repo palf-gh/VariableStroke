@@ -688,6 +688,53 @@ class GeometryTests(unittest.TestCase):
             self.assertAlmostEqual(widget['first'], 45.0, places=3)
             self.assertAlmostEqual(widget['second'], second, places=3)
 
+    def test_corner_may_take_more_than_half_of_its_pieces(self):
+        segments = [('line', ((0, 0), (0, 300)), 40, 40), ('line', ((0, 300), (300, 300)), 40, 40)]
+        report = []
+        outline_curves(segments, corner_radii=[None, {'outer': 200, 'inner': 200}, None],
+                       report=report)
+        for widget in report:
+            self.assertAlmostEqual(widget['first'], 200.0, places=3)
+            self.assertAlmostEqual(widget['second'], 200.0, places=3)
+        # Beyond its pieces, an arc takes them whole.
+        report = []
+        outline_curves(segments, corner_radii=[None, {'outer': 900, 'inner': 900}, None],
+                       report=report)
+        inner = next(widget for widget in report if widget['which'] == 'inner')
+        self.assertAlmostEqual(inner['first'], 280.0, places=3)
+        self.assertAlmostEqual(inner['second'], 280.0, places=3)
+
+    def test_overlapping_corners_share_their_piece_and_meet_smoothly(self):
+        # A U: both top corners rounded far beyond the 100 unit top.
+        segments = [('line', ((0, 0), (0, 300)), 40, 40),
+                    ('line', ((0, 300), (100, 300)), 40, 40),
+                    ('line', ((100, 300), (100, 0)), 40, 40)]
+        plain = outline_curves(segments)[0]
+        for radius in (60, 200, 1000):
+            report = []
+            corner = {'outer': radius, 'inner': radius}
+            contour = outline_curves(segments, corner_radii=[None, corner, corner, None],
+                                     report=report)[0]
+            self.assertEqual(len(contour), len(plain) + 4)  # one arc per rounded vertex
+            for before, after in zip(contour, contour[1:] + contour[:1]):
+                self.assertAlmostEqual(before[1][-1][0], after[1][0][0], places=6)
+                self.assertAlmostEqual(before[1][-1][1], after[1][0][1], places=6)
+            for which, top in (('outer', 140.0), ('inner', 60.0)):
+                first, second = sorted((w for w in report if w['which'] == which),
+                                       key=lambda w: w['node'])
+                along = second['first'] if not second['flip'] else second['second']
+                shared = (first['second'] if not first['flip'] else first['first']) + along
+                self.assertLessEqual(shared, top + 1e-6)
+                if radius >= 200:  # they meet: the top is used up
+                    self.assertAlmostEqual(shared, top, places=3)
+            # Where two arcs meet they run in the same direction.
+            arcs = [piece for piece in contour if piece[0] == 'cubic']
+            for a, b in zip(arcs, arcs[1:]):
+                if length(sub(a[1][3], b[1][0])) < 1e-6:
+                    out, into = unit(sub(a[1][3], a[1][2])), unit(sub(b[1][1], b[1][0]))
+                    self.assertAlmostEqual(out[0]*into[1] - out[1]*into[0], 0.0, places=6)
+                    self.assertGreater(out[0]*into[0] + out[1]*into[1], 0.0)
+
     def test_bad_width(self):
         with self.assertRaises(ValueError):
             outline([('line', ((0, 0), (10, 0)), 0, 10)])
