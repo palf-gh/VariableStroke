@@ -87,8 +87,10 @@ JOIN_KEY = 'com.codex.VariableStroke.join'  # per node: 'bevel'; absent means mi
 BEVEL_ANGLE_KEY = 'com.codex.VariableStroke.bevelAngle'  # page degrees; absent: automatic
 GLYPH_BEVELS_KEY = 'com.codex.VariableStroke.glyphHasBevels'
 # Per path: the holes a stroke makes by crossing itself that are joined and
-# rounded, [{'corners': [crossing indices in contour order], 'radius': r}]
-# (see crossing_loops); the joining is shared by the masters, the radius each
+# rounded, [{'corners': [crossing indices in contour order], 'before': length
+# along the edge arriving at the corner, 'after': along the edge leaving it,
+# 'tension': %}] (see crossing_loops, joined_outline); an older entry has a
+# 'radius' instead. The joining is shared by the masters, the values each
 # master's own.
 CROSSING_HOLES_KEY = 'com.codex.VariableStroke.crossingHoles'
 GLYPH_CROSSINGS_KEY = 'com.codex.VariableStroke.glyphHasCrossings'
@@ -1790,7 +1792,7 @@ def copy_stroke_settings(source, target):
             attributes[key] = source.attributes[key]
         else:
             _pop(attributes, key)
-    if hole_radii(source):
+    if hole_settings(source):
         note_corner(target, GLYPH_CROSSINGS_KEY)
     for at_end, key in ((False, CAP_START_CURVE_KEY), (True, CAP_END_CURVE_KEY)):
         if key in source.attributes:
@@ -2006,9 +2008,14 @@ def bevel_specs(path, items=None):
     return specs if any(specs) else None
 
 
-def hole_radii(path):
-    """{corners (tuple of crossing indices): radius} of the holes a path joins
-    and rounds (see CROSSING_HOLES_KEY)."""
+HOLE_DEFAULTS = {'before': 20.0, 'after': 20.0, 'tension': 100.0}
+
+
+def hole_settings(path, switched_off=False):
+    """{corners (tuple of crossing indices): {'before', 'after', 'tension'}, or
+    {'radius'} for an older entry} of the holes a path joins and rounds (see
+    CROSSING_HOLES_KEY). A hole switched off keeps its values to come back
+    with; with `switched_off` those are included, marked 'off'."""
     try:
         value = path.attributes.get(CROSSING_HOLES_KEY)
     except AttributeError:
@@ -2017,25 +2024,34 @@ def hole_radii(path):
     try:
         for entry in value or ():
             corners = tuple(sorted(int(x) for x in entry['corners']))
-            radius = float(entry.get('radius') or 0.0)
-            if corners:
-                result[corners] = max(radius, 0.0) if math.isfinite(radius) else 0.0
+            if not corners:
+                continue
+            keys = ('before', 'after', 'tension') if entry.get('before') is not None or \
+                entry.get('radius') is None else ('radius',)
+            if entry.get('off') and not switched_off:
+                continue
+            spec = {}
+            for key in keys:
+                number = float(entry.get(key, HOLE_DEFAULTS.get(key, 0.0)))
+                spec[key] = max(number, 0.0) if math.isfinite(number) else 0.0
+            if entry.get('off'):
+                spec['off'] = True
+            result[corners] = spec
     except (AttributeError, KeyError, TypeError, ValueError):
         return {}
     return result
 
 
-def _set_hole_radii(path, radii):
-    if radii:
+def _set_hole_settings(path, holes):
+    if holes:
         path.attributes[CROSSING_HOLES_KEY] = [
-            {'corners': list(corners), 'radius': radius}
-            for corners, radius in sorted(radii.items())]
+            dict(spec, corners=list(corners)) for corners, spec in sorted(holes.items())]
     else:
         _pop(path.attributes, CROSSING_HOLES_KEY)
 
 
 class _Attributes(object):
-    """A recorded attributes dict standing in for its path (see hole_radii)."""
+    """A recorded attributes dict standing in for its path (see hole_settings)."""
     def __init__(self, attributes):
         self.attributes = attributes
 
@@ -2067,19 +2083,22 @@ def _sibling_path_objects(path):
 
 
 def crossing_spec(path):
-    """((corners, radius), ...) of the holes the outline is joined at, or None.
-    A hole joined in another master is joined here too, rounded by 0 when
-    this master has no radius for it: the masters keep one structure."""
-    own = hole_radii(path)
+    """((corners, ((key, value), ...)), ...) of the holes the outline is joined
+    at (see hole_settings), or None. A hole joined in another master is joined
+    here too, rounded by no length when this master has no values for it: the
+    masters keep one structure."""
+    own = hole_settings(path)
     if not own and not _glyph_has_corners(path, GLYPH_CROSSINGS_KEY):
         return None
     holes = set(own)
     if _glyph_has_corners(path, GLYPH_CROSSINGS_KEY):
         for other in _sibling_path_objects(path):
-            holes.update(hole_radii(other))
+            holes.update(hole_settings(other))
     if not holes:
         return None
-    return tuple((corners, own.get(corners, 0.0)) for corners in sorted(holes))
+    unset = {'before': 0.0, 'after': 0.0, 'tension': 100.0}
+    return tuple((corners, tuple(sorted(own.get(corners, unset).items())))
+                 for corners in sorted(holes))
 
 
 def corner_specs(path, items=None):
@@ -2312,19 +2331,23 @@ def _gathered_outline(path, defaults, items, hint=(), base_only=False, detect=Fa
 
     def rounded():
         contours, collected, edges, cap_points, crossings, layout = base
+        rounding = {}
         if crossing is not None:
             loops = {tuple(corners): part for _, corners, part in
                      crossing_loops(contours, crossings)}
             part, fillets = set(), {}
-            for corners, radius in crossing:
+            for corners, values in crossing:
                 if corners in loops:
                     part.update(loops[corners])
-                    fillets.update((x, radius) for x in corners)
+                    values = dict(values)
+                    spec = values['radius'] if 'radius' in values else values
+                    fillets.update((x, spec) for x in corners)
             contours = joined_outline(contours, crossings, part, fillets,
-                                      ranges=_crossing_ranges(layout, hint))
+                                      ranges=_crossing_ranges(layout, hint), report=rounding)
         # Slot 3 keeps the outline as GSPaths once built (see _outline_paths);
-        # slot 5 where the crossings were (see crossing_layout).
-        return [contours, collected, edges, None, cap_points, layout]
+        # slot 5 where the crossings were (see crossing_layout), slot 6 the
+        # rounded corners (see crossing_hole_widgets).
+        return [contours, collected, edges, None, cap_points, layout, rounding]
 
     return segments, _cached(key + (crossing, hint), rounded), node_map
 
@@ -3055,13 +3078,19 @@ def _interpolate_layer(layer, glyph, interpolation, glyph_key=None):
             path.attributes[BLEND_KEY] = ''  # copied from a source: not this blend
         for key, value in template['attributes'].items():
             path.attributes[key] = value
-        # A hole joined in one source is joined here, its radius blended (0 where unset).
-        holes = set()
-        for _, other, _ in others:
-            holes.update(hole_radii(_Attributes(other['attributes'])))
-        _set_hole_radii(path, {corners: sum(
-            factor * hole_radii(_Attributes(other['attributes'])).get(corners, 0.0)
-            for _, other, factor in others) for corners in holes})
+        # A hole joined in one source is joined here, its values blended (no
+        # length where unset, an older radius as both lengths).
+        hole_sources = [(hole_settings(_Attributes(other['attributes'])), factor)
+                        for _, other, factor in others]
+        holes = {}
+        for corners in set().union(*[set(settings) for settings, _ in hole_sources]):
+            blended = {}
+            for key, unset in (('before', 0.0), ('after', 0.0), ('tension', 100.0)):
+                blended[key] = sum(factor * settings.get(corners, {}).get(
+                    key, settings.get(corners, {}).get('radius', unset)
+                    if key != 'tension' else unset) for settings, factor in hole_sources)
+            holes[corners] = blended
+        _set_hole_settings(path, holes)
         if template['profile'] is not None:  # the instance cannot reach the font
             path.attributes[PROFILE_DATA_KEY] = _saved_profile(template['profile'])
         else:
@@ -3257,77 +3286,62 @@ _HOLES = collections.OrderedDict()  # id(base outline): (base outline, holes)
 def crossing_hole_widgets(path, defaults=None, items=None):
     """The holes a stroke makes by crossing itself, for the editor: [{'points':
     the hole's outline, 'corners': its crossings (the key in
-    CROSSING_HOLES_KEY), 'on': joined and rounded, 'radius', 'handles': per
-    corner {'corner', 'direction' into the hole, 'angle' of the corner}}]."""
+    CROSSING_HOLES_KEY), 'on': joined and rounded, 'values': its settings,
+    'rounded': per corner what joined_outline reports}]."""
     items = path_nodes(path) if items is None else items
-    base = _gathered_outline(path, _resolve(defaults, path), items, base_only=True,
-                             detect=True)
+    defaults = _resolve(defaults, path)
+    base = _gathered_outline(path, defaults, items, base_only=True, detect=True)
     with _CACHE_LOCK:
         found = _HOLES.get(id(base))
     if found is None or found[0] is not base:
         found = (base, crossing_loops(base[0], base[4]))  # the base outline is cached
         _remember(_HOLES, 256, id(base), found)
-    contours, crossings = base[0], base[4]
-    radii = hole_radii(path)
+    holes = hole_settings(path)
+    report = _outline(path, defaults, items)[1][6] if holes else {}
     result = []
     for points, corners, _ in found[1]:
-        handles = []
-        for x in corners:
-            point, first, second, opening = crossings[x]
-            d1 = _piece_tangent(contours[first[0]][first[1]], first[2])
-            d2 = _piece_tangent(contours[second[0]][second[1]], second[2])
-            # The open corner lies between one strand arriving and the other leaving.
-            direction = sub(d2, d1) if opening == 12 else sub(d1, d2)
-            size = math.hypot(*direction)
-            if size < 1e-9:
-                continue
-            cosine = -(d1[0]*d2[0] + d1[1]*d2[1])
-            handles.append({'corner': point, 'direction': (direction[0] / size,
-                                                            direction[1] / size),
-                            'angle': math.acos(max(-1.0, min(1.0, cosine)))})
         key = tuple(corners)
-        result.append({'points': points, 'corners': key, 'on': key in radii,
-                       'radius': radii.get(key), 'handles': handles})
+        result.append({'points': points, 'corners': key, 'on': key in holes,
+                       'values': holes.get(key),
+                       'rounded': [report[x] for x in corners if x in report]})
     return result
 
 
-def hole_handle_point(handle, radius):
-    """Where the rounding of a corner of `radius` is furthest into the hole."""
-    half = math.sin(handle['angle'] / 2.0)
-    reach = radius * (1.0 / half - 1.0) if half > 1e-6 else 0.0
-    return add(handle['corner'], mul(handle['direction'], reach))
-
-
-def hole_radius_at(handle, point):
-    """The radius whose rounding reaches `point` (see hole_handle_point)."""
-    half = math.sin(handle['angle'] / 2.0)
-    along = sub(point, handle['corner'])
-    reach = along[0]*handle['direction'][0] + along[1]*handle['direction'][1]
-    factor = 1.0 / half - 1.0 if half > 1e-6 else 0.0
-    return max(0.0, reach / factor) if factor > 1e-6 else 0.0
-
-
-def set_crossing_hole(path, corners, state, radius=None):
-    """Join and round the hole at `corners` (state True) or leave it; a hole
-    switched on gets `radius`, or the default."""
-    radii = hole_radii(path)
+def set_crossing_hole(path, corners, state, values=None):
+    """Join and round the hole at `corners` (state True, with the values it had
+    before it was switched off, else `values` or the defaults) or leave it,
+    keeping its values."""
+    holes = hole_settings(path, switched_off=True)
     corners = tuple(sorted(corners))
     if state:
-        if corners not in radii:
-            radii[corners] = float(radius if radius is not None else DEFAULT_CORNER_RADIUS)
-    else:
-        radii.pop(corners, None)
-    _set_hole_radii(path, radii)
+        if corners in holes:
+            holes[corners].pop('off', None)
+        else:
+            holes[corners] = dict(HOLE_DEFAULTS, **(values or {}))
+    elif corners in holes:
+        holes[corners]['off'] = True
+    _set_hole_settings(path, holes)
     note_corner(path, GLYPH_CROSSINGS_KEY)
 
 
-def set_hole_radius(path, corners, radius):
-    """The radius of a joined hole in this master."""
-    radii = hole_radii(path)
+def set_hole_values(path, corners, rounded=None, **values):
+    """Change 'before', 'after' or 'tension' of a joined hole in this master. An
+    older entry with a radius takes its lengths from `rounded` (a corner as
+    crossing_hole_widgets reports it) first."""
+    holes = hole_settings(path, switched_off=True)
     corners = tuple(sorted(corners))
-    if corners in radii:
-        radii[corners] = max(float(radius), 0.0)
-        _set_hole_radii(path, radii)
+    if corners not in holes or holes[corners].get('off'):
+        return
+    spec = holes[corners]
+    if 'radius' in spec:
+        spec = {'before': round(rounded['before'], 1) if rounded else spec['radius'],
+                'after': round(rounded['after'], 1) if rounded else spec['radius'],
+                'tension': 100.0}
+    for key, value in values.items():
+        if key in HOLE_DEFAULTS and value is not None:
+            spec[key] = max(float(value), 0.0)
+    holes[corners] = spec
+    _set_hole_settings(path, holes)
 
 
 def crossing_layout(path, defaults=None, items=None):

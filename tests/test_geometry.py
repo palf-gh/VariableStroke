@@ -56,6 +56,27 @@ class GeometryTests(unittest.TestCase):
         self.assertEqual(after[1], 0)
         self.assertNotEqual(after[2], 0)
 
+    def test_rounding_gets_a_node_at_its_extreme(self):
+        from variable_stroke_core import _split_at_extreme
+        # A quarter round from going up to going left has its right extreme inside.
+        arc = ('cubic', ((0.0, 0.0), (10.0, 20.0), (0.0, 40.0), (-20.0, 40.0)))
+        first, second = _split_at_extreme(arc, (20.0, 40.0))
+        node = first[1][3]
+        self.assertEqual(second[1][0], node)
+        self.assertAlmostEqual(first[1][2][0], node[0])  # upright: handles level with it
+        self.assertAlmostEqual(second[1][1][0], node[0])
+        xs = [cubic(*arc[1], i / 200.0)[0] for i in range(201)]
+        self.assertAlmostEqual(node[0], max(xs), places=3)
+        # The same curve, split.
+        for t in (0.2, 0.5, 0.8):
+            self.assertLess(min(length(sub(cubic(*arc[1], t), cubic(*piece[1], u / 400.0)))
+                                for piece in (first, second) for u in range(401)), 0.05)
+        # Without an extreme inside, the second cubic has no size.
+        straight = ('cubic', ((0.0, 0.0), (5.0, 10.0), (10.0, 20.0), (15.0, 30.0)))
+        first, second = _split_at_extreme(straight, (20.0, 40.0))
+        self.assertEqual(first, straight)
+        self.assertEqual(second[1], ((15.0, 30.0),) * 4)
+
     def test_joined_loop_keeps_one_structure_for_any_radius_or_width(self):
         def kinds(contours):
             return [[kind for kind, _ in contour] for contour in contours]

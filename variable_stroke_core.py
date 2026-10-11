@@ -2510,7 +2510,7 @@ def crossing_loops(contours, crossings=None):
     return loops
 
 
-def joined_outline(contours, crossings, part, fillets=None, ranges=None, tension=100.0):
+def joined_outline(contours, crossings, part, fillets=None, ranges=None, report=None):
     """Join the outline where it crosses itself at the crossings in `part`
     (see crossing_loops), as one would draw the loop by hand: one outer
     contour and the hole as a contour of its own, without the overlap.
@@ -2518,10 +2518,15 @@ def joined_outline(contours, crossings, part, fillets=None, ranges=None, tension
     At a corner left sharp the edges are not cut at their crossing: each goes
     on to the end of its piece, inside the other part's ink, and a line joins
     them there, so the corner is wherever the edges cross in any blend of the
-    masters. `fillets` {crossing: radius} rounds the hole's corners instead:
-    those are cut at the crossing and joined by one cubic (of no size at
-    radius 0). `ranges` lay out pieces a crossing lands on in some master only
-    (see _crossing_runs). Masters joined at the same crossings interpolate.
+    masters. `fillets` rounds the hole's corners instead: those are cut at the
+    crossing and joined by one cubic (of no size at length 0). Per crossing,
+    {'before': length along the edge arriving at the corner, 'after': along
+    the edge leaving it, 'tension': % (100 about circular)} or a radius (a
+    circular rounding as wide on both edges). `ranges` lay out pieces a
+    crossing lands on in some master only (see _crossing_runs). Masters joined
+    at the same crossings interpolate. `report`, a dict, gets per rounded
+    crossing {'corner', 'start', 'end' (the ends of the rounding), 'in', 'out'
+    (the edges' directions there), 'middle', 'before', 'after', 'tension'}.
     """
     fillets = fillets or {}
     part = set(part)
@@ -2535,25 +2540,32 @@ def joined_outline(contours, crossings, part, fillets=None, ranges=None, tension
     if built is None:  # the ranges do not fit this master: lay it out on its own
         built = _crossing_runs(contours, events, crossings, None, ends)
     runs, starts, first_run = built
-    tension = max(float(tension), 0.0) / 100.0
     lengths = [sum(_piece_samples(piece)[-1][1] for piece in pieces) for pieces, _ in runs]
-    trim_start, trim_end, turns = [0.0]*len(runs), [0.0]*len(runs), {}
+    trim_start, trim_end, rounded, tensions = [0.0]*len(runs), [0.0]*len(runs), {}, {}
     for r, (pieces, (x, strand)) in enumerate(runs):
         if x not in fillets or not _junction_open(crossings[x], strand):
             continue
         after = starts[(x, 1 - strand)]
         t_in = _piece_tangent(pieces[-1], 1.0)
         t_out = _piece_tangent(runs[after][0][0], 0.0)
-        cross = t_in[0]*t_out[1] - t_in[1]*t_out[0]
-        dot = t_in[0]*t_out[0] + t_in[1]*t_out[1]
-        turn = math.atan2(abs(cross), dot)
+        turn = math.atan2(abs(t_in[0]*t_out[1] - t_in[1]*t_out[0]),
+                          t_in[0]*t_out[0] + t_in[1]*t_out[1])
+        # A sliver between nearly parallel edges is not a counter: no rounding.
         fade = (math.degrees(math.pi - turn) - CROSSING_SLIVER[0]) / \
             (CROSSING_SLIVER[1] - CROSSING_SLIVER[0])
         fade = min(max(fade, 0.0), 1.0)
-        turn = min(turn, math.radians(FILLET_MAX_TURN))
-        trim_end[r] = trim_start[after] = \
-            max(float(fillets[x] or 0.0), 0.0) * fade*fade*(3-2*fade) * math.tan(turn / 2.0)
-        turns[after] = turn
+        fade = fade*fade*(3-2*fade)
+        spec = fillets[x]
+        if isinstance(spec, dict):
+            first = max(float(spec.get('before') or 0.0), 0.0)
+            second = max(float(spec.get('after') or 0.0), 0.0)
+            tensions[after] = max(float(spec.get('tension', 100.0) or 0.0), 0.0) / 100.0
+        else:  # a radius: as wide on both edges as a circle in the corner
+            first = second = max(float(spec or 0.0), 0.0) * \
+                math.tan(min(turn, math.radians(FILLET_MAX_TURN)) / 2.0)
+            tensions[after] = 1.0
+        trim_end[r], trim_start[after] = first * fade, second * fade
+        rounded[after] = r
     for r in range(len(runs)):
         # A run gives its ends at most its whole length, shared by what they ask.
         wanted = trim_start[r] + trim_end[r]
@@ -2569,15 +2581,17 @@ def joined_outline(contours, crossings, part, fillets=None, ranges=None, tension
         contour = []
         for k, r in enumerate(order):
             x, strand = runs[order[k-1]][1]
-            if r in turns:
-                before = cut[order[k-1]]
-                turn = turns[r]
-                p1, d1, p2, d2 = before[1], before[2], cut[r][3], cut[r][4]
-                first, second = trim_end[order[k-1]], trim_start[r]
-                f = (4.0/3.0 * math.tan(turn/4.0) / math.tan(turn/2.0)) \
-                    if turn > 1e-6 else 2.0/3.0
-                contour.append(('cubic', (p1, add(p1, mul(d1, first * f * tension)),
-                                          sub(p2, mul(d2, second * f * tension)), p2)))
+            if r in rounded:
+                p1, d1, p2, d2 = cut[order[k-1]][1], cut[order[k-1]][2], cut[r][3], cut[r][4]
+                h1, h2 = _rounding_handles(p1, d1, p2, d2, trim_end[order[k-1]],
+                                           trim_start[r], tensions[r])
+                arc = ('cubic', (p1, add(p1, mul(d1, h1)), sub(p2, mul(d2, h2)), p2))
+                contour.extend(_split_at_extreme(arc, crossings[x][0]))
+                if report is not None:
+                    report[x] = {'corner': crossings[x][0], 'start': p1, 'end': p2,
+                                 'in': d1, 'out': d2, 'middle': cubic(*arc[1], 0.5),
+                                 'before': trim_end[order[k-1]], 'after': trim_start[r],
+                                 'tension': tensions[r] * 100.0}
             elif x not in fillets:
                 contour.append(('line', (cut[order[k-1]][1], cut[r][3])))
             contour.extend(cut[r][0])
@@ -2589,6 +2603,70 @@ def joined_outline(contours, crossings, part, fillets=None, ranges=None, tension
         elif c == min(events):
             result.extend(joined.get(c, []))
     return result
+
+
+def _split_at_extreme(arc, corner):
+    """The rounding cubic as two, split where it runs upright (vertical or
+    horizontal) furthest towards the corner: there the hole has its extreme,
+    which wants a node. The shape stays the same. Without such a point inside
+    it, the second cubic is one of no size at its end (the outline keeps one
+    structure)."""
+    pts = arc[1]
+    toward = sub(corner, mul(add(pts[0], pts[3]), 0.5))
+    best = None
+    for axis in (0, 1):
+        values = [cubic_derivative(*pts, i / 48.0)[axis] for i in range(49)]
+        for i in range(48):
+            if values[i] * values[i+1] >= 0:
+                continue
+            lo, hi = i / 48.0, (i + 1) / 48.0
+            for _ in range(40):
+                middle = (lo + hi) / 2.0
+                if cubic_derivative(*pts, lo)[axis] * cubic_derivative(*pts, middle)[axis] <= 0:
+                    hi = middle
+                else:
+                    lo = middle
+            t = (lo + hi) / 2.0
+            if 0.02 < t < 0.98:
+                point = cubic(*pts, t)
+                reach = point[0]*toward[0] + point[1]*toward[1]
+                if best is None or reach > best[0]:
+                    best = (reach, t, axis)
+    if best is None:
+        return [arc, ('cubic', (pts[3],) * 4)]
+    _, t, axis = best
+    first, second = _split_cubic(pts, t)
+    # Exactly upright at the new node: both handles level with it.
+    node = first[3]
+    first = (first[0], first[1], _upright(first[2], node, axis), node)
+    second = (node, _upright(second[1], node, axis), second[2], second[3])
+    return [('cubic', first), ('cubic', second)]
+
+
+def _upright(handle, node, axis):
+    """`handle` moved onto the line through `node` along which the curve runs
+    there (x of the node kept for axis 0, y for axis 1)."""
+    return (node[0], handle[1]) if axis == 0 else (handle[0], node[1])
+
+
+def _rounding_handles(p1, d1, p2, d2, first, second, tension):
+    """Handle lengths of the cubic rounding a corner from p1 (going along d1)
+    to p2 (arriving along d2): an arc fitting both ends' own directions, the
+    handles reaching `tension` (1 about circular) of the way an arc would to
+    where the two directions cross. Curved edges turn on before the corner,
+    so the ends' directions, not the corner's, give the arc."""
+    turn = math.acos(max(-1.0, min(1.0, d1[0]*d2[0] + d1[1]*d2[1])))
+    denominator = d1[0]*d2[1] - d1[1]*d2[0]
+    if turn > 1e-6 and abs(denominator) > 1e-9:
+        q = sub(p2, p1)
+        a = (q[0]*d2[1] - q[1]*d2[0]) / denominator
+        b = (q[0]*d1[1] - q[1]*d1[0]) / denominator
+        if a > 0 and b > 0:
+            f = 4.0/3.0 * math.tan(turn/4.0) / math.tan(turn/2.0)
+            return a * f * tension, b * f * tension
+    # The directions do not meet ahead of both ends: by the lengths cut instead.
+    f = 4.0/3.0 * math.tan(turn/4.0) / math.tan(turn/2.0) if turn > 1e-6 else 2.0/3.0
+    return first * f * tension, second * f * tension
 
 
 def _overshoots(contours, events, crossings, fillets, polygons):

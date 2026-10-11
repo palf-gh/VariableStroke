@@ -846,9 +846,12 @@ class BridgeTests(unittest.TestCase):
             item.parent = glyph
         self.assertEqual(len(bridge.curves_for_path(plain.paths[0])), 1)  # nothing joined
         hole = bridge.crossing_hole_widgets(rounded.paths[0])[0]
-        bridge.set_crossing_hole(rounded.paths[0], hole['corners'], True, radius=15)
-        self.assertEqual(bridge.crossing_spec(rounded.paths[0]), ((hole['corners'], 15.0),))
-        self.assertEqual(bridge.crossing_spec(plain.paths[0]), ((hole['corners'], 0.0),))
+        bridge.set_crossing_hole(rounded.paths[0], hole['corners'], True,
+                                 {'before': 15, 'after': 10})
+        self.assertEqual(bridge.crossing_spec(rounded.paths[0]), (
+            (hole['corners'], (('after', 10.0), ('before', 15.0), ('tension', 100.0))),))
+        self.assertEqual(bridge.crossing_spec(plain.paths[0]), (
+            (hole['corners'], (('after', 0.0), ('before', 0.0), ('tension', 100.0))),))
         round_contours = bridge.curves_for_path(rounded.paths[0])
         plain_contours = bridge.curves_for_path(plain.paths[0])
         self.assertEqual(len(round_contours), 2)  # the outline and the hole
@@ -874,23 +877,36 @@ class BridgeTests(unittest.TestCase):
         ys = [p[1] for p in holes[0]['points']]
         self.assertEqual((round(min(xs)), round(max(xs)), round(min(ys)), round(max(ys))),
                          (-140, -10, 110, 240))  # the square inside the loop
-        handle = holes[0]['handles'][0]
-        self.assertEqual(handle['corner'], (-10.0, 240.0))
-        self.assertAlmostEqual(handle['angle'], math.pi / 2)
-        for value in (0.0, 12.0, 30.0):  # the handle gives back its radius
-            self.assertAlmostEqual(bridge.hole_radius_at(
-                handle, bridge.hole_handle_point(handle, value)), value)
+        self.assertEqual(holes[0]['rounded'], [])
         bridge.set_crossing_hole(path, holes[0]['corners'], True)
         hole = bridge.crossing_hole_widgets(path)[0]
         self.assertTrue(hole['on'])
-        self.assertEqual(hole['radius'], bridge.DEFAULT_CORNER_RADIUS)
-        bridge.set_hole_radius(path, hole['corners'], 8)
-        self.assertEqual(bridge.crossing_hole_widgets(path)[0]['radius'], 8)
+        self.assertEqual(hole['values'], bridge.HOLE_DEFAULTS)
+        corner = hole['rounded'][0]
+        self.assertEqual(corner['corner'], (-10.0, 240.0))
+        for end in ('start', 'end'):  # each end 20 along its edge from the corner
+            self.assertAlmostEqual(math.dist(corner[end], corner['corner']), 20.0, places=3)
+        bridge.set_hole_values(path, hole['corners'], before=40, tension=80)
+        hole = bridge.crossing_hole_widgets(path)[0]
+        self.assertEqual(hole['values'], {'before': 40.0, 'after': 20.0, 'tension': 80.0})
+        self.assertAlmostEqual(hole['rounded'][0]['before'], 40.0)
+        # An older entry with a radius keeps its shape until a value is changed.
+        path.attributes[bridge.CROSSING_HOLES_KEY] = [{'corners': list(hole['corners']),
+                                                       'radius': 10}]
+        old = bridge.crossing_hole_widgets(path)[0]
+        self.assertAlmostEqual(old['rounded'][0]['before'], 10.0)  # a 90° corner
+        bridge.set_hole_values(path, old['corners'], old['rounded'][0], after=5)
+        self.assertEqual(bridge.hole_settings(path)[old['corners']],
+                         {'before': 10.0, 'after': 5.0, 'tension': 100.0})
         self.assertEqual(len(bridge.curves_for_path(path)), 2)
+        before = bridge.hole_settings(path)[hole['corners']]
         bridge.set_crossing_hole(path, hole['corners'], False)
         self.assertFalse(bridge.crossing_hole_widgets(path)[0]['on'])
-        self.assertNotIn(bridge.CROSSING_HOLES_KEY, path.attributes)
+        self.assertEqual(bridge.hole_settings(path), {})
         self.assertEqual(len(bridge.curves_for_path(path)), 1)
+        # Switched on again, the hole comes back as it was.
+        bridge.set_crossing_hole(path, hole['corners'], True)
+        self.assertEqual(bridge.hole_settings(path)[hole['corners']], before)
 
     def test_crossing_on_another_outline_piece_in_one_master_keeps_one_structure(self):
         # The loop of す: in the bold master the loop runs back across the
@@ -919,7 +935,7 @@ class BridgeTests(unittest.TestCase):
             item.parent = glyph
         hole = bridge.crossing_hole_widgets(light.paths[0])[0]
         for item in glyph.layers:
-            bridge.set_crossing_hole(item.paths[0], hole['corners'], True, radius=25)
+            bridge.set_crossing_hole(item.paths[0], hole['corners'], True, {'before': 25, 'after': 25})
         layouts = [bridge.crossing_layout(item.paths[0]) for item in glyph.layers]
         self.assertEqual(len(layouts[0]), len(layouts[1]))
         self.assertNotEqual(layouts[0], layouts[1])  # a crossing moved to the next piece

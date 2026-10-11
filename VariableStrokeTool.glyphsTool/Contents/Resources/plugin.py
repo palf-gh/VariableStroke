@@ -52,7 +52,7 @@ from glyphs_bridge import (CAP_START_KEY, CAP_END_KEY, CAP_START_ANGLE_KEY, CAP_
                            _content_mark, JOIN_KEY, GLYPH_BEVELS_KEY, join_of,
                            BEVEL_ANGLE_KEY, bevel_angle_of,
                            CROSSING_HOLES_KEY, crossing_hole_widgets, set_crossing_hole,
-                           set_hole_radius, hole_handle_point, hole_radius_at, hole_radii,
+                           set_hole_values, hole_settings,
                            master_incompatibilities, describe_incompatibility)
 from glyphs_bridge import (VIRTUAL_KEY, virtual_nodes, virtual_widgets, virtual_point,
                            segments_for_path, _virtual_section_angle)
@@ -60,7 +60,7 @@ from glyphs_bridge import (PROFILE_KEY as PATH_PROFILE_KEY, profiles, profile_id
                            profile_node_factors, forget_profiles)
 from profile_editor import VariableStrokeProfileEditor, fill_popup, sorted_profiles
 from clipboard_export import svg_document, pdf_document
-from variable_stroke_core import (unit, sub, add, length, outline_curves,
+from variable_stroke_core import (unit, sub, add, mul, length, outline_curves,
                                   cap_curve_coordinates,
                                   nib_edges, ellipse_nib_edges)
 
@@ -565,9 +565,14 @@ NODE_FIELDS = ('scale', 'heightScale', 'offset', 'rotation', 'bevelAngle') + \
 _SELECTED_HOLE = [None]
 
 
-def _hole_radius(path):
+# Panel fields of the selected hole and the value each one edits.
+HOLE_FIELDS = {'holeBefore': 'before', 'holeAfter': 'after', 'holeTension': 'tension'}
+
+
+def _hole_values(path):
+    """The selected hole's values in this path, or None."""
     corners = _SELECTED_HOLE[0]
-    return None if corners is None else hole_radii(path).get(tuple(corners))
+    return None if corners is None else hole_settings(path).get(tuple(corners))
 
 
 def _same(values):
@@ -644,8 +649,10 @@ def _parse_field(name, text):
         return value % 180.0 if math.isfinite(value) else None
     if name in ('startAngle', 'endAngle'):
         return value % 360.0
-    if name in ('radius', 'innerRadius', 'crossing'):
+    if name in ('radius', 'innerRadius', 'holeBefore', 'holeAfter'):
         return value if 0 <= value < 10000 else None
+    if name == 'holeTension':
+        return max(0.0, min(300.0, value))
     if name in ('tension', 'innerTension'):
         return max(0.0, min(300.0, value))
     if name in ('ratio', 'innerRatio'):
@@ -687,11 +694,11 @@ def _apply_field(name, value, paths, nodes):
                 node.userData[JOIN_KEY] = 'bevel'
         if value is not None and nodes and paths:
             note_corner(paths[0], GLYPH_BEVELS_KEY)
-    elif name == 'crossing':
-        # The radius of the selected hole in this master (see _SELECTED_HOLE).
+    elif name in HOLE_FIELDS:
+        # The selected hole in this master (see _SELECTED_HOLE).
         if _SELECTED_HOLE[0] is not None:
             for path in paths:
-                set_hole_radius(path, _SELECTED_HOLE[0], value)
+                set_hole_values(path, _SELECTED_HOLE[0], **{HOLE_FIELDS[name]: value})
     elif name in CORNER_FIELDS:
         for node in nodes:
             node.userData[CORNER_FIELDS[name]] = value
@@ -711,8 +718,9 @@ def _field_is(name, value, paths, nodes):
     if name in ('width', 'height'):
         key = STROKE_WIDTH_KEY if name == 'width' else STROKE_HEIGHT_KEY
         return all(path.attributes.get(key) == value for path in paths)
-    if name == 'crossing':
-        return all(_hole_radius(path) == value for path in paths)
+    if name in HOLE_FIELDS:
+        return all((_hole_values(path) or {}).get(HOLE_FIELDS[name]) == value
+                   for path in paths)
     if name in CORNER_FIELDS:
         return all(corner_on(node) and node.userData.get(CORNER_FIELDS[name]) == value
                    for node in nodes)
@@ -1289,10 +1297,16 @@ class VariableStrokeTool(SelectTool):
         corner.innerRatioField = SteppingEditText((482, 0, 36, 19), sizeStyle='small')
         corner.ratioLink = ImageButton((519, 0, 18, 19), imageObject=_link_icon(True),
                                        bordered=False, callback=self.ratioLinkFromInspector_)
-        corner.crossingLabel = TextBox((6, 28, 80, 14), _loc('Hole radius', '穴の角丸 半径'),
-                                       sizeStyle='small')
-        corner.crossingField = SteppingEditText((88, 24, 43, 19), sizeStyle='small')
-        corner.crossingHint = TextBox((138, 28, 420, 14), '', sizeStyle='small')
+        corner.holeLabel = TextBox((6, 28, 70, 14), _loc('Hole', '穴の角丸'), sizeStyle='small')
+        corner.holeLengthLabel = TextBox((76, 28, 30, 14), _loc('Len', '長さ'),
+                                         sizeStyle='small')
+        corner.holeBeforeField = SteppingEditText((106, 24, 40, 19), sizeStyle='small')
+        corner.holeAfterField = SteppingEditText((148, 24, 40, 19), sizeStyle='small')
+        corner.holeTensionLabel = TextBox((198, 28, 30, 14), _loc('Str', '強さ'),
+                                          sizeStyle='small')
+        corner.holeTensionField = SteppingEditText((228, 24, 40, 19), sizeStyle='small')
+        corner.holeTensionUnit = TextBox((270, 28, 12, 14), '%', sizeStyle='small')
+        corner.holeHint = TextBox((290, 28, 300, 14), '', sizeStyle='small')
 
         virtual = group.virtualTab = Group((0, TAB_TOP, -0, 72))
         virtual.add = Button((6, 0, 55, 20), _loc('Add', '追加'),
@@ -1414,7 +1428,9 @@ class VariableStrokeTool(SelectTool):
                   ('radius', corner.outerField), ('innerRadius', corner.innerField),
                   ('tension', corner.tensionField), ('innerTension', corner.innerTensionField),
                   ('ratio', corner.ratioField), ('innerRatio', corner.innerRatioField),
-                  ('crossing', corner.crossingField),
+                  ('holeBefore', corner.holeBeforeField),
+                  ('holeAfter', corner.holeAfterField),
+                  ('holeTension', corner.holeTensionField),
                   ('virtualAngle', virtual.angleField),
                   ('virtualBeforeLeft', virtual.beforeLeft),
                   ('virtualBeforeRight', virtual.beforeRight),
@@ -2111,8 +2127,9 @@ class VariableStrokeTool(SelectTool):
                                   CORNER_INNER_RATIO_KEY not in data)
                                  for _, data, _ in entries),
                            bool(entries) and all(end for _, _, end in entries),
-                           (_SELECTED_HOLE[0],) + tuple(_hole_radius(path) for path in paths
-                                                        if self._hole_path == path))
+                           (_SELECTED_HOLE[0],) + tuple(
+                               tuple(sorted((_hole_values(path) or {}).items()))
+                               for path in paths if self._hole_path == path))
         selected_targets = any(enabled(path) for path in
                                self._selected_paths(layer, selected)) if layer else False
         ui_state = (tab, stroke, details, selected_targets,
@@ -2341,12 +2358,17 @@ class VariableStrokeTool(SelectTool):
                 _loc('Linked; click to separate values', '連動中。クリックで独立') if linked else
                 _loc('Independent; click to link values', '独立中。クリックで連動'))
             field.enable(editable and not linked)
-        radii = [radius for radius in crossings[1:] if radius is not None]
-        tab.crossingField.enable(editable and bool(radii))
-        tab.crossingField.set(('%g' % round(radii[0], 2)) if radii else '')
-        tab.crossingHint.set(
-            _loc('Drag the green handle in the hole, or click the hole to switch it off',
-                 '穴の緑のハンドルをドラッグで調整、穴をクリックでオフ') if radii else
+        values = [dict(item) for item in crossings[1:] if item]
+        values = values[0] if values else None
+        for field, key in ((tab.holeBeforeField, 'before'), (tab.holeAfterField, 'after'),
+                           (tab.holeTensionField, 'tension')):
+            field.enable(editable and values is not None)
+            shown = None if values is None else values.get(key, values.get('radius')
+                                                            if key != 'tension' else 100.0)
+            field.set('%g' % round(shown, 1) if shown is not None else '')
+        tab.holeHint.set(
+            _loc('Drag the diamonds along the edges; click the hole to switch it off',
+                 '菱形を辺に沿ってドラッグ、穴をクリックでオフ') if values is not None else
             _loc('Click a highlighted hole to join and round it',
                  'ハイライトされた穴をクリックで合成して角丸'))
 
@@ -2526,7 +2548,7 @@ class VariableStrokeTool(SelectTool):
         """(paths, nodes) a field edits: widths/heights and cut angles act on the
         target paths, node % and position on the selected nodes (all if none)."""
         paths = self._edit_paths(layer)
-        if name == 'crossing':
+        if name in HOLE_FIELDS:
             return [path for path in paths if path == self._hole_path], []
         if name in ('startAngle', 'endAngle'):
             return [path for path in paths if not path.closed], []
@@ -2994,34 +3016,57 @@ class VariableStrokeTool(SelectTool):
             if not hole['on']:
                 continue
             color.set()
-            for handle in hole['handles']:
-                x, y = hole_handle_point(handle, hole['radius'] or 0.0)
+            small = 3.0 / scale
+            for corner in hole['rounded']:
                 line = NSBezierPath.bezierPath()
-                line.moveToPoint_(handle['corner'])
-                line.lineToPoint_((x, y))
+                line.moveToPoint_(corner['corner'])
+                line.lineToPoint_(corner['middle'])
                 line.setLineWidth_(1.0 / scale)
+                color.colorWithAlphaComponent_(0.6).set()
                 line.stroke()
-                ring = NSBezierPath.bezierPathWithOvalInRect_(
-                    ((x-radius, y-radius), (radius*2, radius*2)))
-                ring.setLineWidth_(1.5 / scale)
-                ring.stroke()
-                NSBezierPath.bezierPathWithOvalInRect_(
-                    ((x-radius/2.5, y-radius/2.5), (radius/1.25, radius/1.25))).fill()
+                color.set()
+                for x, y in (corner['start'], corner['end']):  # diamonds: the ends
+                    diamond = NSBezierPath.bezierPath()
+                    diamond.moveToPoint_((x, y-small*1.3))
+                    diamond.lineToPoint_((x+small*1.3, y))
+                    diamond.lineToPoint_((x, y+small*1.3))
+                    diamond.lineToPoint_((x-small*1.3, y))
+                    diamond.closePath()
+                    diamond.fill()
+                x, y = corner['middle']  # square: the strength
+                NSBezierPath.bezierPathWithRect_(((x-small, y-small), (small*2, small*2))).fill()
 
     @objc.python_method
     def _hole_handle_at(self, layer, point, strokes, defaults, threshold):
-        """Start dragging the radius handle of a joined hole under `point`."""
+        """Start dragging an end (diamond) or the strength (square) of a joined
+        hole's rounding under `point`."""
         for path, hole in self._holes(strokes, defaults):
             if not hole['on']:
                 continue
-            for handle in hole['handles']:
-                spot = hole_handle_point(handle, hole['radius'] or 0.0)
-                if length(sub(point, spot)) <= threshold:
+            for corner in hole['rounded']:
+                # Ends slide along their edge, away from the corner to lengthen.
+                spots = (('before', corner['start'], (-corner['in'][0], -corner['in'][1])),
+                         ('after', corner['end'], corner['out']),
+                         ('tension', corner['middle'], None))
+                for key, spot, away in spots:
+                    if length(sub(point, spot)) > threshold:
+                        continue
                     self._select_hole(path, hole['corners'])
                     layer.beginChanges()
-                    self._drag = {'kind': 'hole-radius', 'layer': layer, 'path': path,
-                                  'corners': hole['corners'], 'handle': handle}
+                    toward = sub(corner['middle'], corner['corner'])
+                    self._drag = {'kind': 'hole', 'key': key, 'layer': layer, 'path': path,
+                                  'corners': hole['corners'], 'rounded': corner,
+                                  'start': point, 'away': away,
+                                  'initial': corner[key] if key != 'tension'
+                                  else corner['tension'],
+                                  'depth': max(length(toward), 1.0),
+                                  'toward': unit(toward) if length(toward) > 1e-6
+                                  else (0.0, 0.0)}
                     return True
+        return False
+
+        return False
+
         return False
 
     @objc.python_method
@@ -3378,6 +3423,11 @@ class VariableStrokeTool(SelectTool):
                 self._refresh_ui()
                 self._redraw()
                 return
+            # The holes' handles sit on the stroke edges, where the width
+            # handles are too: in the corner tab, where they show, they win.
+            if self._tab == 'corner' and \
+                    self._hole_handle_at(layer, point, strokes, defaults, threshold):
+                return
             for path, items in strokes:
                 try:
                     widgets = virtual_widgets(path, defaults, items)
@@ -3554,9 +3604,6 @@ class VariableStrokeTool(SelectTool):
                     self._refresh_ui()
                     return
         if layer is not None and self._tab == 'corner' and \
-                self._hole_handle_at(layer, point, strokes, defaults, threshold):
-            return
-        if layer is not None and self._tab == 'corner' and \
                 self._toggle_hole_at(layer, point, strokes, defaults):
             self._virtual_click_consumed = True  # the drag and mouse up are this click's
             return
@@ -3661,9 +3708,17 @@ class VariableStrokeTool(SelectTool):
             return
         drag = self._drag
         loc = self.editViewController().graphicView().getActiveLocation_(event)
-        if drag.get('kind') == 'hole-radius':
-            set_hole_radius(drag['path'], drag['corners'],
-                            round(hole_radius_at(drag['handle'], (loc.x, loc.y)), 1))
+        if drag.get('kind') == 'hole':
+            moved = sub((loc.x, loc.y), drag['start'])
+            if drag['key'] == 'tension':
+                # Pulling the middle towards the corner fills it out.
+                along = moved[0]*drag['toward'][0] + moved[1]*drag['toward'][1]
+                value = max(0.0, min(300.0, drag['initial'] - along * 100.0 / drag['depth']))
+            else:
+                along = moved[0]*drag['away'][0] + moved[1]*drag['away'][1]
+                value = max(0.0, drag['initial'] + along)
+            set_hole_values(drag['path'], drag['corners'], drag['rounded'],
+                            **{drag['key']: round(value, 1)})
             _invalidate(drag['layer'], [drag['path']])
             self._last_ui_state = None
             self._refresh_ui()

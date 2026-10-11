@@ -71,7 +71,7 @@ class SelectorTests(unittest.TestCase):
                                  decorator_list=[], returns=None)
         namespace = {'profiles': lambda font: {}, 'sorted_profiles': lambda library: [],
                      'profile_id': lambda path: None, '_SELECTED_HOLE': [None],
-                     '_hole_radius': lambda path: None}
+                     '_hole_values': lambda path: None}
         exec(compile(ast.fix_missing_locations(ast.Module(body=[method], type_ignores=[])),
                      str(PLUGIN), 'exec'), namespace)
 
