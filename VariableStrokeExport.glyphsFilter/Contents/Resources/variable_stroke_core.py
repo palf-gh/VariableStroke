@@ -1079,7 +1079,13 @@ def _join(a, b, width):
         back, on = -_dot(sub(point, a.end), ta), _dot(sub(point, b.start), tb)
         a_size, b_size = length(sub(a.end, a.start)), length(sub(b.end, b.start))
         if back > 0 and on > 0 and a_size > EPS and b_size > EPS:
-            inner = (point, a.tb, b.ta, max(back / a_size, on / b_size))
+            # A crossing past a side's far end swallows that side: it stops there.
+            if on >= b_size:
+                inner = (b.end, a.tb, b.tb)
+            elif back >= a_size:
+                inner = (a.start, a.ta, b.ta)
+            else:
+                inner = (point, a.tb, b.ta)
     if a.kind == 'cubic' or b.kind == 'cubic':
         crossing = _side_crossing(a, b, ta, tb, reach)
         if crossing is None or crossing[0] > reach:
@@ -1089,9 +1095,7 @@ def _join(a, b, width):
             if far is not None:
                 far = _refined_crossing(a, b, far)
             if far is not None and far[2] < a.tb - 1e-6 and far[3] > b.ta + 1e-6:
-                used = max((a.tb - far[2]) / max(a.tb - a.ta, EPS),
-                           (far[3] - b.ta) / max(b.tb - b.ta, EPS))
-                inner = (far[1], far[2], far[3], used)
+                inner = (far[1], far[2], far[3])
         if crossing is not None:
             cost, hit, hit_a_tb, hit_b_ta = crossing
             # 0 within `reach` along the sides, 1 at twice that: blend, don't switch.
@@ -1109,15 +1113,8 @@ def _join(a, b, width):
     limit = MITER_FAR_LIMIT * width / 2.0 if a.kind != b.kind else reach
     if distance > limit:
         point = add(middle, mul(sub(point, middle), limit / distance))
-    if inner is not None and inner[3] < 1.0:
-        # The true crossing; only where it nears the end of a side (one part
-        # all but swallowed by the other) it gives way to the point held near
-        # the node, smoothly.
-        w = min(max((inner[3] - 0.75) / 0.25, 0.0), 1.0)
-        w = w*w*(3-2*w)
-        point = add(mul(inner[0], 1-w), mul(point, w))
-        a_tb = inner[1]*(1-w) + a_tb*w
-        b_ta = inner[2]*(1-w) + b_ta*w
+    if inner is not None:
+        point, a_tb, b_ta = inner
     a_controls = (a.override_piece or a.piece())[1] if a.kind == 'cubic' else None
     b_controls = (b.override_piece or b.piece())[1] if b.kind == 'cubic' else None
     a_trim = ((a_tb-a.ta)/(a.tb-a.ta) if a_controls is not None and a.tb-a.ta > EPS
@@ -1154,6 +1151,13 @@ def _join(a, b, width):
         point = add(mul(bounded, 1-weight), mul(point, weight))
     a.tb, b.ta = a_tb, b_ta
     a.end = b.start = point
+    if exact:
+        # The side's own curve runs a little off its centerline parameter on a
+        # thick stroke: cut it where it passes nearest the crossing.
+        if a_controls is not None:
+            a_trim = _nearest_parameter(a_controls, point, a_trim)
+        if b_controls is not None:
+            b_trim = _nearest_parameter(b_controls, point, b_trim)
     if a_controls is not None:
         if a_on_curve:
             part = _cubic_interval(a_controls, 0.0, a_trim)
@@ -1224,6 +1228,24 @@ def _side_crossing(a, b, ta, tb, reach):
             b_ta = b.ta + (b.tb-b.ta) * (j-1+u) / count if j >= 1 else b.ta
             best = (cost, point, a_tb, b_ta)
     return best
+
+
+def _nearest_parameter(controls, point, guess):
+    """The parameter of the cubic `controls` nearest to `point`, from `guess`."""
+    best = min((i / 64.0 for i in range(65)),
+               key=lambda t: length(sub(cubic(*controls, t), point)))
+    if abs(best - guess) > 0.25:
+        best = guess if length(sub(cubic(*controls, guess), point)) < \
+            length(sub(cubic(*controls, best), point)) else best
+    t = best
+    for _ in range(12):
+        d = cubic_derivative(*controls, t)
+        q = sub(cubic(*controls, t), point)
+        dd = d[0]*d[0] + d[1]*d[1]
+        if dd < EPS:
+            break
+        t = min(max(t - (q[0]*d[0] + q[1]*d[1]) / dd, 0.0), 1.0)
+    return t
 
 
 def _refined_crossing(a, b, crossing):
