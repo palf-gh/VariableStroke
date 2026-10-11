@@ -1089,6 +1089,20 @@ class BridgeTests(unittest.TestCase):
         bridge._BEVELLED_ELSEWHERE.clear()
         self.assertEqual(len(bridge.curves_for_path(mitered.paths[0])[0]), 6)
 
+    def test_stored_switches_read_as_glyphs_hands_them_back(self):
+        # After copy and paste Glyphs gives numbers and booleans back as strings.
+        path = Path([Node(0, 0), Node(0, 100)])
+        path.attributes[bridge.CAP_END_KEY] = 'angle'
+        for stored, on in (('0', False), ('1', True), (0, False), (True, True),
+                           ('false', False), ('', False)):
+            path.attributes[bridge.CAP_END_CURVE_ON_KEY] = stored
+            self.assertEqual(bridge.cap_curve_enabled(path, True), on, stored)
+        path.attributes[bridge.PATH_KEY] = '0'
+        self.assertFalse(bridge.enabled(path))
+        self.assertFalse(bridge.corner_on_of({bridge.CORNER_ON_KEY: '0', bridge.CORNER_KEY: 20}))
+        self.assertFalse(bridge.glyph_enabled(types.SimpleNamespace(
+            userData={bridge.GLYPH_KEY: '0'})))
+
     def test_interpolated_layer_takes_switches_from_the_nearest_master_only(self):
         def master(curve):
             path = Path([Node(0, 0), Node(0, 100)])

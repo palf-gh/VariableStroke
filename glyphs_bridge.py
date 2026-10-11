@@ -242,11 +242,23 @@ def has_live_corners(items):
 
 
 def enabled(path):
-    return bool(path.attributes.get(PATH_KEY))
+    return flag(path.attributes.get(PATH_KEY))
 
 
 def generated(path):
-    return bool(path.attributes.get(GENERATED_KEY))
+    return flag(path.attributes.get(GENERATED_KEY))
+
+
+def flag(value):
+    """A stored on/off value: Glyphs may hand numbers and booleans back as
+    strings (after copy and paste, or from the file), and "0" is off, which
+    bool() would read as on."""
+    if isinstance(value, str):
+        return value.strip().lower() not in ('', '0', 'false', 'no', 'off', 'none')
+    try:
+        return bool(value)
+    except Exception:
+        return False
 
 
 def _number(value, default):
@@ -432,7 +444,7 @@ def rotation(node, default=0.0):
 
 
 def corner_on_of(data):
-    return bool(data.get(CORNER_ON_KEY, CORNER_KEY in data))
+    return flag(data.get(CORNER_ON_KEY, CORNER_KEY in data))
 
 
 def corner_on(node):
@@ -923,7 +935,7 @@ def _virtual_nodes(path, raw, owner, items, closed, on_curve_items, anchor_ids, 
                 after = dict(before)
             spec = {'id': str(data.get('id', '')), 'segment': segment, 't': t,
                     'mode': mode, 'side': side, 'direction': direction,
-                    'angle': angle, 'linked': bool(data.get('linked', True)),
+                    'angle': angle, 'linked': flag(data.get('linked', True)),
                     'before': before, 'after': after,
                     'anchorStart': start_id, 'anchorEnd': end_id, 'anchorCount': count}
             if mode == 'section':
@@ -1715,7 +1727,7 @@ def cap_curve_enabled(path, at_end):
     style = path.attributes.get(CAP_END_KEY if at_end else CAP_START_KEY, 'flat')
     if style == 'curve':  # paths made by the earlier standalone curve style
         return True
-    return style not in ('round', 'ellipse') and bool(path.attributes.get(
+    return style not in ('round', 'ellipse') and flag(path.attributes.get(
         CAP_END_CURVE_ON_KEY if at_end else CAP_START_CURVE_ON_KEY, False))
 
 
@@ -1987,13 +1999,13 @@ def _glyph_has_corners(path, key=GLYPH_CORNERS_KEY):
         return False
     try:
         data = glyph.pyobjc_instanceMethods.userData()
-        return bool(data is not None and data.objectForKey_(key))
+        return data is not None and flag(data.objectForKey_(key))
     except AttributeError:
         pass  # plain objects (tests)
     except Exception:
         return False
     try:
-        return bool(glyph.userData.get(key))
+        return flag(glyph.userData.get(key))
     except Exception:
         return False
 
@@ -2003,7 +2015,7 @@ def note_corner(node, key=GLYPH_CORNERS_KEY):
     with GLYPH_BEVELS_KEY bevel joins (see bevel_specs)."""
     glyph = _glyph_of(node)
     try:
-        if glyph is not None and not glyph.userData.get(key):
+        if glyph is not None and not flag(glyph.userData.get(key)):
             glyph.userData[key] = True
     except Exception:
         pass
@@ -2570,7 +2582,7 @@ def generated_paths(path, defaults=None, contours=None, upright=True):
 
 
 def glyph_enabled(glyph):
-    return bool(glyph and glyph.userData.get(GLYPH_KEY))
+    return bool(glyph) and flag(glyph.userData.get(GLYPH_KEY))
 
 
 def active(path):
@@ -2590,7 +2602,7 @@ def set_glyph_enabled(glyph, state):
 
 
 def is_outline(path):
-    return bool(path.attributes.get(OUTLINE_KEY))
+    return flag(path.attributes.get(OUTLINE_KEY))
 
 
 def _valid_structure(path, types=None):
@@ -2645,7 +2657,7 @@ def normalize_layer(layer, state):
             continue
         if not enabled(path):
             if ORIGINAL_FILL_KEY not in path.attributes:
-                path.attributes[ORIGINAL_FILL_KEY] = bool(path.attributes.get('fill', True))
+                path.attributes[ORIGINAL_FILL_KEY] = flag(path.attributes.get('fill', True))
             path.attributes[PATH_KEY] = True
             path.attributes['fill'] = False
             changed = True
@@ -3426,7 +3438,7 @@ def layer_state(layer):
     try:
         marked = layer.userData.get(LAYER_STATE_KEY)
         if marked is not None:
-            return bool(marked)
+            return flag(marked)
     except Exception:
         pass
     try:
