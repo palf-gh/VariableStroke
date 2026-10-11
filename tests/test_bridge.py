@@ -771,6 +771,92 @@ class BridgeTests(unittest.TestCase):
         self.assertEqual(len(bridge.curves_for_path(target.paths[0])[0]),
                          len(bridge.curves_for_path(first.paths[0])[0]))
 
+    def test_interpolation_reads_alternate_layers_where_glyphs_uses_them(self):
+        def layer(layer_id, master_id, strokes, rules=None):
+            paths = []
+            for points in strokes:
+                path = Path([Node(x, y) for x, y in points])
+                for node in path.nodes:
+                    node.userData.clear()
+                path.attributes[bridge.CAP_END_KEY] = 'round'
+                paths.append(path)
+            result = Layer(paths)
+            result.layerId, result.associatedMasterId = layer_id, master_id
+            result.attributes = {} if rules is None else {'axisRules': rules}
+            return result
+        master = [[(0, 0), (0, 100)], [(50, 0), (50, 100)]]
+        alternate = [[(0, 0), (0, 100), (0, 200)], [(50, 0), (50, 100)]]
+        rules = [{}, {'max': 70}]
+        layers = {'a': layer('a', 'a', master), 'b': layer('b', 'b', master),
+                  'a-alt': layer('a-alt', 'a', alternate, rules),
+                  'b-alt': layer('b-alt', 'b', alternate, rules)}
+        glyph = types.SimpleNamespace(layers=layers, userData={bridge.GLYPH_KEY: True},
+                                      parent=types.SimpleNamespace(masters=[
+                                          types.SimpleNamespace(id='a', axes=[200, 50]),
+                                          types.SimpleNamespace(id='b', axes=[700, 50])]))
+        # Glyphs interpolated the alternates but names the masters.
+        target = layer('t', None, alternate)
+        for path in target.paths:
+            path.attributes.clear()
+        self.assertTrue(bridge.interpolate_layer(target, glyph, {'a': 0.5, 'b': 0.5}))
+        self.assertTrue(all(bridge.enabled(path) for path in target.paths))
+        self.assertTrue(all(path.attributes.get(bridge.CAP_END_KEY) == 'round'
+                            for path in target.paths))
+
+    def test_interpolation_rereads_sources_whose_design_was_swapped(self):
+        # Variable Font Preview keeps one glyph and swaps its master layers between
+        # the master and the alternate design as the preview moves.
+        def design(strokes, cap):
+            paths = []
+            for points in strokes:
+                path = Path([Node(x, y) for x, y in points])
+                for node in path.nodes:
+                    node.userData.clear()
+                path.attributes[bridge.CAP_END_KEY] = cap
+                paths.append(path)
+            return Layer(paths)
+        first = [[(0, 0), (0, 100)], [(50, 0), (50, 100)]]
+        second = [[(0, 0), (0, 100)], [(50, 0), (50, 100), (50, 200)]]
+        glyph = types.SimpleNamespace(userData={bridge.GLYPH_KEY: True},
+                                      layers={'a': design(first, 'round'),
+                                              'b': design(first, 'round')})
+        key = ('proxy', 'same change')
+        target = design(first, 'flat')
+        bridge.interpolate_layer(target, glyph, {'a': 0.5, 'b': 0.5}, glyph_key=key)
+        self.assertEqual(target.paths[0].attributes[bridge.CAP_END_KEY], 'round')
+        glyph.layers = {'a': design(second, 'square'), 'b': design(second, 'square')}
+        target = design(second, 'flat')
+        bridge.interpolate_layer(target, glyph, {'a': 0.5, 'b': 0.5}, glyph_key=key)
+        self.assertEqual([path.attributes[bridge.CAP_END_KEY] for path in target.paths],
+                         ['square', 'square'])
+
+    def test_live_corners_line_up_only_with_layers_of_the_same_design(self):
+        def layer(strokes, corner_at=None):
+            paths = []
+            for points in strokes:
+                path = Path([Node(x, y) for x, y in points])
+                for node in path.nodes:
+                    node.userData.clear()
+                paths.append(path)
+            if corner_at is not None:
+                data = paths[corner_at[0]].nodes[corner_at[1]].userData
+                data[bridge.CORNER_ON_KEY] = True
+                data[bridge.CORNER_KEY] = 20
+            return Layer(paths)
+        bent = [(0, 0), (100, 0), (100, 100)]
+        rounded = layer([bent, bent], corner_at=(0, 1))
+        plain = layer([bent, bent])
+        # An alternate design: the same number of paths, the second one longer,
+        # its first path happens to have as many nodes as the masters'.
+        alternate = layer([bent, bent + [(0, 100)]])
+        glyph = types.SimpleNamespace(layers=[rounded, plain, alternate],
+                                      userData={bridge.GLYPH_CORNERS_KEY: True})
+        for item in glyph.layers:
+            item.parent = glyph
+        specs = bridge.corner_specs(plain.paths[0])
+        self.assertIsNotNone(specs[1])  # a zero arc, as the corner is on elsewhere
+        self.assertEqual(bridge.corner_specs(alternate.paths[0]), [None, None, None])
+
     def test_layer_expansion_uses_virtual_step_without_editing_source_nodes(self):
         path = Path([Node(0, 0), Node(0, 100)])
         for node in path.nodes:

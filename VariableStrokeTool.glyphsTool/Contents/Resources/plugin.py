@@ -49,6 +49,7 @@ from glyphs_bridge import (CAP_START_KEY, CAP_END_KEY, CAP_START_ANGLE_KEY, CAP_
                            corner_handle_of,
                            corner_on_of, corner_spec_of, copied_contours,
                            copy_stroke_settings, compare_string_suffix, forget_interpolations,
+                           _content_mark,
                            master_incompatibilities, describe_incompatibility)
 from glyphs_bridge import (VIRTUAL_KEY, virtual_nodes, virtual_widgets, virtual_point,
                            segments_for_path, _virtual_section_angle)
@@ -275,9 +276,13 @@ def _hook_copy():
 _hooked_compare = []
 
 
-# compare_string_suffix per (layer, glyph's last change): Glyphs asks for compare
-# strings on every interpolation (Variable Font Preview redraws, instance
-# previews), and the outline structure only changes with an edit.
+# compare_string_suffix per (layer, glyph's last change, what the layer holds):
+# Glyphs asks for compare strings on every interpolation (Variable Font Preview
+# redraws, instance previews), and the outline structure only changes with an
+# edit. Variable Font Preview swaps a master layer's content between the master
+# and its alternate (bracket) design as it moves, and a layer object's id can be
+# taken by another: a suffix of the other design makes the masters incompatible
+# for Glyphs, which then draws nothing.
 _SUFFIXES = collections.OrderedDict()
 _SUFFIX_CACHE_SIZE = 4096
 
@@ -297,7 +302,7 @@ def _stroke_suffix(layer):
         font = glyph.parent
         if font is None or font.parent is None:
             return ''
-        key = (objc.pyobjc_id(layer), str(glyph.lastChange))
+        key = (objc.pyobjc_id(layer), str(glyph.lastChange), _content_mark(layer))
     except Exception:
         return ''
     suffix = _SUFFIXES.get(key)

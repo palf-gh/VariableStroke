@@ -1843,7 +1843,8 @@ def _index_of(items, item):
 def _sibling_paths(path, count):
     """On-curve path_nodes of the same path in the glyph's other layers (masters,
     brace layers) with `count` on-curve nodes: needed so every layer rounds the
-    same corners."""
+    same corners. Only layers with the same paths (node counts) take part:
+    alternate (bracket) layers with another design are interpolated apart."""
     layer = getattr(path, 'parent', None)
     glyph = getattr(layer, 'parent', None) if layer is not None else None
     if glyph is None:
@@ -1855,12 +1856,15 @@ def _sibling_paths(path, count):
     except Exception:
         return []
     layer_id = getattr(layer, 'layerId', None)
+    shape = [len(other.nodes) for other in paths]
     result = []
     for other_layer in layers:
         if other_layer is layer or (layer_id is not None and
                                     getattr(other_layer, 'layerId', None) == layer_id):
             continue
         other_paths = list(other_layer.paths)
+        if [len(other.nodes) for other in other_paths] != shape:
+            continue
         if index < len(other_paths):
             other = other_paths[index]
             on_curve = _on_curve(path_nodes(other), bool(other.closed))
@@ -2658,20 +2662,38 @@ def interpolate_layer(layer, glyph, interpolation, cache_key=None, glyph_key=Non
     return result
 
 
+def _content_mark(layer):
+    """Node count and first node of each path: tells the designs a layer can
+    hold apart without reading it whole."""
+    if layer is None:
+        return None
+    try:
+        return tuple((len(path.nodes), xy(path.nodes[0]) if len(path.nodes) else None)
+                     for path in layer.paths)
+    except (AttributeError, IndexError, TypeError):
+        return None
+
+
 def _source_record(glyph, layer_id, glyph_key=None):
     """What interpolation reads from one source layer, read from Glyphs once per
     edit of the glyph (by `glyph_key`): its defaults and, per path, the node
-    count, stroke flag, stroke attributes, cap curves and virtual nodes."""
-    key = None if glyph_key is None else ('source', glyph_key, str(layer_id))
+    count, stroke flag, stroke attributes, cap curves and virtual nodes.
+
+    The key also takes what the layer holds now: interpolation previews
+    (Variable Font Preview) keep one glyph whose master layers hold the
+    master's design or its alternate (bracket) one depending on where the
+    preview is, with the same glyph, last change and layer ids."""
+    try:
+        source = glyph.layers[layer_id]
+    except (KeyError, IndexError, TypeError):
+        source = None
+    content = _content_mark(source)
+    key = None if glyph_key is None else ('source', glyph_key, str(layer_id), content)
     if key is not None:
         with _CACHE_LOCK:
             if key in _SOURCE_OUTLINES:
                 _SOURCE_OUTLINES.move_to_end(key)
                 return _SOURCE_OUTLINES[key]
-    try:
-        source = glyph.layers[layer_id]
-    except (KeyError, IndexError, TypeError):
-        source = None
     record = None
     if source is not None:
         paths = []
@@ -2683,10 +2705,73 @@ def _source_record(glyph, layer_id, glyph_key=None):
                                if attributes.get(name) is not None},
                 'cap_curves': (cap_curve_of(path, False), cap_curve_of(path, True)),
                 'virtual': virtual_nodes(path), 'profile': path_profile(path)})
-        record = {'id': str(layer_id), 'defaults': layer_defaults(source), 'paths': paths}
+        # (The id keys the outlines and values read from it: it marks the content too.)
+        record = {'id': (str(layer_id), content), 'defaults': layer_defaults(source),
+                  'paths': paths}
     if key is not None:
         _remember(_SOURCE_OUTLINES, _SOURCE_OUTLINES_SIZE, key, record)
     return record
+
+
+def _glyph_layers(glyph):
+    layers = glyph.layers
+    return list(layers.values()) if isinstance(layers, dict) else list(layers)
+
+
+def _alternate_layer_id(glyph, master_id, shape, interpolation, glyph_key=None):
+    """The id of the alternate (bracket) layer of a master whose paths have
+    `shape` (node counts), or None. Among several, the one whose axis rules
+    hold where `interpolation` ({master id: factor}) puts the layer."""
+    candidates = []
+    for other in _glyph_layers(glyph):
+        try:
+            if str(other.associatedMasterId) != str(master_id) or \
+                    str(other.layerId) == str(master_id):
+                continue
+            rules = (other.attributes or {}).get('axisRules')
+        except (AttributeError, TypeError):
+            continue
+        if rules is None:
+            continue
+        record = _source_record(glyph, other.layerId, glyph_key)
+        if record is not None and tuple(item['count'] for item in record['paths']) == shape:
+            candidates.append((other.layerId, rules))
+    if len(candidates) > 1:
+        location = _interpolated_location(glyph, interpolation)
+        if location is not None:
+            inside = [layer_id for layer_id, rules in candidates
+                      if _within_rules(rules, location)]
+            if inside:
+                return inside[0]
+    return candidates[0][0] if candidates else None
+
+
+def _interpolated_location(glyph, interpolation):
+    """Axis values where {master id: factor} puts a layer, or None."""
+    try:
+        masters = {str(master.id): [float(value) for value in master.axes]
+                   for master in glyph.parent.masters}
+        location = None
+        for master_id, factor in interpolation.items():
+            values = masters[str(master_id)]
+            location = [0.0]*len(values) if location is None else location
+            for axis, value in enumerate(values):
+                location[axis] += float(factor) * value
+        return location
+    except (AttributeError, KeyError, TypeError, ValueError):
+        return None
+
+
+def _within_rules(rules, location):
+    for axis, rule in enumerate(rules or ()):
+        if axis >= len(location):
+            break
+        rule = rule or {}
+        if rule.get('min') is not None and location[axis] < float(rule['min']) - 1e-6:
+            return False
+        if rule.get('max') is not None and location[axis] > float(rule['max']) + 1e-6:
+            return False
+    return True
 
 
 def _interpolate_layer(layer, glyph, interpolation, glyph_key=None):
@@ -2702,8 +2787,16 @@ def _interpolate_layer(layer, glyph, interpolation, glyph_key=None):
     path index.
     """
     sources = []
-    for layer_id, factor in dict(interpolation or {}).items():
+    interpolation = dict(interpolation or {})
+    shape = tuple(len(path.nodes) for path in layer.paths)
+    for layer_id, factor in interpolation.items():
         record = _source_record(glyph, layer_id, glyph_key)
+        if record is not None and tuple(item['count'] for item in record['paths']) != shape:
+            # Glyphs names the masters also where it interpolates their
+            # alternate (bracket) layers, which have other paths.
+            alternate = _alternate_layer_id(glyph, layer_id, shape, interpolation, glyph_key)
+            if alternate is not None:
+                record = _source_record(glyph, alternate, glyph_key)
         if record is not None:
             sources.append((record, float(factor)))
     if not sources:
