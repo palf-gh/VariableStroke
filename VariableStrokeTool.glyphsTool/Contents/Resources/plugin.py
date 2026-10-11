@@ -52,7 +52,7 @@ from glyphs_bridge import (CAP_START_KEY, CAP_END_KEY, CAP_START_ANGLE_KEY, CAP_
                            _content_mark, JOIN_KEY, GLYPH_BEVELS_KEY, join_of,
                            BEVEL_ANGLE_KEY, bevel_angle_of,
                            AFTER_SCALE_KEY, AFTER_HEIGHT_SCALE_KEY, MITER_LIMIT_KEY,
-                           miter_limit_of,
+                           miter_limit_of, after_handles, set_after_size,
                            CROSSING_HOLES_KEY, crossing_hole_widgets, set_crossing_hole,
                            set_hole_values, hole_settings,
                            master_incompatibilities, describe_incompatibility)
@@ -2927,6 +2927,24 @@ class VariableStrokeTool(SelectTool):
                 yield path, node, on_curve[node], pair
 
     @objc.python_method
+    def _after_handles(self, strokes, defaults):
+        """[(path, handle, left, right)] for the stroke's size after each cut
+        corner (see after_handles), drawn a little along the way it goes on so
+        they stand apart from the node's own width handles."""
+        shift = 10.0 / self._scale()
+        result = []
+        for path, items in strokes:
+            try:
+                handles = after_handles(path, defaults, items)
+            except ValueError:
+                continue
+            for handle in handles:
+                along = mul(unit(handle['tangent']), shift)
+                result.append((path, handle, add(handle['left'], along),
+                               add(handle['right'], along)))
+        return result
+
+    @objc.python_method
     def _corner_handles(self, strokes, defaults):
         """[(path, widget)] for every rounded outline corner of nodes whose live
         corner is on (widget: see corner_widgets)."""
@@ -3241,6 +3259,17 @@ class VariableStrokeTool(SelectTool):
             for handle in (left, right):
                 NSBezierPath.bezierPathWithOvalInRect_(((handle[0]-radius, handle[1]-radius),
                                                         (radius*2, radius*2))).fill()
+        # After a cut corner: squares for the size the stroke goes on with.
+        for _, _, left, right in self._after_handles(strokes, defaults):
+            color.colorWithAlphaComponent_(0.5).set()
+            line = NSBezierPath.bezierPath()
+            line.moveToPoint_(left)
+            line.lineToPoint_(right)
+            line.setLineWidth_(1.0 / scale)
+            line.stroke()
+            color.set()
+            for x, y in (left, right):
+                NSBezierPath.bezierPathWithRect_(((x-small, y-small), (small*2, small*2))).fill()
         control_color = NSColor.colorWithCalibratedRed_green_blue_alpha_(0.55, 0.27, 0.83, 1.0)
         for _, widget in bezier_handles:
             corner, control = widget['corner'], widget['control']
@@ -3562,6 +3591,29 @@ class VariableStrokeTool(SelectTool):
                     return
             selected = set(layer.selection)
             handles = list(self._handles(strokes, defaults))
+            for path, handle, left, right in self._after_handles(strokes, defaults):
+                for spot in (left, right):
+                    if length(sub(point, spot)) > threshold:
+                        continue
+                    middle = mul(add(left, right), 0.5)
+                    direction = unit(sub(spot, middle))
+                    near = length(sub(spot, middle))
+                    if near < 1e-6:
+                        continue
+                    # Across a stroke running sideways the size is its height.
+                    key = AFTER_SCALE_KEY if abs(direction[0]) >= abs(direction[1]) \
+                        else AFTER_HEIGHT_SCALE_KEY
+                    self._select_node(layer, handle['node'])
+                    layer.beginChanges()
+                    self._drag = {'kind': 'after-size', 'layer': layer, 'path': path,
+                                  'node': handle['node'], 'handle': handle, 'key': key,
+                                  'center': middle, 'direction': direction, 'near': near,
+                                  'percent': handle['scale'] if key == AFTER_SCALE_KEY
+                                  else handle['height_scale']}
+                    self._select_tab('node')
+                    self._last_ui_state = None
+                    self._refresh_ui()
+                    return
             bezier_hits = [(length(sub(point, widget['control'])), path, widget)
                            for path, widget in self._corner_bezier_handles(
                                strokes, defaults, selected)]
@@ -3899,6 +3951,17 @@ class VariableStrokeTool(SelectTool):
                 drag['node'].userData[ROTATION_KEY] = round(angle % 180.0, 1)
                 _invalidate(drag['layer'], [drag['path']])
                 self._redraw()
+            return
+        if drag.get('kind') == 'after-size':
+            # Both sides move together, as a node's own width handles do.
+            delta = sub((loc.x, loc.y), drag['center'])
+            reach = delta[0]*drag['direction'][0] + delta[1]*drag['direction'][1]
+            value = max(1.0, round(drag['percent'] * max(0.0, reach) / drag['near'], 1))
+            set_after_size(drag['node'], drag['key'], value, drag['handle'])
+            _invalidate(drag['layer'], [drag['path']])
+            self._last_ui_state = None
+            self._refresh_ui()
+            self._redraw()
             return
         if drag.get('kind') == 'nib-size':
             delta = sub((loc.x, loc.y), drag['center'])

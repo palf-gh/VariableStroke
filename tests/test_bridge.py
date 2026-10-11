@@ -995,6 +995,30 @@ class BridgeTests(unittest.TestCase):
             self.assertGreater(areas[1], 0)
             self.assertGreater(abs(areas[1]), abs(areas[0]))  # the outer contour
 
+    def test_size_after_a_cut_corner_has_handles(self):
+        path = Path([Node(0, 100), Node(0, 0), Node(200, 0)])
+        for node in path.nodes:
+            node.userData.clear()
+        path.attributes[bridge.STROKE_WIDTH_KEY] = 40
+        path.attributes[bridge.STROKE_HEIGHT_KEY] = 20
+        Layer([path])
+        self.assertEqual(bridge.after_handles(path), [])  # a plain miter has none
+        corner = path.nodes[1]
+        corner.userData[bridge.JOIN_KEY] = 'bevel'
+        corner.userData[bridge.SCALE_KEY] = 50
+        corner.userData[bridge.HEIGHT_SCALE_KEY] = 150
+        handle, = bridge.after_handles(path)
+        self.assertIs(handle['node'], corner)
+        # The stroke goes on to the right as thick as before the corner: 150 % of 20.
+        self.assertEqual(handle['center'], (0, 0))
+        self.assertEqual(sorted((handle['left'][1], handle['right'][1])), [-15.0, 15.0])
+        self.assertEqual((handle['scale'], handle['height_scale']), (50.0, 150.0))
+        # Dragging its height keeps the width it has now.
+        bridge.set_after_size(corner, bridge.AFTER_HEIGHT_SCALE_KEY, 100, handle)
+        self.assertEqual(corner.userData[bridge.AFTER_SCALE_KEY], 50.0)
+        handle, = bridge.after_handles(path)
+        self.assertEqual(sorted((handle['left'][1], handle['right'][1])), [-10.0, 10.0])
+
     def test_miter_limit_in_one_master_gives_the_others_a_cut_of_no_size(self):
         def layer(limit):
             path = Path([Node(0, 0), Node(200, 60), Node(0, 120)])

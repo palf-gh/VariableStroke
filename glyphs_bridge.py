@@ -1573,6 +1573,55 @@ def ellipse_cap_nodes(path, items=None):
     return result
 
 
+def after_handles(path, defaults=None, items=None):
+    """Width handles for the stroke after each cut corner (a bevel or a limited
+    miter, see after_data): [{'node', 'center', 'left', 'right' (where the
+    stroke after the corner starts, on both sides), 'tangent' (the way it
+    goes on), 'scale', 'height_scale' (its percents now)}]."""
+    from variable_stroke_core import nib_edges
+    defaults = _resolve(defaults, path)
+    items = path_nodes(path) if items is None else items
+    closed = bool(path.closed)
+    on_curve = _on_curve(items, closed)
+    segments = segments_for_path(path, defaults, items)
+    result = []
+    for k, segment in enumerate(segments):
+        if k >= len(on_curve):
+            break
+        node, _, point, data = on_curve[k]
+        if not join_of(data):
+            continue
+        kind, points, nib = segment[0], segment[1], segment[2]
+        tangent = sub(points[1], points[0])
+        if kind == 'cubic' and math.hypot(*tangent) < 1e-9:
+            tangent = sub(points[2], points[0])
+        if math.hypot(*tangent) < 1e-9:
+            continue
+        left, right = nib_edges(points[0], tangent, nib, defaults.italic_angle)
+        width_percent = _number(data.get(AFTER_SCALE_KEY), None)
+        height_percent = _number(data.get(AFTER_HEIGHT_SCALE_KEY), None)
+        if width_percent is None and height_percent is None:
+            width_percent, height_percent = scale_of(data), height_scale_of(data)
+        result.append({'node': node, 'center': points[0], 'left': left, 'right': right,
+                       'tangent': tangent,
+                       'scale': width_percent if width_percent is not None else height_percent,
+                       'height_scale': height_percent if height_percent is not None
+                       else width_percent})
+    return result
+
+
+def set_after_size(node, key, value, current):
+    """Set the width (AFTER_SCALE_KEY) or height percent after a cut corner;
+    the other one, when unset, keeps its size now (`current`, the handle's
+    percents) instead of following this one."""
+    other, other_value = ((AFTER_HEIGHT_SCALE_KEY, current['height_scale'])
+                          if key == AFTER_SCALE_KEY else
+                          (AFTER_SCALE_KEY, current['scale']))
+    if node.userData.get(other) is None:
+        node.userData[other] = other_value
+    node.userData[key] = value
+
+
 def edges_for_path(path, defaults=None, items=None):
     """[(node, (left, right))] for each on-curve node: where the outline really
     passes on both sides of it (miter/crossing points at corners). They come
