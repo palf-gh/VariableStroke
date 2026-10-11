@@ -433,8 +433,7 @@ class SelectorTests(unittest.TestCase):
     def test_panel_shows_one_tab_below_the_stroke_row(self):
         source = PLUGIN.read_text()
         self.assertIn('group.tabs = SegmentedButton(', source)
-        self.assertIn('group.nodeTab = Group((0, TAB_TOP, -0, 24))', source)
-        for tab in ('capsTab', 'cornerTab'):
+        for tab in ('nodeTab', 'capsTab', 'cornerTab'):
             self.assertIn('group.' + tab + ' = Group((0, TAB_TOP, -0, 48))', source)
         self.assertIn('group.virtualTab = Group((0, TAB_TOP, -0, 72))', source)
         self.assertIn("('virtual', 'Virtual', '仮想')", source)

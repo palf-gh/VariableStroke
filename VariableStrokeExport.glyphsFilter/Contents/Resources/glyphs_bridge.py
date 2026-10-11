@@ -85,6 +85,10 @@ GLYPH_KEY = 'com.codex.VariableStroke.glyphEnabled'
 GLYPH_CORNERS_KEY = 'com.codex.VariableStroke.glyphHasCorners'
 JOIN_KEY = 'com.codex.VariableStroke.join'  # per node: 'bevel'; absent means miter
 BEVEL_ANGLE_KEY = 'com.codex.VariableStroke.bevelAngle'  # page degrees; absent: automatic
+# Per bevelled node: the width and height percent after the corner (the
+# segment leaving the node); absent, the stroke goes on as thick as before it.
+AFTER_SCALE_KEY = 'com.codex.VariableStroke.scaleAfter'
+AFTER_HEIGHT_SCALE_KEY = 'com.codex.VariableStroke.heightScaleAfter'
 GLYPH_BEVELS_KEY = 'com.codex.VariableStroke.glyphHasBevels'
 # Per path: the holes a stroke makes by crossing itself that are joined and
 # rounded, [{'corners': [crossing indices in contour order], 'before': length
@@ -507,6 +511,23 @@ def width(node, path=None, base=None):
     return _width_of(node_data(node), base)
 
 
+def after_data(data):
+    """A bevelled node's values for the segment after its corner (see
+    AFTER_SCALE_KEY), or None where the stroke goes on as before it."""
+    if data is None or join_of(data) != 'bevel':
+        return None
+    width, height = data.get(AFTER_SCALE_KEY), data.get(AFTER_HEIGHT_SCALE_KEY)
+    if width is None and height is None:
+        return None
+    after = dict(data)
+    for key, value in ((SCALE_KEY, width), (HEIGHT_SCALE_KEY, height)):
+        if value is not None:
+            after[key] = value
+        else:
+            after.pop(key, None)  # shares the other percent, as a node's does
+    return after
+
+
 def nib_of(data, base_width, base_height, default_angle):
     w = _width_of(data, base_width)
     h = w * base_height / base_width if _legacy_width(data) else \
@@ -555,11 +576,16 @@ def segments_for_path(path, defaults=None, items=None):
     defaults = _resolve(defaults, path)
     base_width = stroke_width(path, defaults)
     base_height = stroke_height(path, defaults)
-    # (type, point, nib): every on-curve nib once, though it ends one segment
-    # and starts the next.
-    entries = [(kind, point, None if data is None else
-                nib_of(data, base_width, base_height, defaults.nib_angle))
-               for _, kind, point, data in items]
+    # (type, point, nib, nib after): every on-curve nib once, though it ends
+    # one segment and starts the next; a bevelled corner may start the next
+    # thicker or thinner (see after_data).
+    entries = []
+    for _, kind, point, data in items:
+        nib = None if data is None else nib_of(data, base_width, base_height,
+                                               defaults.nib_angle)
+        after = after_data(data)
+        entries.append((kind, point, nib, nib if after is None else
+                        nib_of(after, base_width, base_height, defaults.nib_angle)))
     if path.closed:
         entries = entries[first:] + entries[:first]
         run = entries[1:] + [entries[0]]
@@ -574,10 +600,10 @@ def segments_for_path(path, defaults=None, items=None):
             controls.append(entry[1])
             continue
         if len(controls) == 0:
-            result.append(('line', (start[1], entry[1]), start[2], entry[2]))
+            result.append(('line', (start[1], entry[1]), start[3], entry[2]))
         elif len(controls) == 2 and entry[0] == CURVE:
             result.append(('cubic', (start[1], controls[0], controls[1], entry[1]),
-                           start[2], entry[2]))
+                           start[3], entry[2]))
         else:
             raise ValueError('Only line and cubic path segments are supported')
         start = entry
@@ -1806,7 +1832,8 @@ def copy_stroke_settings(source, target):
         _pop(attributes, PROFILE_KEY)
     corner_keys = (CORNER_ON_KEY, CORNER_KEY, CORNER_INNER_KEY,
                    CORNER_TENSION_KEY, CORNER_INNER_TENSION_KEY,
-                   CORNER_RATIO_KEY, CORNER_INNER_RATIO_KEY, JOIN_KEY, BEVEL_ANGLE_KEY)
+                   CORNER_RATIO_KEY, CORNER_INNER_RATIO_KEY, JOIN_KEY, BEVEL_ANGLE_KEY,
+                   AFTER_SCALE_KEY, AFTER_HEIGHT_SCALE_KEY)
     for index, (position, item) in enumerate(zip(target_positions, target_nodes)):
         node = item[0]
         width, height, offset_value, rotation_value = samples[index] if matching_nodes else \
@@ -2858,11 +2885,21 @@ def _source_outline(path, defaults, key=None):
     return contours
 
 
+def _after_size(data, base_width, base_height):
+    """(width, height) after a bevelled corner (see after_data), or None."""
+    after = after_data(data)
+    if after is None:
+        return None
+    nib = nib_of(after, base_width, base_height, 0.0)
+    return (nib[0], nib[1])
+
+
 def _source_values(path, defaults, key=None):
     """A master path's stroke values as interpolation blends them, read from
     Glyphs once per edit of the glyph (by `key`) instead of once per instance:
     {'width', 'height', 'nodes': {position: (w, h, offset, rotation, corner
-    spec or None, left offset, right offset, 4 corner handles, join, bevel angle)}}."""
+    spec or None, left offset, right offset, 4 corner handles, join, bevel angle,
+    (width, height) after a bevel or None)}}."""
     if key is not None:
         key = ('values',) + tuple(key)
         with _CACHE_LOCK:
@@ -2882,7 +2919,7 @@ def _source_values(path, defaults, key=None):
             corner_offset_of(data, 'left'), corner_offset_of(data, 'right'),
             corner_handle_of(data, 'left', True), corner_handle_of(data, 'left', False),
             corner_handle_of(data, 'right', True), corner_handle_of(data, 'right', False),
-            join_of(data), bevel_angle_of(data))
+            join_of(data), bevel_angle_of(data), _after_size(data, base_w, base_h))
     values = {'width': base_w, 'height': base_h, 'nodes': nodes}
     if key is not None:
         _remember(_SOURCE_OUTLINES, _SOURCE_OUTLINES_SIZE, key, values)
@@ -3187,7 +3224,7 @@ def _interpolate_layer(layer, glyph, interpolation, glyph_key=None):
                 continue
             nodes = [(entry['nodes'][position], factor) for entry, factor in values]
             # (w, h, offset, rotation, corner spec or None, 2 offsets, 4 handles, join,
-            #  bevel angle)
+            #  bevel angle, (w, h) after a bevel or None)
             node.userData[SCALE_KEY] = sum(f * v[0] for v, f in nodes) / base_w * 100.0
             node.userData[HEIGHT_SCALE_KEY] = sum(f * v[1] for v, f in nodes) / base_h * 100.0
             node.userData[OFFSET_KEY] = sum(f * v[2] for v, f in nodes)
@@ -3224,6 +3261,16 @@ def _interpolate_layer(layer, glyph, interpolation, glyph_key=None):
                 node.userData[BEVEL_ANGLE_KEY] = _blend_angles(angles)
             elif BEVEL_ANGLE_KEY in node.userData:
                 del node.userData[BEVEL_ANGLE_KEY]
+            # Sizes after the corner blend with the sources' own sizes where unset.
+            if any(v[13] is not None for v, _ in nodes):
+                node.userData[AFTER_SCALE_KEY] = sum(
+                    f * (v[13] or v[:2])[0] for v, f in nodes) / base_w * 100.0
+                node.userData[AFTER_HEIGHT_SCALE_KEY] = sum(
+                    f * (v[13] or v[:2])[1] for v, f in nodes) / base_h * 100.0
+            else:
+                for key in (AFTER_SCALE_KEY, AFTER_HEIGHT_SCALE_KEY):
+                    if key in node.userData:
+                        del node.userData[key]
             if WIDTH_KEY in node.userData:
                 del node.userData[WIDTH_KEY]
         blends = getattr(layer, 'blends', None)

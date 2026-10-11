@@ -995,6 +995,28 @@ class BridgeTests(unittest.TestCase):
             self.assertGreater(areas[1], 0)
             self.assertGreater(abs(areas[1]), abs(areas[0]))  # the outer contour
 
+    def test_bevelled_corner_can_go_on_thicker_or_thinner(self):
+        path = Path([Node(0, 100), Node(0, 0), Node(200, 0)])
+        for node in path.nodes:
+            node.userData.clear()
+        path.attributes[bridge.STROKE_WIDTH_KEY] = 40
+        path.attributes[bridge.STROKE_HEIGHT_KEY] = 40
+        corner = path.nodes[1].userData
+        corner[bridge.SCALE_KEY] = 50
+        corner[bridge.AFTER_SCALE_KEY] = 100
+        Layer([path])
+        # A miter keeps one size at the node: the size after it only counts for a bevel.
+        segments = bridge.segments_for_path(path)
+        self.assertEqual(segments[0][3][0], 20.0)
+        self.assertEqual(segments[1][2][0], 20.0)
+        corner[bridge.JOIN_KEY] = 'bevel'
+        segments = bridge.segments_for_path(path)
+        self.assertEqual(segments[0][3][0], 20.0)  # before the corner: 50 %
+        self.assertEqual(segments[1][2][0], 40.0)  # after it: 100 %
+        self.assertEqual(segments[1][2][1], 40.0)  # its height shares the width's percent
+        corner[bridge.AFTER_HEIGHT_SCALE_KEY] = 25
+        self.assertEqual(bridge.segments_for_path(path)[1][2][1], 10.0)
+
     def test_bevel_cuts_the_outer_corner_and_other_masters_keep_the_structure(self):
         def layer(bevel):
             path = Path([Node(0, 0), Node(0, 100), Node(100, 100)])
