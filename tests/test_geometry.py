@@ -771,6 +771,23 @@ class GeometryTests(unittest.TestCase):
                 self.assertLess(length(sub(a, previous)), 2.0)
             previous = a
 
+    def test_bend_tighter_than_half_the_width_follows_the_pen(self):
+        # あ's loop (wide bold): a smooth node where the centerline bends by a
+        # radius of about 21 under a stroke 120 x 90 wide. The pen never
+        # reaches the fold of the inner edge: the outline must follow where
+        # the nib really goes, not a cubic fitted over the fold.
+        from variable_stroke_core import _side_pair
+        segs = [('cubic', ((233, 13), (184, 13), (98, 63), (98, 98)), (120, 90, 0.0), (120, 90, 0.0)),
+                ('cubic', ((98, 98), (98, 195), (417, 337), (683, 337)), (120, 90, 0.0), (120, 90, 0.0))]
+        contour = outline_curves(segs)[0]
+        _, right = _side_pair(*segs[1][:4])
+        inner = next(points for kind, points in contour if kind == 'cubic' and
+                     (points[0] == (683.0, 292.0) or points[-1] == (683.0, 292.0)))
+        fitted = [cubic(*inner, i / 800.0) for i in range(801)]
+        for t in (0.15, 0.3, 0.5, 0.7, 0.9):
+            edge = right.at(t)
+            self.assertLess(min(length(sub(edge, p)) for p in fitted), 4.0, t)
+
     def test_corner_moves_continuously(self):
         previous = None
         for step in range(0, 1700):

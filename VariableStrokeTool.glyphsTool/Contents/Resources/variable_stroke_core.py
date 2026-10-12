@@ -491,6 +491,8 @@ def node_edges(segments, closed=False, italic_angle=0.0):
         return {}
     _ease_sizes(lefts, closed)
     _ease_sizes(rights, closed)
+    _trim_folds(lefts)
+    _trim_folds(rights)
     count = len(lefts)
     for sides in (lefts, rights):
         for k in range(count if closed else count-1):
@@ -666,6 +668,14 @@ class _Side(object):
             d0 = unit(sub(self.at(ta+step), p0))
         if length(sub(p3, self.at(tb))) > 0.05:
             d1 = unit(sub(p3, self.at(tb-step)))
+        # Next to a fold (see _trim_folds) the edge all but stops and turns:
+        # its direction at the end says little about where it goes. Then
+        # head for a point a little further on.
+        ahead, behind = unit(sub(self.at(ta+step), p0)), unit(sub(p3, self.at(tb-step)))
+        if _dot(d0, ahead) < 0.9:
+            d0 = ahead
+        if _dot(d1, behind) < 0.9:
+            d1 = behind
         # When the stroke is wider than the local radius of curvature, the
         # mathematical offset can turn backwards even though the centerline is
         # gentle. Keep the outline visually flowing forward in that case.
@@ -879,6 +889,57 @@ def _fillet_edge(side, controls, samples, d0, d1):
         if min(k0*s0, k1*s1)*scale < 0.2*chord or depth(fillet(scale)) <= depth(controls):
             return controls  # the fit already bends at least as far out
     return fillet(scale)
+
+
+def _trim_folds(sides):
+    """Where a side's edge runs backwards at a segment's end (inside a bend
+    tighter than half the stroke's width the offset folds over itself), start
+    or end the side where it runs forward again. A pen drawing the stroke
+    never reaches the fold; the join then cuts the two sides where they
+    really cross (the inside corner of the too-tight bend). Fitted together
+    with its fold a side's cubic misses the true edge by many units."""
+    for side in sides:
+        if side.kind != 'cubic':
+            continue
+
+        def forward(t):
+            step = 1e-4
+            lo, hi = max(t - step, 0.0), min(t + step, 1.0)
+            edge = sub(side.at(hi), side.at(lo))
+            return _dot(edge, side.tangent(t))
+        count = 64
+        start = 0.0
+        if forward(0.0) < 0 or forward(1.0 / count) < 0:
+            k = 0
+            while k < count // 2 and forward(k / float(count)) < 0:
+                k += 1
+            if forward(k / float(count)) > 0:
+                lo, hi = max(k - 1, 0) / float(count), k / float(count)
+                for _ in range(30):
+                    middle = (lo + hi) / 2.0
+                    if forward(middle) < 0:
+                        lo = middle
+                    else:
+                        hi = middle
+                start = hi
+        end = 1.0
+        if forward(1.0) < 0 or forward(1.0 - 1.0 / count) < 0:
+            k = count
+            while k > count // 2 and forward(k / float(count)) < 0:
+                k -= 1
+            if forward(k / float(count)) > 0:
+                lo, hi = k / float(count), min(k + 1, count) / float(count)
+                for _ in range(30):
+                    middle = (lo + hi) / 2.0
+                    if forward(middle) < 0:
+                        hi = middle
+                    else:
+                        lo = middle
+                end = lo
+        if start > 0.0 and start < end:
+            side.ta, side.start = start, side.at(start)
+        if end < 1.0 and start < end:
+            side.tb, side.end = end, side.at(end)
 
 
 def _ease_sizes(sides, closed):
@@ -1162,6 +1223,9 @@ def _join(a, b, width):
         point = add(middle, mul(sub(point, middle), limit / distance))
     if inner is not None:
         point, a_tb, b_ta = inner
+    # Sides nothing has reshaped yet can simply be fitted again over what is
+    # left of them once cut (see below).
+    a_fresh, b_fresh = a.override_piece is None, b.override_piece is None
     a_controls = (a.override_piece or a.piece())[1] if a.kind == 'cubic' else None
     b_controls = (b.override_piece or b.piece())[1] if b.kind == 'cubic' else None
     a_trim = ((a_tb-a.ta)/(a.tb-a.ta) if a_controls is not None and a.tb-a.ta > EPS
@@ -1205,6 +1269,14 @@ def _join(a, b, width):
             a_trim = _nearest_parameter(a_controls, point, a_trim)
         if b_controls is not None:
             b_trim = _nearest_parameter(b_controls, point, b_trim)
+    if exact:
+        # Cut at the true crossing: a side's cubic fitted over the whole
+        # segment (with an edge that may have run back near the node) is cut
+        # less well than one fitted over what is left; refit those.
+        if a_fresh:
+            a_controls = None
+        if b_fresh:
+            b_controls = None
     if a_controls is not None:
         if a_on_curve:
             part = _cubic_interval(a_controls, 0.0, a_trim)
@@ -2130,6 +2202,8 @@ def _independent_outline_curves(left_segments, right_segments, closed, cap_start
         return []
     _ease_sizes(lefts, closed)
     _ease_sizes(rights, closed)
+    _trim_folds(lefts)
+    _trim_folds(rights)
     left_breaks, right_breaks = set(left_breaks), set(right_breaks)
     maps = {id(lefts): left_map, id(rights): right_map}
     cut, zero = _bevel_breaks(lefts, rights,
@@ -2338,6 +2412,8 @@ def outline_curves(segments, closed=False, cap_start='flat', cap_end='flat',
         return []
     _ease_sizes(lefts, closed)
     _ease_sizes(rights, closed)
+    _trim_folds(lefts)
+    _trim_folds(rights)
     cut, zero = _bevel_breaks(lefts, rights,
                               lambda sides, k: indices[(k+1) % len(sides)], bevels, closed)
     left_breaks = left_breaks | set(cut['left'])
