@@ -491,8 +491,8 @@ def node_edges(segments, closed=False, italic_angle=0.0):
         return {}
     _ease_sizes(lefts, closed)
     _ease_sizes(rights, closed)
-    _trim_folds(lefts)
-    _trim_folds(rights)
+    _trim_folds(lefts, closed)
+    _trim_folds(rights, closed)
     count = len(lefts)
     for sides in (lefts, rights):
         for k in range(count if closed else count-1):
@@ -557,6 +557,7 @@ class _Side(object):
         self.w0, self.w1 = self.n0[0], self.n1[0]
         self.ta, self.tb = 0.0, 1.0
         self.size_slopes = None  # see _ease_sizes
+        self.fold_start = self.fold_end = None  # see _trim_folds
         self.start, self.end = self.at(0.0), self.at(1.0)
         self.override_piece = None
         self.join_extension_ratio = 0.0
@@ -676,6 +677,13 @@ class _Side(object):
             d0 = ahead
         if _dot(d1, behind) < 0.9:
             d1 = behind
+        # A fold at a smooth node: the outline keeps the node's own direction.
+        folded_start = self.fold_start is not None and ta < self.fold_start
+        folded_end = self.fold_end is not None and tb > self.fold_end
+        if folded_start:
+            d0 = self.tangent(ta)
+        if folded_end:
+            d1 = self.tangent(tb)
         # When the stroke is wider than the local radius of curvature, the
         # mathematical offset can turn backwards even though the centerline is
         # gentle. Keep the outline visually flowing forward in that case.
@@ -697,6 +705,12 @@ class _Side(object):
                     else:
                         d1 = direction
         us = [i/float(count) for i in range(1, count)]
+        if folded_start or folded_end:
+            # Fit to the edge where it runs forward, by its share of the way.
+            lo = self.fold_start if folded_start else ta
+            hi = self.fold_end if folded_end else tb
+            us = [(lo - ta + (hi - lo) * i / float(count)) / (tb - ta)
+                  for i in range(1, count)]
         samples = [self.at(ta + (tb-ta)*u) for u in us]
         best = None
         for _ in range(4):
@@ -721,6 +735,8 @@ class _Side(object):
                 break  # already far below what anyone can see
             us = [min(max(i/64.0, 1e-3), 1-1e-3) for i in nearest]
         controls = best[1]
+        if folded_start or folded_end:
+            controls = _round_folded_ends(controls, d0, d1, folded_start, folded_end)
         # A true normal offset can cancel a gentle centerline's bend entirely.
         # For display outlines, retain some of that bend rather than producing
         # an almost straight edge beside a visibly curved centerline.
@@ -891,16 +907,26 @@ def _fillet_edge(side, controls, samples, d0, d1):
     return fillet(scale)
 
 
-def _trim_folds(sides):
+def _trim_folds(sides, closed):
     """Where a side's edge runs backwards at a segment's end (inside a bend
-    tighter than half the stroke's width the offset folds over itself), start
-    or end the side where it runs forward again. A pen drawing the stroke
-    never reaches the fold; the join then cuts the two sides where they
-    really cross (the inside corner of the too-tight bend). Fitted together
-    with its fold a side's cubic misses the true edge by many units."""
-    for side in sides:
+    tighter than half the stroke's width the offset folds over itself),
+    leave the fold out. Fitted together with its fold a side's cubic misses
+    the true edge by many units.
+
+    At a smooth centerline node the outline keeps its node there, upright to
+    the centerline's handles (`fold_start` / `fold_end`: the fit leaves the
+    fold's samples out, see _Side.piece). At a corner the side starts or
+    ends where its edge runs forward again, and the join cuts the two sides
+    where they really cross."""
+    total = len(sides)
+
+    def smooth(a, b):
+        return _dot(a.tangent(1.0), b.tangent(0.0)) > 0.995
+    for k, side in enumerate(sides):
         if side.kind != 'cubic':
             continue
+        previous = sides[k-1] if (closed or k > 0) and total > 1 else None
+        following = sides[(k+1) % total] if (closed or k < total-1) and total > 1 else None
 
         def forward(t):
             step = 1e-4
@@ -937,9 +963,41 @@ def _trim_folds(sides):
                         lo = middle
                 end = lo
         if start > 0.0 and start < end:
-            side.ta, side.start = start, side.at(start)
+            if previous is not None and smooth(previous, side):
+                side.fold_start = start
+            else:
+                side.ta, side.start = start, side.at(start)
         if end < 1.0 and start < end:
-            side.tb, side.end = end, side.at(end)
+            if following is not None and smooth(side, following):
+                side.fold_end = end
+            else:
+                side.tb, side.end = end, side.at(end)
+
+
+def _round_folded_ends(controls, d0, d1, at_start, at_end):
+    """A cubic whose end at a fold (see _trim_folds) keeps the node's own
+    direction but was fitted with almost no handle there (the edge it
+    follows comes back towards the node from the far side): give that
+    handle at least the length of a round arc between the two directions,
+    so the outline rounds into the node instead of coming to a point."""
+    p0, p1, p2, p3 = controls
+    denominator = d0[0]*d1[1] - d0[1]*d1[0]
+    if abs(denominator) < 1e-9:
+        return controls
+    q = sub(p3, p0)
+    a = (q[0]*d1[1] - q[1]*d1[0]) / denominator  # along d0 from p0
+    b = -(q[0]*d0[1] - q[1]*d0[0]) / denominator  # back along d1 from p3
+    if a <= 0 or b <= 0:
+        return controls
+    turn = math.acos(max(-1.0, min(1.0, _dot(d0, d1))))
+    arc = 4.0/3.0 * math.tan(turn/4.0) / math.tan(turn/2.0) if turn > 1e-6 else 2.0/3.0
+    # Only a handle of next to nothing is lengthened: one the fit gave some
+    # length already follows the edge, and lengthened it would thin the stroke.
+    if at_start and _dot(sub(p1, p0), d0) < 0.3 * a * arc:
+        p1 = add(p0, mul(d0, a * arc))
+    if at_end and _dot(sub(p3, p2), d1) < 0.3 * b * arc:
+        p2 = sub(p3, mul(d1, b * arc))
+    return (p0, p1, p2, p3)
 
 
 def _ease_sizes(sides, closed):
@@ -2202,8 +2260,8 @@ def _independent_outline_curves(left_segments, right_segments, closed, cap_start
         return []
     _ease_sizes(lefts, closed)
     _ease_sizes(rights, closed)
-    _trim_folds(lefts)
-    _trim_folds(rights)
+    _trim_folds(lefts, closed)
+    _trim_folds(rights, closed)
     left_breaks, right_breaks = set(left_breaks), set(right_breaks)
     maps = {id(lefts): left_map, id(rights): right_map}
     cut, zero = _bevel_breaks(lefts, rights,
@@ -2412,8 +2470,8 @@ def outline_curves(segments, closed=False, cap_start='flat', cap_end='flat',
         return []
     _ease_sizes(lefts, closed)
     _ease_sizes(rights, closed)
-    _trim_folds(lefts)
-    _trim_folds(rights)
+    _trim_folds(lefts, closed)
+    _trim_folds(rights, closed)
     cut, zero = _bevel_breaks(lefts, rights,
                               lambda sides, k: indices[(k+1) % len(sides)], bevels, closed)
     left_breaks = left_breaks | set(cut['left'])
