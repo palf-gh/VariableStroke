@@ -489,6 +489,8 @@ def node_edges(segments, closed=False, italic_angle=0.0):
         indices.append(index)
     if not lefts:
         return {}
+    _ease_sizes(lefts, closed)
+    _ease_sizes(rights, closed)
     count = len(lefts)
     for sides in (lefts, rights):
         for k in range(count if closed else count-1):
@@ -552,6 +554,7 @@ class _Side(object):
         self.n0, self.n1 = _nib(e0), _nib(e1)
         self.w0, self.w1 = self.n0[0], self.n1[0]
         self.ta, self.tb = 0.0, 1.0
+        self.size_slopes = None  # see _ease_sizes
         self.start, self.end = self.at(0.0), self.at(1.0)
         self.override_piece = None
         self.join_extension_ratio = 0.0
@@ -559,6 +562,13 @@ class _Side(object):
 
     def nib(self, t):
         values = [x*(1-t) + y*t for x, y in zip(self.n0[:3], self.n1[:3])]
+        if self.size_slopes is not None:
+            # Width and height ease through the nodes (see _ease_sizes).
+            h00, h10 = 2*t**3 - 3*t*t + 1, t**3 - 2*t*t + t
+            h01, h11 = -2*t**3 + 3*t*t, t**3 - t*t
+            for axis, (m0, m1) in enumerate(self.size_slopes):
+                values[axis] = max(EPS, h00*self.n0[axis] + h10*m0 +
+                                   h01*self.n1[axis] + h11*m1)
         # The two axes describe the same ellipse after a 180-degree turn.
         # Interpolating normalized end angles directly (e.g. 179 -> 1)
         # would rotate through 90 degrees and make the outline swell midway.
@@ -869,6 +879,43 @@ def _fillet_edge(side, controls, samples, d0, d1):
         if min(k0*s0, k1*s1)*scale < 0.2*chord or depth(fillet(scale)) <= depth(controls):
             return controls  # the fit already bends at least as far out
     return fillet(scale)
+
+
+def _ease_sizes(sides, closed):
+    """Let width and height change smoothly through the nodes. Changing them
+    in a straight line along each segment makes the stroke's thickness turn
+    sharply at a node it is thickest or thinnest at, and the edge there comes
+    to a point (inside ぬ's loop, where the node is narrower than its
+    neighbours). Each segment instead follows a cubic through its end sizes
+    whose slope at a node is 0 where the size turns there and between its
+    neighbours' slopes otherwise (no overshoot), so the sizes at the nodes
+    stay what they are. A size that steps at a node (virtual steps), and the
+    ends of an open path, keep the segment's own straight slope."""
+    count = len(sides)
+
+    def through(before, after):
+        if before * after <= 0:
+            return 0.0
+        return 2.0 * before * after / (before + after)
+    for k, side in enumerate(sides):
+        if side.kind != 'cubic':
+            continue
+        previous = sides[k-1] if (closed or k > 0) and count > 1 else None
+        following = sides[(k+1) % count] if (closed or k < count-1) and count > 1 else None
+        slopes = []
+        for axis in (0, 1):
+            change = side.n1[axis] - side.n0[axis]
+            start = end = change
+            if previous is not None and abs(previous.n1[axis] - side.n0[axis]) < 1e-6:
+                start = through(previous.n1[axis] - previous.n0[axis], change)
+            if following is not None and abs(following.n0[axis] - side.n1[axis]) < 1e-6:
+                end = through(change, following.n1[axis] - following.n0[axis])
+            slopes.append((start, end))
+        if any(abs(a - b) > 1e-9 for (a, b), axis in zip(slopes, (0, 1))
+               for b in (side.n1[axis] - side.n0[axis],)):
+            side.size_slopes = tuple(slopes)
+            side._edges.clear()
+            side.start, side.end = side.at(side.ta), side.at(side.tb)
 
 
 def _side_pair(kind, pts, e0, e1, slant=0.0, modulation=None):
@@ -2081,6 +2128,8 @@ def _independent_outline_curves(left_segments, right_segments, closed, cap_start
     rights, right_widths = make_sides(right_segments, -1)
     if not lefts or not rights:
         return []
+    _ease_sizes(lefts, closed)
+    _ease_sizes(rights, closed)
     left_breaks, right_breaks = set(left_breaks), set(right_breaks)
     maps = {id(lefts): left_map, id(rights): right_map}
     cut, zero = _bevel_breaks(lefts, rights,
@@ -2287,6 +2336,8 @@ def outline_curves(segments, closed=False, cap_start='flat', cap_end='flat',
         indices.append(index)
     if not lefts:
         return []
+    _ease_sizes(lefts, closed)
+    _ease_sizes(rights, closed)
     cut, zero = _bevel_breaks(lefts, rights,
                               lambda sides, k: indices[(k+1) % len(sides)], bevels, closed)
     left_breaks = left_breaks | set(cut['left'])
