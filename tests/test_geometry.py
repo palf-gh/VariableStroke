@@ -859,6 +859,28 @@ class GeometryTests(unittest.TestCase):
             self.assertLess(abs(handle[1] - node[1]), 1e-6)
             self.assertGreater(abs(handle[0] - node[0]), 4.0)
 
+    def test_side_swallowed_by_a_fold_rounds_between_its_neighbours(self):
+        # れ (condensed bold, edited): between the smooth top node and the
+        # smooth node below it the inside edge runs on, turns back midway and
+        # runs down again, all inside the stroke. The inside rounds off the
+        # corner where the edges beside it meet, each node heading its own
+        # way: horizontal at the top, upright below.
+        n = (120, 90, 0, 0)
+        segs = [('cubic', ((112, 620), (143, 639), (186, 658), (218, 658)), (84, 63, 0, 0), n),
+                ('cubic', ((218, 658), (245, 658), (265, 645), (265, 607)), n, n),
+                ('cubic', ((265, 607), (265, 558), (249, 461), (89, 82)), n, n)]
+        contour = outline_curves(segs)[0]
+        below, middle, top = [points for kind, points in contour][4:7]
+        self.assertEqual(middle[0], below[3])
+        self.assertEqual(middle[3], top[0])
+        self.assertLess(abs(middle[2][1] - middle[3][1]), 1e-6)  # horizontal at the top
+        self.assertLess(abs(top[1][1] - top[0][1]), 1e-6)
+        self.assertLess(abs(middle[1][0] - middle[0][0]), 1e-6)  # upright below
+        self.assertLess(abs(below[2][0] - below[3][0]), 1e-6)
+        # A round, not a hook: the inside never runs back to the right.
+        xs = [cubic(*middle, i / 20.0)[0] for i in range(21)]
+        self.assertTrue(all(x2 <= x1 + 1e-6 for x1, x2 in zip(xs, xs[1:])))
+
     def test_corner_moves_continuously(self):
         previous = None
         for step in range(0, 1700):

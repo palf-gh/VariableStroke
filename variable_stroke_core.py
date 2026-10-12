@@ -567,6 +567,7 @@ class _Side(object):
         self.corner_start = self.corner_end = False
         self.fillet_start = self.fillet_end = None  # (control, end of the round)
         self.round_corner_start = self.round_corner_end = None  # the corner it rounds
+        self.fixed_piece = None  # a side swallowed by a fold (see _trim_folds)
         self.fold_from, self.fold_to = 0.0, 1.0
         self.start, self.end = self.at(0.0), self.at(1.0)
         self.override_piece = None
@@ -666,6 +667,8 @@ class _Side(object):
     def piece(self):
         if self.kind == 'line':
             return ('line', (self.start, self.end))
+        if self.fixed_piece is not None:
+            return ('cubic', self.fixed_piece)
         ta, tb = self.ta, self.tb
         p0, p3 = self.start, self.end
         chord = length(sub(p3, p0))
@@ -1001,13 +1004,13 @@ def _trim_folds(sides, closed, fold_rounds=None):
         smooth_after = following is not None and smooth(side, following)
         lead = 0
         if smooth_before:
-            while lead < count // 4 and forward((lead + 1) / float(count)) >= 0:
+            while lead < count // 2 and forward((lead + 1) / float(count)) >= 0:
                 lead += 1
             if forward((lead + 1) / float(count)) >= 0:
                 lead = 0
         trail = count
         if smooth_after:
-            while trail > count - count // 4 and forward((trail - 1) / float(count)) >= 0:
+            while trail > count - count // 2 and forward((trail - 1) / float(count)) >= 0:
                 trail -= 1
             if forward((trail - 1) / float(count)) >= 0:
                 trail = count
@@ -1039,6 +1042,13 @@ def _trim_folds(sides, closed, fold_rounds=None):
                     else:
                         lo = middle
                 end = lo
+        # A fold midway between two smooth nodes is found from both ends:
+        # it goes with the node nearer to it.
+        if start > 0.0 and end < 1.0 and start >= end:
+            if lead <= count - trail:
+                end = 1.0
+            else:
+                start = 0.0
         if start > 0.0 and start < end:
             if previous is not None and smooth(previous, side):
                 side.fold_start = start
@@ -1055,6 +1065,7 @@ def _trim_folds(sides, closed, fold_rounds=None):
     # stroke really ends inside, along the node's own normal (where the edges
     # left after the folds are), not half the width out, which juts far into
     # the counter. Both sides meet there.
+    original = [(side.start, side.end) for side in sides]
     for k in range(total if closed else total - 1):
         a, b = sides[k], sides[(k+1) % total]
         if a.kind != 'cubic' or b.kind != 'cubic' or not smooth(a, b):
@@ -1152,7 +1163,8 @@ def _trim_folds(sides, closed, fold_rounds=None):
                 # in proportion to the width. The sharper the corner, the
                 # further back it begins.
                 radius = rounding * FOLD_ROUNDING * math.sqrt(
-                    length(sub(corner, b.start)) * full)
+                    length(sub(corner, b.start)) * full) * _fold_onset(
+                        folded, *sorted((turned, t)), reach=full)
                 coming = other.edge_tangent(meet[0])
                 going = folded.edge_tangent(u)
                 if not at_start:
@@ -1216,6 +1228,145 @@ def _trim_folds(sides, closed, fold_rounds=None):
                 a.fold_end = a.tb
             if b.fold_start is None:
                 b.fold_start = b.ta
+    _swallow_folded_sides(sides, closed, fold_rounds, original, smooth)
+
+
+def _swallow_folded_sides(sides, closed, fold_rounds, original, smooth):
+    """A side between two smooth nodes whose edge folds so far that it lies
+    inside the stroke all along, with the edges beside it stopping short of
+    it: the inside turns the corner where the side before and the side after
+    meet (as offsetting a thin outline does), rounded off. Its two nodes go
+    where the round heads each node's way, and the side is that stretch of
+    the round."""
+    total = len(sides)
+    for k, side in enumerate(sides):
+        if side.kind != 'cubic' or (side.fold_start is None and side.fold_end is None):
+            continue
+        if (side.start, side.end) != original[k] or side.corner_start or side.corner_end or \
+                side.fillet_start is not None or side.fillet_end is not None:
+            continue  # the fold is dealt with at a node
+        if not closed and (k == 0 or k == total - 1):
+            continue
+        before, after = sides[k-1], sides[(k+1) % total]
+        if before.kind != 'cubic' or after.kind != 'cubic' or \
+                not smooth(before, side) or not smooth(side, after):
+            continue
+        if before.fillet_end is not None or after.fillet_start is not None or \
+                before.corner_end or after.corner_start:
+            continue
+        reach = max(length(sub(side.start, side.pts[0])), length(sub(side.end, side.pts[-1])))
+        hi = before.fold_end if before.fold_end is not None else before.tb
+        lo = after.fold_start if after.fold_start is not None else after.ta
+        before_ts = [before.ta + (hi - before.ta) * i / 48.0 for i in range(49)]
+        after_ts = [lo + (after.tb - lo) * i / 48.0 for i in range(49)]
+        before_points = [before.at(t) for t in before_ts]
+        after_points = [after.at(t) for t in after_ts]
+        # Where the edges meet: the side after carried straight back, or the
+        # side before carried straight on.
+        meet = None
+        origin, way = after.at(lo), mul(after.edge_tangent(lo), -1.0)
+        tip = add(origin, mul(way, 2.0 * reach))
+        for j in range(48, 0, -1):
+            hit = _segment_intersection(origin, tip, before_points[j-1], before_points[j])
+            if hit is not None:
+                meet = (hit[0], before_ts[j-1] + (before_ts[j] - before_ts[j-1]) * hit[2], lo)
+                break
+        if meet is None:
+            origin, way = before.at(hi), before.edge_tangent(hi)
+            tip = add(origin, mul(way, 2.0 * reach))
+            for j in range(48):
+                hit = _segment_intersection(origin, tip, after_points[j], after_points[j+1])
+                if hit is not None:
+                    meet = (hit[0], hi, after_ts[j] + (after_ts[j+1] - after_ts[j]) * hit[2])
+                    break
+        if meet is None:
+            continue
+        corner, before_t, after_t = meet
+        rounding = fold_rounds.get(k, 1.0) if fold_rounds else 1.0
+        rounding = (rounding + (fold_rounds.get((k + 1) % total, 1.0) if fold_rounds
+                                else 1.0)) / 2.0
+        depth = min(length(sub(corner, side.start)), length(sub(corner, side.end)))
+        radius = rounding * FOLD_ROUNDING * math.sqrt(depth * reach) * _fold_onset(
+            side, *sorted((side.fold_end if side.fold_end is not None else side.fold_from,
+                           side.fold_start if side.fold_start is not None else side.fold_to)),
+            reach=reach)
+        coming, going = before.edge_tangent(before_t), after.edge_tangent(after_t)
+        turn = math.acos(max(-1.0, min(1.0, _dot(coming, going))))
+        setback = radius * math.tan(min(turn, math.radians(170)) / 2.0)
+        setback = min(setback,
+                      0.75 * length(sub(before.at(before.ta), corner)),
+                      0.75 * length(sub(after.at(after.tb), corner)))
+        # A round that ends (or begins) before the side's far (near) node
+        # leaves that node where it is: the side runs on from the round to
+        # it as it would beside a fold at one node.
+        tail = side.fold_start if side.fold_start is not None else side.fold_to
+        lead = side.fold_end if side.fold_end is not None else side.fold_from
+        ends_inside = setback < length(sub(side.end, corner))
+        begins_inside = setback < length(sub(side.start, corner))
+        if ends_inside and begins_inside:
+            continue
+        first_t = _at_distance(before, before_t, before.ta, corner, setback) \
+            if not begins_inside else _at_distance(side, lead, side.ta, corner, setback)
+        last_t = _at_distance(after, after_t, after.tb, corner, setback) \
+            if not ends_inside else _at_distance(side, tail, side.tb, corner, setback)
+        first = before.at(first_t) if not begins_inside else side.at(first_t)
+        last = after.at(last_t) if not ends_inside else side.at(last_t)
+        in_turn, out_turn = sub(corner, first), sub(last, corner)
+
+        def split_for(way):
+            cross_in = in_turn[0]*way[1] - in_turn[1]*way[0]
+            cross_out = out_turn[0]*way[1] - out_turn[1]*way[0]
+            if abs(cross_in - cross_out) < EPS:
+                return 0.0
+            return min(max(cross_in / (cross_in - cross_out), 0.0), 1.0)
+        if ends_inside or begins_inside:
+            # One node moves onto the round, where it heads the node's way.
+            if ends_inside:
+                a, b, way = before, side, side.tangent(side.ta)
+            else:
+                a, b, way = side, after, side.tangent(side.tb)
+            split = split_for(way)
+            node = _quadratic(first, corner, last, split)
+            a.end = b.start = node
+            a.fillet_end = (add(first, mul(in_turn, split)), first)
+            b.fillet_start = (add(corner, mul(out_turn, split)), last)
+            if ends_inside:
+                before.fold_end, side.fold_start = first_t, last_t
+                side.round_corner_start = corner
+            else:
+                side.fold_end, after.fold_start = first_t, last_t
+                side.round_corner_end = corner
+            continue
+        s0 = split_for(side.tangent(side.ta))
+        s1 = max(split_for(side.tangent(side.tb)), s0)
+        # The round's stretches before, on and after the side.
+        p_start = _quadratic(first, corner, last, s0)
+        p_end = _quadratic(first, corner, last, s1)
+        before_control = add(first, mul(in_turn, s0))
+        after_control = add(corner, mul(out_turn, s1))
+        # The middle stretch of a parabola, as a cubic.
+        q1 = add(add(mul(first, (1-s0)*(1-s1)), mul(corner, (1-s0)*s1 + s0*(1-s1))),
+                 mul(last, s0*s1))
+        side.start, side.end = p_start, p_end
+        side.fixed_piece = (p_start, add(p_start, mul(sub(q1, p_start), 2.0/3.0)),
+                            add(p_end, mul(sub(q1, p_end), 2.0/3.0)), p_end)
+        before.end, after.start = p_start, p_end
+        before.fold_end, after.fold_start = first_t, last_t
+        before.fillet_end = (before_control, first)
+        after.fillet_start = (after_control, last)
+
+
+def _fold_onset(side, lo, hi, reach):
+    """0 to 1 as the edge between `lo` and `hi` runs back further, up to a
+    twentieth of the half-width `reach`: a fold that has only just begun is
+    rounded off by next to nothing, so the outline never jumps."""
+    back, previous = 0.0, side.at(lo)
+    for i in range(1, 33):
+        t = lo + (hi - lo) * i / 32.0
+        point = side.at(t)
+        back += max(0.0, -_dot(sub(point, previous), side.tangent(t)))
+        previous = point
+    return min(1.0, back / max(0.05 * reach, EPS))
 
 
 def _at_distance(side, near, far, center, distance):
