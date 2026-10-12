@@ -813,6 +813,35 @@ class GeometryTests(unittest.TestCase):
             for i in range(1, 20):
                 self.assertGreater(depth(cubic(*points, i / 20.0)), 0.8)
 
+    def test_fold_past_a_smooth_node_is_rounded_its_way(self):
+        # れ (condensed bold): right past the smooth top node the inside edge
+        # stalls and runs back. No hook: the inside turns the corner the edges
+        # make, rounded off by the node's rounding, its node heading the
+        # centerline's way (horizontal) unless the rounding is 0.
+        base = [((112, 630), (143, 649), (186, 668), (218, 668)),
+                ((218, 668), (245, 668), (265, 645), (265, 607)),
+                ((265, 607), (265, 558), (249, 461), (89, 79))]
+        segs = [('cubic', base[0], (84, 63, 0, 0), (120, 90, 0, 0)),
+                ('cubic', base[1], (120, 90, 0, 0), (120, 90, 0, 0)),
+                ('cubic', base[2], (120, 90, 0, 0), (120, 90, 0, 0))]
+
+        def inside(rounds):
+            contour = outline_curves(segs, fold_rounds=rounds)[0]
+            # From the second piece's end up the inside: the pieces next to the top node.
+            return [points for kind, points in contour][5:7]
+        for rounds in (None, {1: 2.0}):
+            into, out_of = inside(rounds)
+            node = into[3]
+            self.assertEqual(node, out_of[0])
+            self.assertLess(node[0], 205.0)  # off the corner, the stroke thicker
+            for handle in (into[2], out_of[1]):
+                self.assertLess(abs(handle[1] - node[1]), 1e-6)
+            # Never back past the vertical edge below (no hook).
+            self.assertLess(max(cubic(*into, i / 20.0)[0] for i in range(21)), 205.5)
+        into, out_of = inside({1: 0.0})
+        self.assertAlmostEqual(into[3][0], 204.7, delta=1.0)
+        self.assertGreater(abs(into[2][1] - into[3][1]), 5.0)  # a corner: comes up into it
+
     def test_corner_moves_continuously(self):
         previous = None
         for step in range(0, 1700):
