@@ -349,11 +349,12 @@ MITER_LIMIT = 4.0
 # A line meeting a curve keeps its true miter (both edges straight on to their
 # crossing) up to this many half-widths; only near hairpins is it pulled in.
 MITER_FAR_LIMIT = 10.0
-# Inside a smooth node whose fold is cut by a corner (see _trim_folds), how
-# far back the outline rounds that corner off, in times the corner's
-# distance from where the unfolded edges would meet. A node's own rounding
+# Inside a smooth node whose fold is cut by a corner (see _trim_folds), the
+# radius the outline rounds that corner off by: this many times the
+# geometric mean of the corner's distance from where the unfolded edges
+# would meet and the stroke's half-width there. A node's own rounding
 # (`fold_rounds`) scales it.
-FOLD_ROUNDING = 1.5
+FOLD_ROUNDING = 1.0
 # How many half-widths a cap cut may reach along the stroke: a horizontal cut
 # stays horizontal down to a stroke about 5 degrees from horizontal.
 CUT_LIMIT = 12.0
@@ -564,7 +565,8 @@ class _Side(object):
         self.size_slopes = None  # see _ease_sizes
         self.fold_start = self.fold_end = None  # see _trim_folds
         self.corner_start = self.corner_end = False
-        self.fillet_start = self.fillet_end = None  # (corner, end of the round)
+        self.fillet_start = self.fillet_end = None  # (control, end of the round)
+        self.round_corner_start = self.round_corner_end = None  # the corner it rounds
         self.fold_from, self.fold_to = 0.0, 1.0
         self.start, self.end = self.at(0.0), self.at(1.0)
         self.override_piece = None
@@ -778,12 +780,13 @@ class _Side(object):
             us = [min(max(i/64.0, 1e-3), 1-1e-3) for i in nearest]
         controls = best[1]
         # Rounding a fold's corner off (see _trim_folds), the handle at the
-        # node reaches no further than the corner.
-        for index, fillet, node in ((1, self.fillet_start if corner_start else None, 0),
-                                    (2, self.fillet_end if corner_end else None, 3)):
-            if fillet is not None:
+        # node heading for the corner reaches no further than the corner.
+        for index, corner, node in ((1, self.round_corner_start if corner_start else None, 0),
+                                    (2, self.round_corner_end if corner_end else None, 3)):
+            if corner is not None:
                 handle = sub(controls[index], controls[node])
-                reach = length(sub(fillet[0], controls[node]))
+                reach = _dot(sub(corner, controls[node]), unit(handle)) \
+                    if length(handle) > EPS else 0.0
                 if length(handle) > reach > EPS:
                     controls = tuple(add(controls[node], mul(unit(handle), reach))
                                      if i == index else p for i, p in enumerate(controls))
@@ -1145,29 +1148,37 @@ def _trim_folds(sides, closed, fold_rounds=None):
                 # times the node's rounding.
                 corner, u = meet[1], meet[2]
                 rounding = fold_rounds.get((k + 1) % total, 1.0) if fold_rounds else 1.0
-                setback = rounding * FOLD_ROUNDING * length(sub(corner, b.start))
+                # A round of this radius: it grows from nothing with the fold,
+                # in proportion to the width. The sharper the corner, the
+                # further back it begins.
+                radius = rounding * FOLD_ROUNDING * math.sqrt(
+                    length(sub(corner, b.start)) * full)
+                coming = other.edge_tangent(meet[0])
+                going = folded.edge_tangent(u)
+                if not at_start:
+                    coming, going = going, coming
+                turn = math.acos(max(-1.0, min(1.0, _dot(coming, going))))
+                setback = radius * math.tan(min(turn, math.radians(170)) / 2.0)
                 straight = length(sub(folded.at(u), corner))
                 ts, points = other_edge
-                # No further back than half the other side's edge.
+                # No further back than three quarters of the other side's edge.
                 far_end = other.at(other.ta if at_start else other.tb)
-                setback = min(setback, 0.5 * length(sub(far_end, corner)))
+                setback = min(setback, 0.75 * length(sub(far_end, corner)))
                 if setback > 1e-3 and straight > EPS:
                     node_way = a.tangent(a.tb)
-                    target = sub(corner, mul(node_way, setback)) if at_start \
-                        else add(corner, mul(node_way, setback))
-                    nearest_on = None
-                    for j in range(len(points) - 1):
-                        span = sub(points[j+1], points[j])
-                        size2 = _dot(span, span)
-                        f = 0.0 if size2 < EPS else \
-                            min(max(_dot(sub(target, points[j]), span) / size2, 0.0), 1.0)
-                        gap = length(sub(add(points[j], mul(span, f)), target))
-                        if nearest_on is None or gap < nearest_on[0]:
-                            nearest_on = (gap, ts[j] + (ts[j+1] - ts[j]) * f)
-                    param = nearest_on[1]
+                    # The round begins and ends that far from the corner,
+                    # along each side's own edge.
+                    if at_start:
+                        param = _at_distance(other, meet[0], other.ta, corner, setback)
+                    else:
+                        param = _at_distance(other, meet[0], other.tb, corner, setback)
                     near = other.at(param)
-                    away = add(corner, mul(sub(folded.at(u), corner),
-                                           min(setback, straight) / straight))
+                    if setback <= straight:
+                        away = add(corner, mul(sub(folded.at(u), corner), setback / straight))
+                    else:
+                        u = _at_distance(folded, u, u + (folded.tb - u) * 0.75 if at_start
+                                         else u - (u - folded.ta) * 0.75, corner, setback)
+                        away = folded.at(u)
                     # The round runs as a parabola from the other side's edge
                     # over the corner on to the folded side's; the node sits
                     # where it heads the centerline's way.
@@ -1182,14 +1193,14 @@ def _trim_folds(sides, closed, fold_rounds=None):
                     before = add(first, mul(in_turn, split))
                     after = add(corner, mul(out_turn, split))
                     a.end = b.start = node
+                    a.fillet_end = (before, first)
+                    b.fillet_start = (after, last)
                     if at_start:
                         a.fold_end, b.fold_start = param, u
-                        a.fillet_end = (before, first)
-                        b.fillet_start = (after, last)
+                        b.round_corner_start = corner
                     else:
                         b.fold_start, a.fold_end = param, u
-                        a.fillet_end = (before, first)
-                        b.fillet_start = (after, last)
+                        a.round_corner_end = corner
                 else:
                     a.end = b.start = corner
                     if at_start:
@@ -1205,6 +1216,21 @@ def _trim_folds(sides, closed, fold_rounds=None):
                 a.fold_end = a.tb
             if b.fold_start is None:
                 b.fold_start = b.ta
+
+
+def _at_distance(side, near, far, center, distance):
+    """The parameter between `near` and `far` (towards `far`) where `side`'s
+    edge is `distance` from `center`, or `far` if it never gets that far."""
+    if length(sub(side.at(far), center)) <= distance:
+        return far
+    lo, hi = near, far
+    for _ in range(30):
+        middle = (lo + hi) / 2.0
+        if length(sub(side.at(middle), center)) < distance:
+            lo = middle
+        else:
+            hi = middle
+    return (lo + hi) / 2.0
 
 
 def _quadratic(p0, p1, p2, t):

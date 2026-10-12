@@ -842,6 +842,23 @@ class GeometryTests(unittest.TestCase):
         self.assertAlmostEqual(into[3][0], 204.7, delta=1.0)
         self.assertGreater(abs(into[2][1] - into[3][1]), 5.0)  # a corner: comes up into it
 
+    def test_sharp_fold_past_a_smooth_node_is_rounded_too(self):
+        # れ's second stroke: it climbs at 45 degrees into a smooth top node and
+        # drops straight down; the inside folds into a corner far sharper
+        # than a right angle. It is rounded off all the same: the inside
+        # node heads the centerline's way with handles that round it.
+        n = (120, 90, 0, 0)
+        segs = [('cubic', ((424, 696), (468, 753), (507, 782), (541, 782)), n, n),
+                ('cubic', ((541, 782), (573, 782), (595, 750), (595, 708)), n, n),
+                ('cubic', ((595, 708), (595, 579), (557, 231), (557, 72)), n, n)]
+        contour = outline_curves(segs)[0]
+        down, up = [points for kind, points in contour][5:7]  # into / out of the node
+        node = up[0]
+        self.assertEqual(down[3], node)
+        for handle in (down[2], up[1]):
+            self.assertLess(abs(handle[1] - node[1]), 1e-6)
+            self.assertGreater(abs(handle[0] - node[0]), 4.0)
+
     def test_corner_moves_continuously(self):
         previous = None
         for step in range(0, 1700):
