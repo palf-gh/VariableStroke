@@ -53,6 +53,7 @@ from glyphs_bridge import (CAP_START_KEY, CAP_END_KEY, CAP_START_ANGLE_KEY, CAP_
                            BEVEL_ANGLE_KEY, bevel_angle_of,
                            AFTER_SCALE_KEY, AFTER_HEIGHT_SCALE_KEY, MITER_LIMIT_KEY,
                            miter_limit_of, after_handles, set_after_size,
+                           FOLD_ROUND_KEY, fold_round_of,
                            CROSSING_HOLES_KEY, crossing_hole_widgets, set_crossing_hole,
                            set_hole_values, hole_settings,
                            master_incompatibilities, describe_incompatibility)
@@ -553,7 +554,7 @@ _NODE_KEYS = (SCALE_KEY, HEIGHT_SCALE_KEY, OFFSET_KEY, CORNER_OFFSET_LEFT_KEY,
               CORNER_ON_KEY, CORNER_KEY, CORNER_INNER_KEY,
               CORNER_TENSION_KEY, CORNER_INNER_TENSION_KEY,
               CORNER_RATIO_KEY, CORNER_INNER_RATIO_KEY, JOIN_KEY, BEVEL_ANGLE_KEY,
-              AFTER_SCALE_KEY, AFTER_HEIGHT_SCALE_KEY, MITER_LIMIT_KEY)
+              AFTER_SCALE_KEY, AFTER_HEIGHT_SCALE_KEY, MITER_LIMIT_KEY, FOLD_ROUND_KEY)
 _MISSING = object()
 # Node fields of the live corner and the userData key each one writes.
 CORNER_FIELDS = {'radius': CORNER_KEY, 'innerRadius': CORNER_INNER_KEY,
@@ -561,7 +562,8 @@ CORNER_FIELDS = {'radius': CORNER_KEY, 'innerRadius': CORNER_INNER_KEY,
                  'ratio': CORNER_RATIO_KEY, 'innerRatio': CORNER_INNER_RATIO_KEY}
 # Node fields of the size after a bevelled corner and the key each one writes.
 AFTER_FIELDS = {'scaleAfter': AFTER_SCALE_KEY, 'heightScaleAfter': AFTER_HEIGHT_SCALE_KEY}
-NODE_FIELDS = ('scale', 'heightScale', 'offset', 'rotation', 'bevelAngle', 'miterLimit') + \
+NODE_FIELDS = ('scale', 'heightScale', 'offset', 'rotation', 'bevelAngle', 'miterLimit',
+               'foldRound') + \
     tuple(CORNER_FIELDS) + tuple(AFTER_FIELDS)
 
 
@@ -661,6 +663,8 @@ def _parse_field(name, text):
         return value % 180.0 if math.isfinite(value) else None
     if name == 'miterLimit':
         return value if math.isfinite(value) and 0 <= value < 1000 else None
+    if name == 'foldRound':
+        return value if math.isfinite(value) and 0 <= value < 1000 else None
     if name in ('startAngle', 'endAngle'):
         return value % 360.0
     if name in ('radius', 'innerRadius', 'holeBefore', 'holeAfter'):
@@ -695,6 +699,14 @@ def _apply_field(name, value, paths, nodes):
                     del node.userData[JOIN_KEY]
         if value is not None and nodes and paths:
             note_corner(paths[0], GLYPH_BEVELS_KEY)
+    elif name == 'foldRound':
+        # Empty: the default rounding (100%).
+        for node in nodes:
+            if value is None:
+                if node.userData.get(FOLD_ROUND_KEY) is not None:
+                    del node.userData[FOLD_ROUND_KEY]
+            else:
+                node.userData[FOLD_ROUND_KEY] = value
     elif name in AFTER_FIELDS:
         # An empty field: the stroke goes on after the corner as before it.
         for node in nodes:
@@ -763,6 +775,8 @@ def _field_is(name, value, paths, nodes):
                    (value is None or join_of(node.userData)) for node in nodes)
     if name in AFTER_FIELDS:
         return all(node.userData.get(AFTER_FIELDS[name]) == value for node in nodes)
+    if name == 'foldRound':
+        return all(fold_round_of(node.userData) == value for node in nodes)
     if name == 'miterLimit':
         return all(miter_limit_of(node.userData) == value and
                    join_of(node.userData) != 'bevel' for node in nodes)
@@ -1269,7 +1283,7 @@ class VariableStrokeTool(SelectTool):
         group.divider = HorizontalLine((6, 28, -6, 1))
         group.sampleStatus = TextBox((6, TAB_TOP+6, -6, 20), '', sizeStyle='small')
 
-        node = group.nodeTab = Group((0, TAB_TOP, -0, 48))
+        node = group.nodeTab = Group((0, TAB_TOP, -0, 72))
         node.scaleLabel = TextBox((6, 4, 24, 14), _loc('W', '幅'), sizeStyle='small')
         node.scaleField = SteppingEditText((31, 0, 43, 19), sizeStyle='small')
         node.scaleUnit = TextBox((76, 4, 12, 14), '%', sizeStyle='small')
@@ -1302,6 +1316,16 @@ class VariableStrokeTool(SelectTool):
                                   sizeStyle='small')
         node.miterLimitField = SteppingEditText((334, 24, 43, 19), sizeStyle='small')
         node.afterHint = TextBox((386, 28, 210, 14), '', sizeStyle='small')
+        # Inside a bend tighter than the stroke is wide: how round the inside
+        # of a smooth node is (the stroke thickens there), in %.
+        node.foldRoundLabel = TextBox((6, 52, 84, 14), _loc('Fold round', '内側の丸み'),
+                                      sizeStyle='small')
+        node.foldRoundField = SteppingEditText((91, 48, 43, 19), sizeStyle='small')
+        node.foldRoundUnit = TextBox((136, 52, 12, 14), '%', sizeStyle='small')
+        node.foldRoundHint = TextBox((156, 52, 440, 14),
+                                     _loc('Smooth nodes in bends tighter than the stroke',
+                                          '線幅よりきついカーブのスムーズノード'),
+                                     sizeStyle='small')
 
         caps = [{'imageObject': _cap_icon(value), 'width': 21} for value in CAP_VALUES]
         cap = group.capsTab = Group((0, TAB_TOP, -0, 48))
@@ -1477,6 +1501,7 @@ class VariableStrokeTool(SelectTool):
                   ('offset', node.offsetField), ('rotation', node.rotationField),
                   ('bevelAngle', node.bevelAngleField),
                   ('miterLimit', node.miterLimitField),
+                  ('foldRound', node.foldRoundField),
                   ('scaleAfter', node.scaleAfterField),
                   ('heightScaleAfter', node.heightScaleAfterField),
                   ('startAngle', cap.startAngle), ('endAngle', cap.endAngle),
@@ -2175,7 +2200,7 @@ class VariableStrokeTool(SelectTool):
                     join_of(data), bevel_angle_of(data),
                     _number_or_none(data.get(AFTER_SCALE_KEY)),
                     _number_or_none(data.get(AFTER_HEIGHT_SCALE_KEY)),
-                    miter_limit_of(data))
+                    miter_limit_of(data), fold_round_of(data))
                     for _, data, _ in entries)
             else:
                 details = (tuple((corner_on_of(data),
@@ -2292,8 +2317,8 @@ class VariableStrokeTool(SelectTool):
     @objc.python_method
     def _show_node_tab(self, tab, editable, details):
         (scales, height_scales, offsets, rotations, rotation_overridden, joins, bevel_angles,
-         scales_after, height_scales_after, limits) = \
-            [list(column) for column in zip(*details)] or ([],) * 10
+         scales_after, height_scales_after, limits, fold_rounds) = \
+            [list(column) for column in zip(*details)] or ([],) * 11
         tab.join.enable(editable)
         # The angle field: bevels only; empty for the automatic cut (or mixed values).
         bevels = bool(joins) and all(join == 'bevel' for join in joins)
@@ -2304,6 +2329,10 @@ class VariableStrokeTool(SelectTool):
         miters = bool(joins) and all(join != 'bevel' for join in joins)
         tab.miterLimitField.enable(editable and miters)
         tab.miterLimitField.set(('%g' % limits[0]) if miters and _same(limits) else '')
+        tab.foldRoundField.enable(editable)
+        # Unset is the default 100%, shown so the arrow keys step from it.
+        rounds = [100.0 if value is None else value for value in fold_rounds]
+        tab.foldRoundField.set(('%g' % rounds[0]) if _same(rounds) else '')
         # Mixed selection: neither segment.
         tab.join.set(-1 if len(set(joins)) != 1 else 1 if joins[0] == 'bevel' else 0)
         for field in (tab.scaleField, tab.heightScaleField, tab.offsetField, tab.rotationField):
@@ -2665,7 +2694,8 @@ class VariableStrokeTool(SelectTool):
             self._live = live = None
         paths, nodes = self._field_targets(name, layer)
         value = _parse_field(name, text)
-        clear_scale = name in ('scale', 'heightScale', 'bevelAngle', 'miterLimit') + \
+        clear_scale = name in ('scale', 'heightScale', 'bevelAngle', 'miterLimit',
+                               'foldRound') + \
             tuple(AFTER_FIELDS) and not str(text).strip()
         if not paths or (name in NODE_FIELDS and not nodes):
             return

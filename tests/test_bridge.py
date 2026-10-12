@@ -1041,6 +1041,38 @@ class BridgeTests(unittest.TestCase):
                  for item in glyph.layers]
         self.assertEqual(kinds[0], kinds[1])
 
+    def test_fold_rounding_of_a_node_reaches_the_outline(self):
+        # れ: the inside of the smooth top node folds; its rounding is a node value.
+        def outline(rounding):
+            path = Path([Node(112, 630), Node(143, 649, 'offcurve'), Node(186, 668, 'offcurve'),
+                         Node(218, 668, 'curve'), Node(245, 668, 'offcurve'),
+                         Node(265, 645, 'offcurve'), Node(265, 607, 'curve'),
+                         Node(265, 558, 'offcurve'), Node(249, 461, 'offcurve'),
+                         Node(89, 79, 'curve')])
+            for node in path.nodes:
+                node.userData.clear()
+            if rounding is not None:
+                path.nodes[3].userData[bridge.FOLD_ROUND_KEY] = rounding
+            path.attributes[bridge.STROKE_WIDTH_KEY] = 120
+            path.attributes[bridge.STROKE_HEIGHT_KEY] = 90
+            Layer([path])
+            return bridge.curves_for_path(path)[0]
+
+        from variable_stroke_core import cubic
+
+        def ink(contour):
+            # The more it rounds the inside off, the thicker the stroke there.
+            points = [cubic(*p, i / 32.0) if kind == 'cubic' else
+                      tuple(p[0][j] + (p[1][j] - p[0][j]) * i / 32.0 for j in (0, 1))
+                      for kind, p in contour for i in range(32)]
+            return abs(sum(a[0]*b[1] - b[0]*a[1]
+                           for a, b in zip(points, points[1:] + points[:1]))) / 2.0
+        default, sharper, rounder = outline(None), outline('20'), outline(200)
+        self.assertEqual(outline(100), default)
+        self.assertLess(ink(sharper), ink(default))
+        self.assertLess(ink(default), ink(rounder))
+        self.assertEqual([k for k, _ in default], [k for k, _ in rounder])
+
     def test_bevelled_corner_can_go_on_thicker_or_thinner(self):
         path = Path([Node(0, 100), Node(0, 0), Node(200, 0)])
         for node in path.nodes:

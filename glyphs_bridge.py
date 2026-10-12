@@ -89,6 +89,10 @@ BEVEL_ANGLE_KEY = 'com.codex.VariableStroke.bevelAngle'  # page degrees; absent:
 # the node; beyond, it is cut off (as Affinity Designer's miter limit). Absent:
 # the miter is held near the node in one point, as before.
 MITER_LIMIT_KEY = 'com.codex.VariableStroke.miterLimit'
+# Inside a smooth node where the bend is tighter than the stroke is wide: how
+# much the outline rounds off the corner the fold leaves, in % (100: the core's
+# FOLD_ROUNDING; 0: the corner itself).
+FOLD_ROUND_KEY = 'com.codex.VariableStroke.foldRound'
 # Per bevelled node: the width and height percent after the corner (the
 # segment leaving the node); absent, the stroke goes on as thick as before it.
 AFTER_SCALE_KEY = 'com.codex.VariableStroke.scaleAfter'
@@ -1898,7 +1902,7 @@ def copy_stroke_settings(source, target):
     corner_keys = (CORNER_ON_KEY, CORNER_KEY, CORNER_INNER_KEY,
                    CORNER_TENSION_KEY, CORNER_INNER_TENSION_KEY,
                    CORNER_RATIO_KEY, CORNER_INNER_RATIO_KEY, JOIN_KEY, BEVEL_ANGLE_KEY,
-                   AFTER_SCALE_KEY, AFTER_HEIGHT_SCALE_KEY, MITER_LIMIT_KEY)
+                   AFTER_SCALE_KEY, AFTER_HEIGHT_SCALE_KEY, MITER_LIMIT_KEY, FOLD_ROUND_KEY)
     for index, (position, item) in enumerate(zip(target_positions, target_nodes)):
         node = item[0]
         width, height, offset_value, rotation_value = samples[index] if matching_nodes else \
@@ -2042,6 +2046,28 @@ def miter_limit_of(data):
         return max(value, 0.0) if value is not None and math.isfinite(value) else None
     except (AttributeError, TypeError, ValueError):
         return None
+
+
+def fold_round_of(data):
+    """A node's rounding inside a fold, in % (see FOLD_ROUND_KEY), or None."""
+    try:
+        value = data.get(FOLD_ROUND_KEY) if data is not None else None
+        value = float(value) if value is not None else None
+        return max(value, 0.0) if value is not None and math.isfinite(value) else None
+    except (AttributeError, TypeError, ValueError):
+        return None
+
+
+def fold_round_specs(path, items=None):
+    """{on-curve node index: rounding factor} for outline_curves' `fold_rounds`,
+    or None where no node sets one."""
+    items = path_nodes(path) if items is None else items
+    rounds = {}
+    for k, (_, _, _, data) in enumerate(_on_curve(items, bool(path.closed))):
+        value = fold_round_of(data)
+        if value is not None:
+            rounds[k] = value / 100.0
+    return rounds or None
 
 
 def bevel_angle_of(data):
@@ -2408,6 +2434,7 @@ def _gathered_outline(path, defaults, items, hint=(), base_only=False, detect=Fa
         with PROFILE.section('  inputs: corners'):
             source_corners = corner_specs(path, items)
             source_bevels = bevel_specs(path, items)
+            source_rounds = fold_round_specs(path, items)
             crossing = crossing_spec(path)
         source_offsets = [(corner_offset_of(data, 'left'), corner_offset_of(data, 'right'))
                           for _, _, _, data in _on_curve(items, closed)]
@@ -2437,6 +2464,12 @@ def _gathered_outline(path, defaults, items, hint=(), base_only=False, detect=Fa
         else:
             bevels = tuple(source_bevels[index] if index is not None and
                            index < len(source_bevels) else None for index in node_map)
+        if source_rounds is None or independent:
+            fold_rounds = None
+        else:
+            fold_rounds = tuple(sorted(
+                (k, source_rounds[index]) for k, index in enumerate(node_map)
+                if index is not None and index in source_rounds)) or None
         segments = tuple(segments)
         key = ('curves', segments, right_segments, closed, caps, angles, cap_curves,
                defaults.italic_angle, tuple(sorted(breaks['left'])),
@@ -2445,7 +2478,7 @@ def _gathered_outline(path, defaults, items, hint=(), base_only=False, detect=Fa
                tuple(left_map) if independent else (),
                tuple(right_map) if independent else (),
                tuple(None if c is None else tuple(sorted(c.items())) for c in corners),
-               tuple(source_offsets), tuple(source_handles), bevels, crossing)
+               tuple(source_offsets), tuple(source_handles), bevels, crossing, fold_rounds)
 
     def compute():
         collected, edges, cap_points = [], {}, {}
@@ -2461,7 +2494,8 @@ def _gathered_outline(path, defaults, items, hint=(), base_only=False, detect=Fa
                                   cap_start_curve=cap_curves[0],
                                   cap_end_curve=cap_curves[1], cap_out=cap_points,
                                   bevels=None if independent else bevels,
-                                  right_bevels=bevels if independent else None)
+                                  right_bevels=bevels if independent else None,
+                                  fold_rounds=dict(fold_rounds) if fold_rounds else None)
         if any(delta != (0.0, 0.0) for pair in source_offsets for delta in pair) or \
                 any(delta != (0.0, 0.0) for handles in source_handles for delta in handles):
             if independent:
@@ -3010,7 +3044,7 @@ def _source_values(path, defaults, key=None):
             corner_handle_of(data, 'left', True), corner_handle_of(data, 'left', False),
             corner_handle_of(data, 'right', True), corner_handle_of(data, 'right', False),
             join_of(data), bevel_angle_of(data), _after_size(data, base_w, base_h),
-            miter_limit_of(data))
+            miter_limit_of(data), fold_round_of(data))
     values = {'width': base_w, 'height': base_h, 'nodes': nodes}
     if key is not None:
         _remember(_SOURCE_OUTLINES, _SOURCE_OUTLINES_SIZE, key, values)
@@ -3338,7 +3372,8 @@ def _interpolate_layer(layer, glyph, interpolation, glyph_key=None):
                 continue
             nodes = [(entry['nodes'][position], factor) for entry, factor in values]
             # (w, h, offset, rotation, corner spec or None, 2 offsets, 4 handles, join,
-            #  bevel angle, (w, h) after a bevel or None, miter limit or None)
+            #  bevel angle, (w, h) after a bevel or None, miter limit or None,
+            #  fold rounding or None)
             node.userData[SCALE_KEY] = sum(f * v[0] for v, f in nodes) / base_w * 100.0
             node.userData[HEIGHT_SCALE_KEY] = sum(f * v[1] for v, f in nodes) / base_h * 100.0
             node.userData[OFFSET_KEY] = sum(f * v[2] for v, f in nodes)
@@ -3377,6 +3412,14 @@ def _interpolate_layer(layer, glyph, interpolation, glyph_key=None):
                     if total > 1e-9 else limits[0][0]
             elif MITER_LIMIT_KEY in node.userData:
                 del node.userData[MITER_LIMIT_KEY]
+            # A fold's rounding blends, a source without one at 100%.
+            if any(v[15] is not None for v, _ in nodes):
+                total = sum(f for _, f in nodes)
+                node.userData[FOLD_ROUND_KEY] = sum(
+                    f * (100.0 if v[15] is None else v[15]) for v, f in nodes) / total \
+                    if total > 1e-9 else 100.0
+            elif FOLD_ROUND_KEY in node.userData:
+                del node.userData[FOLD_ROUND_KEY]
             # An angle set in every source blends; one automatic cut keeps it automatic.
             angles = [(v[12], f) for v, f in nodes]
             if any(v[11] for v, _ in nodes) and all(a is not None for a, _ in angles):
