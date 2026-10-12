@@ -736,7 +736,12 @@ class _Side(object):
             us = [min(max(i/64.0, 1e-3), 1-1e-3) for i in nearest]
         controls = best[1]
         if folded_start or folded_end:
-            controls = _round_folded_ends(controls, d0, d1, folded_start, folded_end)
+            controls = _round_folded_ends(
+                controls, d0, d1,
+                (self.at(self.fold_start), self.edge_tangent(self.fold_start))
+                if folded_start else None,
+                (self.at(self.fold_end), self.edge_tangent(self.fold_end))
+                if folded_end else None)
         # A true normal offset can cancel a gentle centerline's bend entirely.
         # For display outlines, retain some of that bend rather than producing
         # an almost straight edge beside a visibly curved centerline.
@@ -972,31 +977,98 @@ def _trim_folds(sides, closed):
                 side.fold_end = end
             else:
                 side.tb, side.end = end, side.at(end)
+    # A smooth node with a fold beside it: its inside node goes where the
+    # stroke really ends inside, along the node's own normal (where the edges
+    # left after the folds are), not half the width out, which juts far into
+    # the counter. Both sides meet there.
+    for k in range(total if closed else total - 1):
+        a, b = sides[k], sides[(k+1) % total]
+        if a.kind != 'cubic' or b.kind != 'cubic' or not smooth(a, b):
+            continue
+        if a.fold_end is None and b.fold_start is None:
+            continue
+        center = b.pts[0]
+        reach = sub(b.start, center)
+        full = length(reach)
+        if full < EPS:
+            continue
+        direction = mul(reach, 1.0 / full)
+        far = add(center, mul(direction, full))
+        nearest = full
+        edges = []
+        for side, lo, hi in ((a, a.ta, a.fold_end if a.fold_end is not None else a.tb),
+                             (b, b.fold_start if b.fold_start is not None else b.ta, b.tb)):
+            ts = [lo + (hi - lo) * i / 48.0 for i in range(49)]
+            points = [side.at(t) for t in ts]
+            edges.append((ts, points))
+            for p, q in zip(points, points[1:]):
+                hit = _segment_intersection(center, far, p, q)
+                if hit is not None and hit[1] * full > 1e-6:
+                    nearest = min(nearest, hit[1] * full)
+        # What is left of the edges past the folds can still run on past
+        # each other (the other side's edge covers it there): fit each only
+        # up to where they cross, or its handle reaches out for the overlap.
+        (ats, apoints), (bts, bpoints) = edges
+        crossing = None
+        for i in range(48, 0, -1):
+            for j in range(48):
+                hit = _segment_intersection(apoints[i-1], apoints[i], bpoints[j], bpoints[j+1])
+                if hit is not None:
+                    crossing = (ats[i-1] + (ats[i] - ats[i-1]) * hit[1],
+                                bts[j] + (bts[j+1] - bts[j]) * hit[2])
+                    break
+            if crossing is not None:
+                break
+        if crossing is not None:
+            a.fold_end, b.fold_start = crossing
+        if nearest < full - 1e-6:
+            point = add(center, mul(direction, nearest))
+            a.end = b.start = point
+            # Fit from here on to the edge left after the fold.
+            if a.fold_end is None:
+                a.fold_end = a.tb
+            if b.fold_start is None:
+                b.fold_start = b.ta
 
 
-def _round_folded_ends(controls, d0, d1, at_start, at_end):
+def _round_folded_ends(controls, d0, d1, start_turn, end_turn):
     """A cubic whose end at a fold (see _trim_folds) keeps the node's own
     direction but was fitted with almost no handle there (the edge it
     follows comes back towards the node from the far side): give that
-    handle at least the length of a round arc between the two directions,
-    so the outline rounds into the node instead of coming to a point."""
+    handle the length of a round arc from the node into the edge, so the
+    outline rounds into the node instead of coming to a point.
+
+    `start_turn` / `end_turn` is where the edge left after the fold begins
+    (or ends) and its direction there; the arc turns between the node's
+    direction and that one, and reaches no further than the edge does."""
     p0, p1, p2, p3 = controls
-    denominator = d0[0]*d1[1] - d0[1]*d1[0]
-    if abs(denominator) < 1e-9:
-        return controls
-    q = sub(p3, p0)
-    a = (q[0]*d1[1] - q[1]*d1[0]) / denominator  # along d0 from p0
-    b = -(q[0]*d0[1] - q[1]*d0[0]) / denominator  # back along d1 from p3
-    if a <= 0 or b <= 0:
-        return controls
-    turn = math.acos(max(-1.0, min(1.0, _dot(d0, d1))))
-    arc = 4.0/3.0 * math.tan(turn/4.0) / math.tan(turn/2.0) if turn > 1e-6 else 2.0/3.0
+
+    def reach(node, direction, point, edge):
+        # Where the node's line and the edge's line meet, how far out from
+        # the node, and the arc's share of that.
+        # When the edge begins right beside the node, heading off at once,
+        # the lines meet behind it: then the handle reaches as far out as
+        # the edge's beginning, enough to keep the node round.
+        q = sub(point, node)
+        denominator = direction[0]*edge[1] - direction[1]*edge[0]
+        turn = math.acos(max(-1.0, min(1.0, _dot(direction, edge))))
+        if abs(denominator) < 1e-9 or turn < 1e-6:
+            return None
+        along = (q[0]*edge[1] - q[1]*edge[0]) / denominator
+        back = (q[0]*direction[1] - q[1]*direction[0]) / denominator
+        if along <= 0 or back > 0:
+            return length(q)
+        return along * 4.0/3.0 * math.tan(turn/4.0) / math.tan(turn/2.0)
     # Only a handle of next to nothing is lengthened: one the fit gave some
     # length already follows the edge, and lengthened it would thin the stroke.
-    if at_start and _dot(sub(p1, p0), d0) < 0.3 * a * arc:
-        p1 = add(p0, mul(d0, a * arc))
-    if at_end and _dot(sub(p3, p2), d1) < 0.3 * b * arc:
-        p2 = sub(p3, mul(d1, b * arc))
+    if start_turn is not None:
+        handle = reach(p0, d0, *start_turn)
+        if handle is not None and _dot(sub(p1, p0), d0) < 0.3 * handle:
+            p1 = add(p0, mul(d0, handle))
+    if end_turn is not None:
+        handle = reach(p3, mul(d1, -1.0), end_turn[0], mul(end_turn[1], -1.0))
+        if handle is not None and _dot(sub(p3, p2), d1) < 0.3 * handle:
+            p2 = sub(p3, mul(d1, handle))
     return (p0, p1, p2, p3)
 
 

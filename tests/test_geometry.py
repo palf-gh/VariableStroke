@@ -788,6 +788,31 @@ class GeometryTests(unittest.TestCase):
             edge = right.at(t)
             self.assertLess(min(length(sub(edge, p)) for p in fitted), 4.0, t)
 
+    def test_fold_at_a_smooth_node_stays_with_the_pen_for_short_handles(self):
+        # あ's loop again, with the centerline's handles at the node shortened
+        # (15 and 40): the inner edges past the fold run on past each other.
+        # The inside outline must stay on the nib's sweep (not reach out for
+        # the overlap with a long handle and thin the stroke) and keep the
+        # node upright to the centerline's handles.
+        segs = [('cubic', ((722, 337), (722, 169), (473, 13), (233, 13)), (120, 90, 0.0), (120, 90, 0.0)),
+                ('cubic', ((233, 13), (184, 13), (98, 83), (98, 98)), (120, 90, 0.0), (120, 90, 0.0)),
+                ('cubic', ((98, 98), (98, 138), (417, 337), (683, 337)), (120, 90, 0.0), (120, 90, 0.0))]
+        centers = [cubic(*s[1], i / 300.0) for s in segs for i in range(301)]
+
+        def depth(p):  # 1 on the sweep's edge, less inside it
+            return min(math.hypot((p[0]-c[0]) / 60.0, (p[1]-c[1]) / 45.0) for c in centers)
+        contour = outline_curves(segs)[0]
+        inner = [points for kind, points in contour if kind == 'cubic' and
+                 any(abs(p[1] - 98) < 1e-6 and 120 < p[0] < 200 for p in (points[0], points[-1]))]
+        self.assertEqual(len(inner), 2)
+        for points in inner:
+            node = 0 if abs(points[0][1] - 98) < 1e-6 else 3
+            handle = points[1] if node == 0 else points[2]
+            self.assertLess(abs(handle[0] - points[node][0]), 1e-6)
+            self.assertGreater(abs(handle[1] - points[node][1]), 1.0)
+            for i in range(1, 20):
+                self.assertGreater(depth(cubic(*points, i / 20.0)), 0.8)
+
     def test_corner_moves_continuously(self):
         previous = None
         for step in range(0, 1700):
