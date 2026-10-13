@@ -1806,6 +1806,56 @@ def _bevel_breaks(lefts, rights, node_of, bevels, closed):
     return cut, zero
 
 
+def _clip_folds(outers, inners, cuts, folds):
+    """A cut corner's inside, folded in (see outline_curves), ends no
+    further than the cut: an inner edge reaching past the cut line (carried
+    on) stops on it, else the fold would stick out past the bevel."""
+    n = len(outers)
+    for k in cuts:
+        if k not in folds:
+            continue
+        a_out, b_out = outers[k], outers[(k+1) % n]
+        line_from, line_to = a_out.end, b_out.start
+        way = sub(line_to, line_from)
+        if length(way) < EPS:
+            continue
+        reach = 4.0 * max(length(way), 1.0)
+        along = unit(way)
+        far_from, far_to = sub(line_from, mul(along, reach)), add(line_to, mul(along, reach))
+
+        def side_of(p):
+            return way[0]*(p[1]-line_from[1]) - way[1]*(p[0]-line_from[0])
+        for side, at_end, kept in ((inners[k], True, a_out.pts[0]),
+                                   (inners[(k+1) % n], False, b_out.pts[-1])):
+            controls = (side.override_piece or side.piece())[1]
+            if side.kind == 'line':
+                controls = (controls[0], controls[0], controls[1], controls[1])
+            tip = controls[3] if at_end else controls[0]
+            if side_of(tip) * side_of(kept) >= 0:
+                continue  # already on the stroke's side of the cut
+            curve = [(i / 64.0, cubic(*controls, i / 64.0)) for i in range(65)]
+            if not at_end:
+                curve.reverse()
+            cut_at = None
+            for (t0, p0), (t1, p1) in zip(curve[::-1], curve[::-1][1:]):
+                hit = _segment_intersection(far_from, far_to, p1, p0)
+                if hit is not None:
+                    cut_at = t1 + (t0 - t1) * (1.0 - hit[2])
+                    break
+            if cut_at is None:
+                continue
+            part = _cubic_interval(controls, 0.0, cut_at) if at_end \
+                else _cubic_interval(controls, cut_at, 1.0)
+            if side.kind == 'line':
+                side.override_piece = ('line', (part[0], part[3]))
+            else:
+                side.override_piece = ('cubic', part)
+            if at_end:
+                side.end = part[3]
+            else:
+                side.start = part[0]
+
+
 def _apply_bevel_angles(sides, widths, cuts):
     for k, angle in cuts.items():
         if isinstance(angle, tuple):
@@ -2819,6 +2869,8 @@ def outline_curves(segments, closed=False, cap_start='flat', cap_end='flat',
                 _smooth_virtual_join(sides[k], sides[(k+1) % n])
         _apply_bevel_angles(lefts, widths, cut['left'])
         _apply_bevel_angles(rights, widths, cut['right'])
+        _clip_folds(lefts, rights, cut['left'], fold_right)
+        _clip_folds(rights, lefts, cut['right'], fold_left)
         if edges is not None:
             edges.update(_edge_map(lefts, rights, indices, True))
         for side in lefts + rights:
@@ -2849,6 +2901,8 @@ def outline_curves(segments, closed=False, cap_start='flat', cap_end='flat',
             _smooth_virtual_join(sides[k], sides[k+1])
     _apply_bevel_angles(lefts, widths, cut['left'])
     _apply_bevel_angles(rights, widths, cut['right'])
+    _clip_folds(lefts, rights, cut['left'], fold_right)
+    _clip_folds(rights, lefts, cut['right'], fold_left)
     if edges is not None:
         edges.update(_edge_map(lefts, rights, indices, False))
 
