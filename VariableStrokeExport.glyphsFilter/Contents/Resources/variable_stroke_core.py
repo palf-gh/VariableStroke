@@ -1806,34 +1806,192 @@ def _bevel_breaks(lefts, rights, node_of, bevels, closed):
     return cut, zero
 
 
-def _clip_folds(outers, inners, cuts, folds):
-    """A cut corner's inside, folded in (see outline_curves), ends no
-    further than the cut: an inner edge reaching past the cut line (carried
-    on) stops on it, else the fold would stick out past the bevel."""
+def _cover_overhang(a_out, b_out, a_in):
+    """At a hairpin whose stroke after the corner is thinner, the incoming
+    stroke's inner edge runs outside the outgoing stroke's outer edge near
+    the node: the outer side then carries the cut line on to that inner
+    edge and follows it until it meets its own edge. The strip grows from
+    nothing, and so does the change."""
+    if a_in.kind != 'cubic' or b_out.kind != 'cubic':
+        return
+    piece = (b_out.override_piece or b_out.piece())[1]
+    curve = [cubic(*piece, i / 64.0) for i in range(65)]
+    lo = a_in.ta
+    tail = [a_in.at(a_in.tb - (a_in.tb - lo) * i / 64.0) for i in range(65)]  # from the node back
+    center = b_out.pts[0]
+    start, way = curve[0], unit(sub(curve[4], curve[0]))
+    if length(way) < EPS:
+        return
+
+    def outside(p):
+        side = way[0]*(p[1]-start[1]) - way[1]*(p[0]-start[0])
+        inward = way[0]*(center[1]-start[1]) - way[1]*(center[0]-start[0])
+        return side * inward < 0
+    if not outside(tail[0]):
+        return
+    over = None
+    for i in range(64):
+        for j in range(64):
+            hit = _segment_intersection(tail[i], tail[i+1], curve[j], curve[j+1])
+            if hit is not None:
+                over = (i + hit[1], j + hit[2], hit[0])
+                break
+        if over is not None:
+            break
+    if over is None:
+        return
+    line_from, line_to = a_out.end, b_out.start
+    reach = add(line_to, mul(sub(line_to, line_from), 4.0))
+    meet = None
+    for i in range(64):
+        hit = _segment_intersection(line_from, reach, tail[i], tail[i+1])
+        if hit is not None and (meet is None or hit[1] < meet[0]):
+            meet = (hit[1], i + hit[2], hit[0])
+    if meet is None or meet[1] >= over[0]:
+        return
+    path = [meet[2]] + [tail[i] for i in range(int(math.floor(meet[1])) + 1,
+                                               int(math.ceil(over[0])))
+                        if meet[1] < i < over[0]]
+    path.append(over[2])
+    path += [curve[j] for j in range(int(math.floor(over[1])) + 1, 65)]
+    d1 = unit(sub(piece[3], piece[2])) if length(sub(piece[3], piece[2])) > EPS \
+        else unit(sub(curve[-1], curve[-2]))
+    d0 = unit(sub(path[1], path[0]))
+    b_out.start = meet[2]
+    b_out.override_piece = ('cubic', _fit_cubic(path, d0, d1))
+
+
+def _fit_cubic(path, d0, d1, rounds=10):
+    """A cubic from path[0] to path[-1], leaving and arriving along d0 and
+    d1, fitted to the points between."""
+    p0, p3 = path[0], path[-1]
+    chord = length(sub(p3, p0))
+    if chord < 1e-6 or len(path) < 3:
+        return (p0, p0, p3, p3)
+    run = [0.0]
+    for a, b in zip(path, path[1:]):
+        run.append(run[-1] + length(sub(b, a)))
+    samples = path[1:-1]
+    us = [min(max(r / run[-1], 1e-3), 1 - 1e-3) for r in run[1:-1]]
+    best = None
+    for _ in range(rounds):
+        controls = _handles(p0, p3, d0, d1, samples, us, chord)
+        curve = [cubic(*controls, i/64.0) for i in range(65)]
+        nearest = _nearest_along(samples, curve)
+        error = max(min(_point_segment_distance(p, curve[j], curve[j+1])
+                        for j in (i-1, i) if 0 <= j < 64) for p, i in zip(samples, nearest))
+        if best is None or error < best[0]:
+            best = (error, controls)
+        if error <= FIT_TOLERANCE / 4.0:
+            break
+        us = [min(max(i/64.0, 1e-3), 1-1e-3) for i in nearest]
+    return best[1]
+
+
+def _clip_folds(outers, inners, cuts, folds, widths):
+    """Shape a cut corner's inside, folded in (see outline_curves): where
+    the inner edges cross, the incoming one runs on a little past the
+    crossing and folds back onto the outgoing one, by a line about half the
+    stroke wide, so the outline overlaps itself only near the crossing
+    (where inner edges cross far from the node, a hairpin, the rest of each
+    would otherwise run on down the other stroke). Where they never cross,
+    each runs to its own end. Either way an inner edge reaching past the
+    cut line (carried on) stops on it, so nothing sticks out of the bevel."""
     n = len(outers)
+
+    def controls_of(side):
+        controls = (side.override_piece or side.piece())[1]
+        if side.kind == 'line':
+            controls = (controls[0], controls[0], controls[1], controls[1])
+        return controls
+
+    def store(side, controls):
+        if side.kind == 'line':
+            side.override_piece = ('line', (controls[0], controls[3]))
+        else:
+            side.override_piece = ('cubic', controls)
+        side.start, side.end = controls[0], controls[3]
+
+    def walk(curve, index, frac, distance, step):
+        """The parameter `distance` along `curve` (sampled at i/64) from
+        sample index + frac, towards its end (step 1) or start (-1)."""
+        run = [0.0]
+        for p, q in zip(curve, curve[1:]):
+            run.append(run[-1] + length(sub(q, p)))
+        here = run[index] + (run[index+1] - run[index]) * frac
+        goal = min(max(here + step * distance, 0.0), run[-1])
+        for q in range(64):
+            if run[q+1] >= goal:
+                span = run[q+1] - run[q]
+                return (q + ((goal - run[q]) / span if span > EPS else 0.0)) / 64.0
+        return 1.0
     for k in cuts:
         if k not in folds:
             continue
+        a_in, b_in = inners[k], inners[(k+1) % n]
+        ca, cb = controls_of(a_in), controls_of(b_in)
+        curve_a = [cubic(*ca, i / 64.0) for i in range(65)]
+        curve_b = [cubic(*cb, i / 64.0) for i in range(65)]
+        # The edge coming in, with the side before it: at a hairpin the
+        # outgoing edge may cross it before its last segment.
+        before = inners[k-1] if (k > 0 or n > 2) and k - 1 != (k+1) % n else None
+        lead = []
+        if before is not None and length(sub(before.end, a_in.start)) < 0.5:
+            cp = controls_of(before)
+            lead = [cubic(*cp, i / 64.0) for i in range(64)]
+        chain = lead + curve_a
+        crossing = None
+        for i in range(len(chain) - 2, -1, -1):
+            for j in range(64):
+                hit = _segment_intersection(chain[i], chain[i+1], curve_b[j], curve_b[j+1])
+                if hit is not None:
+                    crossing = (i, hit[1], j, hit[2])
+                    break
+            if crossing is not None:
+                break
+        if crossing is not None:
+            i, fi, j, fj = crossing
+            way_a = unit(sub(chain[i+1], chain[i]))
+            way_b = unit(sub(curve_b[j+1], curve_b[j]))
+            turn = math.acos(max(-1.0, min(1.0, _dot(way_a, way_b))))
+            half = widths[k] / 2.0
+            reach = half / (2.0 * max(math.sin(turn / 2.0), 0.05))
+            # Past the crossing along the incoming edge: onto its last segment.
+            run = [0.0]
+            for p, q in zip(chain, chain[1:]):
+                run.append(run[-1] + length(sub(q, p)))
+            here = run[i] + (run[i+1] - run[i]) * fi
+            start_run = run[len(lead)]
+            goal = min(max(here + reach, start_run), run[-1])
+            ta = 1.0
+            for q in range(len(lead), len(chain) - 1):
+                if run[q+1] >= goal:
+                    span = run[q+1] - run[q]
+                    ta = (q - len(lead) + ((goal - run[q]) / span if span > EPS else 0.0)) / 64.0
+                    break
+            tb = walk(curve_b, j, fj, reach, -1)
+            ca, cb = _cubic_interval(ca, 0.0, ta), _cubic_interval(cb, tb, 1.0)
+            store(a_in, ca)
+            store(b_in, cb)
         a_out, b_out = outers[k], outers[(k+1) % n]
+        _cover_overhang(a_out, b_out, a_in)
+        # No further than the cut.
         line_from, line_to = a_out.end, b_out.start
         way = sub(line_to, line_from)
         if length(way) < EPS:
             continue
-        reach = 4.0 * max(length(way), 1.0)
         along = unit(way)
+        reach = 4.0 * max(length(way), 1.0)
         far_from, far_to = sub(line_from, mul(along, reach)), add(line_to, mul(along, reach))
 
         def side_of(p):
             return way[0]*(p[1]-line_from[1]) - way[1]*(p[0]-line_from[0])
-        for side, at_end, kept in ((inners[k], True, a_out.pts[0]),
-                                   (inners[(k+1) % n], False, b_out.pts[-1])):
-            controls = (side.override_piece or side.piece())[1]
-            if side.kind == 'line':
-                controls = (controls[0], controls[0], controls[1], controls[1])
+        for side, at_end, kept in ((a_in, True, a_out.pts[0]), (b_in, False, b_out.pts[-1])):
+            controls = controls_of(side)
             tip = controls[3] if at_end else controls[0]
             if side_of(tip) * side_of(kept) >= 0:
-                continue  # already on the stroke's side of the cut
-            curve = [(i / 64.0, cubic(*controls, i / 64.0)) for i in range(65)]
+                continue
+            curve = [(t / 64.0, cubic(*controls, t / 64.0)) for t in range(65)]
             if not at_end:
                 curve.reverse()
             cut_at = None
@@ -1844,16 +2002,8 @@ def _clip_folds(outers, inners, cuts, folds):
                     break
             if cut_at is None:
                 continue
-            part = _cubic_interval(controls, 0.0, cut_at) if at_end \
-                else _cubic_interval(controls, cut_at, 1.0)
-            if side.kind == 'line':
-                side.override_piece = ('line', (part[0], part[3]))
-            else:
-                side.override_piece = ('cubic', part)
-            if at_end:
-                side.end = part[3]
-            else:
-                side.start = part[0]
+            store(side, _cubic_interval(controls, 0.0, cut_at) if at_end
+                  else _cubic_interval(controls, cut_at, 1.0))
 
 
 def _apply_bevel_angles(sides, widths, cuts):
@@ -2869,8 +3019,8 @@ def outline_curves(segments, closed=False, cap_start='flat', cap_end='flat',
                 _smooth_virtual_join(sides[k], sides[(k+1) % n])
         _apply_bevel_angles(lefts, widths, cut['left'])
         _apply_bevel_angles(rights, widths, cut['right'])
-        _clip_folds(lefts, rights, cut['left'], fold_right)
-        _clip_folds(rights, lefts, cut['right'], fold_left)
+        _clip_folds(lefts, rights, cut['left'], fold_right, widths)
+        _clip_folds(rights, lefts, cut['right'], fold_left, widths)
         if edges is not None:
             edges.update(_edge_map(lefts, rights, indices, True))
         for side in lefts + rights:
@@ -2901,8 +3051,8 @@ def outline_curves(segments, closed=False, cap_start='flat', cap_end='flat',
             _smooth_virtual_join(sides[k], sides[k+1])
     _apply_bevel_angles(lefts, widths, cut['left'])
     _apply_bevel_angles(rights, widths, cut['right'])
-    _clip_folds(lefts, rights, cut['left'], fold_right)
-    _clip_folds(rights, lefts, cut['right'], fold_left)
+    _clip_folds(lefts, rights, cut['left'], fold_right, widths)
+    _clip_folds(rights, lefts, cut['right'], fold_left, widths)
     if edges is not None:
         edges.update(_edge_map(lefts, rights, indices, False))
 

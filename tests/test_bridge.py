@@ -1112,7 +1112,10 @@ class BridgeTests(unittest.TestCase):
             item.parent = glyph
         cut = bridge.curves_for_path(bevelled.paths[0])[0]
         self.assertIn(('line', ((-10.0, 100.0), (0.0, 110.0))), cut)  # outside the turn
-        self.assertIn(('line', ((0.0, 90.0), (10.0, 100.0))), cut)  # inside folded in
+        # inside folded in a little past the crossing at (10, 90)
+        self.assertTrue(any(kind == 'line' and abs(p[0][1] - 90) < 1e-6 and 0 <= p[0][0] < 10 and
+                            abs(p[1][0] - 10) < 1e-6 and 90 < p[1][1] <= 100
+                            for kind, p in cut))
         sharp = bridge.curves_for_path(mitered.paths[0])[0]
         self.assertEqual([kind for kind, _ in sharp], [kind for kind, _ in cut])
         self.assertIn(('line', ((-10.0, 110.0), (-10.0, 110.0))), sharp)

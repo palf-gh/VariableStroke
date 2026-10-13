@@ -1012,7 +1012,10 @@ class GeometryTests(unittest.TestCase):
         # edge runs to its own end; the outline overlaps itself there).
         self.assertEqual(len(cut), len(plain) + 2)
         self.assertIn(('line', ((-10.0, 100.0), (0.0, 110.0))), cut)
-        self.assertIn(('line', ((0.0, 90.0), (10.0, 100.0))), cut)
+        # The inside folds back a little past the inner edges' crossing at (10, 90).
+        self.assertTrue(any(kind == 'line' and abs(p[0][1] - 90) < 1e-6 and 0 <= p[0][0] < 10 and
+                            abs(p[1][0] - 10) < 1e-6 and 90 < p[1][1] <= 100
+                            for kind, p in cut))
         self.assertEqual([kind for kind, _ in zero], [kind for kind, _ in cut])
         self.assertIn(('line', ((-10.0, 110.0), (-10.0, 110.0))), zero)
         # Turning the other way, the right side is outside.
