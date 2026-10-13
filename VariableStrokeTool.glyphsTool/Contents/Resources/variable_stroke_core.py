@@ -1265,9 +1265,9 @@ def _fold_corner(points, cusp_in, cusp_out, half):
                 return hit[0], i + hit[1], j + hit[2]
 
     def heading(index, step):
-        # The way the edge runs from a cusp, over a little stretch (right
-        # past a fold it still curls round).
-        target = 0.25 * half
+        # The way the edge runs from a cusp, over a stretch as long as the
+        # half-width (right past a fold it still curls round).
+        target = half
         q, travelled = index, 0.0
         while 0 < q < last and travelled < target:
             travelled += length(sub(points[q + step], points[q]))

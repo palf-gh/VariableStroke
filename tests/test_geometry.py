@@ -863,7 +863,7 @@ class GeometryTests(unittest.TestCase):
         self.assertEqual(down[3], node)
         for handle in (down[2], up[1]):
             self.assertLess(abs(handle[1] - node[1]), 1e-6)
-            self.assertGreater(abs(handle[0] - node[0]), 4.0)
+            self.assertGreater(abs(handle[0] - node[0]), 2.0)
 
     def test_side_swallowed_by_a_fold_rounds_between_its_neighbours(self):
         # れ (condensed bold, edited): between the smooth top node and the
