@@ -791,9 +791,9 @@ class GeometryTests(unittest.TestCase):
     def test_fold_at_a_smooth_node_stays_with_the_pen_for_short_handles(self):
         # あ's loop again, with the centerline's handles at the node shortened
         # (15 and 40): the inner edges past the fold run on past each other.
-        # The inside outline must stay on the nib's sweep (not reach out for
-        # the overlap with a long handle and thin the stroke) and keep the
-        # node upright to the centerline's handles.
+        # The inside outline must not cut into the nib's sweep (the round may
+        # thicken the stroke, never thin it) and keeps a node upright to the
+        # centerline's handles.
         segs = [('cubic', ((722, 337), (722, 169), (473, 13), (233, 13)), (120, 90, 0.0), (120, 90, 0.0)),
                 ('cubic', ((233, 13), (184, 13), (98, 83), (98, 98)), (120, 90, 0.0), (120, 90, 0.0)),
                 ('cubic', ((98, 98), (98, 138), (417, 337), (683, 337)), (120, 90, 0.0), (120, 90, 0.0))]
@@ -802,14 +802,18 @@ class GeometryTests(unittest.TestCase):
         def depth(p):  # 1 on the sweep's edge, less inside it
             return min(math.hypot((p[0]-c[0]) / 60.0, (p[1]-c[1]) / 45.0) for c in centers)
         contour = outline_curves(segs)[0]
-        inner = [points for kind, points in contour if kind == 'cubic' and
-                 any(abs(p[1] - 98) < 1e-6 and 120 < p[0] < 200 for p in (points[0], points[-1]))]
-        self.assertEqual(len(inner), 2)
-        for points in inner:
-            node = 0 if abs(points[0][1] - 98) < 1e-6 else 3
-            handle = points[1] if node == 0 else points[2]
-            self.assertLess(abs(handle[0] - points[node][0]), 1e-6)
-            self.assertGreater(abs(handle[1] - points[node][1]), 1.0)
+        # The inside's node at the loop's left: where the inner pieces meet.
+        pieces = [points for kind, points in contour]
+        meet = [k for k in range(len(pieces))
+                if 120 < pieces[k][-1][0] < 220 and 60 < pieces[k][-1][1] < 140 and
+                pieces[(k+1) % len(pieces)][0] == pieces[k][-1]]
+        self.assertEqual(len(meet), 1)
+        into, out_of = pieces[meet[0]], pieces[(meet[0] + 1) % len(pieces)]
+        node = into[-1]
+        for handle in (into[2], out_of[1]):
+            self.assertLess(abs(handle[0] - node[0]), 1e-6)
+            self.assertGreater(abs(handle[1] - node[1]), 1.0)
+        for points in (into, out_of):
             for i in range(1, 20):
                 self.assertGreater(depth(cubic(*points, i / 20.0)), 0.8)
 
@@ -839,8 +843,10 @@ class GeometryTests(unittest.TestCase):
             # Never back past the vertical edge below (no hook).
             self.assertLess(max(cubic(*into, i / 20.0)[0] for i in range(21)), 205.5)
         into, out_of = inside({1: 0.0})
-        self.assertAlmostEqual(into[3][0], 204.7, delta=1.0)
-        self.assertGreater(abs(into[2][1] - into[3][1]), 5.0)  # a corner: comes up into it
+        self.assertAlmostEqual(into[3][0], 205.0, delta=3.0)
+        # A corner: the inside comes up into it, not round it.
+        just_before = sub(into[3], cubic(*into, 0.9))
+        self.assertGreater(abs(just_before[1]), 2.0 * abs(just_before[0]))
 
     def test_sharp_fold_past_a_smooth_node_is_rounded_too(self):
         # れ's second stroke: it climbs at 45 degrees into a smooth top node and
