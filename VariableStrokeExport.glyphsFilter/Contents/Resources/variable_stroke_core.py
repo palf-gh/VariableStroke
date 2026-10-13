@@ -2778,15 +2778,27 @@ def outline_curves(segments, closed=False, cap_start='flat', cap_end='flat',
     _trim_folds(rights, closed, fold_rounds)
     cut, zero = _bevel_breaks(lefts, rights,
                               lambda sides, k: indices[(k+1) % len(sides)], bevels, closed)
-    left_breaks = left_breaks | set(cut['left'])
-    right_breaks = right_breaks | set(cut['right'])
-    left_zero, right_zero = zero['left'] - left_breaks, zero['right'] - right_breaks
 
     def corner_of(node):
         if not corner_radii:
             return None
         node = node % len(corner_radii) if closed else node
         return _corner_spec(corner_radii[node]) if 0 <= node < len(corner_radii) else None
+    # A cut corner folds its inside in: each inner edge runs to its own end
+    # and a line joins them (the outline overlaps itself there and fills
+    # as the two strokes together). Cut where the inner edges cross, a
+    # hairpin whose outgoing stroke is thinner loses the strip of the
+    # incoming one that sticks out past it, and edges almost back to back
+    # may not cross where the join looks at all. Every master cuts the same
+    # corners (see _bevel_breaks), so all have this line; a rounded inner
+    # corner keeps its join.
+    fold_left = {k for k in set(cut['right']) | zero['right']
+                 if corner_of(indices[(k+1) % len(indices)]) is None}
+    fold_right = {k for k in set(cut['left']) | zero['left']
+                  if corner_of(indices[(k+1) % len(indices)]) is None}
+    left_breaks = left_breaks | set(cut['left']) | fold_left
+    right_breaks = right_breaks | set(cut['right']) | fold_right
+    left_zero, right_zero = zero['left'] - left_breaks, zero['right'] - right_breaks
 
     if closed:
         n = len(indices)

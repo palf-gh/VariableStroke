@@ -1008,8 +1008,11 @@ class GeometryTests(unittest.TestCase):
         plain = outline_curves(segments)[0]
         cut = outline_curves(segments, bevels=[None, 'bevel', None])[0]
         zero = outline_curves(segments, bevels=[None, 'zero', None])[0]
-        self.assertEqual(len(cut), len(plain) + 1)
+        # One line cuts the outside, one folds the inside in (each inner
+        # edge runs to its own end; the outline overlaps itself there).
+        self.assertEqual(len(cut), len(plain) + 2)
         self.assertIn(('line', ((-10.0, 100.0), (0.0, 110.0))), cut)
+        self.assertIn(('line', ((0.0, 90.0), (10.0, 100.0))), cut)
         self.assertEqual([kind for kind, _ in zero], [kind for kind, _ in cut])
         self.assertIn(('line', ((-10.0, 110.0), (-10.0, 110.0))), zero)
         # Turning the other way, the right side is outside.
