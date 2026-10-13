@@ -1257,12 +1257,29 @@ def _fold_corner(points, cusp_in, cusp_out, half):
     the chain where the corner's edges leave it (the corner itself when on
     them)."""
     last = len(points) - 1
-    window = 2 * FOLD_SAMPLES
-    for i in range(cusp_in - 1, max(-1, cusp_in - 1 - window), -1):
-        for j in range(cusp_out, min(last, cusp_out + window)):
+    # Only near the fold: a stroke that crosses itself further on (a loop
+    # closing) is no corner of this fold.
+    limit = 4.0 * half
+    lo, travelled = cusp_in, 0.0
+    while lo > 0 and travelled < limit:
+        travelled += length(sub(points[lo], points[lo-1]))
+        lo -= 1
+    hi, travelled = cusp_out, 0.0
+    while hi < last and travelled < limit:
+        travelled += length(sub(points[hi+1], points[hi]))
+        hi += 1
+    window = max(cusp_in - lo, hi - cusp_out)
+    best = None
+    for i in range(cusp_in - 1, lo - 1, -1):
+        for j in range(cusp_out, hi):
             hit = _segment_intersection(points[i], points[i+1], points[j], points[j+1])
             if hit is not None:
-                return hit[0], i + hit[1], j + hit[2]
+                # The crossing nearest the fold on both sides.
+                score = (cusp_in - i - hit[1]) + (j + hit[2] - cusp_out)
+                if best is None or score < best[0]:
+                    best = (score, (hit[0], i + hit[1], j + hit[2]))
+    if best is not None:
+        return best[1]
 
     def heading(index, step):
         # The way the edge runs from a cusp, over a stretch as long as the
