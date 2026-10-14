@@ -22,6 +22,22 @@ PREVIEW_GLYPHS = ('A', 'g')  # what the start window shows
 _SELECTORS = (b'thumbnailOfGlyphsFileAtURL:ofSize:asIcon:',
               b'thumbnailOfFileAtURL:ofSize:asIcon:fallback:')
 _hooked = []
+# Fonts open in Glyphs (real paths), noted on the main thread: while a font is
+# open its stand-in is written again after every save, so one made before
+# the last save still stands (Glyphs may ask for the preview between writing
+# the file and saying it has saved it). A plain set: the previews may be asked
+# for on another thread, which must not touch Glyphs' fonts.
+_open_paths = set()
+
+
+def note_open(path):
+    if path:
+        _open_paths.add(os.path.realpath(path))
+
+
+def note_closed(path):
+    if path:
+        _open_paths.discard(os.path.realpath(path))
 
 
 def _key(path):
@@ -43,9 +59,9 @@ def _stamp(path):
         return None
 
 
-def cached_preview(path):
+def cached_preview(path, any_age=False):
     """The stand-in file for the font at `path`, or None when there is none or
-    the font's file has changed since it was written."""
+    (unless `any_age`) the font's file has changed since it was written."""
     if not path:
         return None
     key = _key(path)
@@ -55,8 +71,19 @@ def cached_preview(path):
             meta = json.load(handle)
     except (OSError, ValueError):
         return None
-    if meta.get('stamp') != _stamp(path) or not os.path.exists(stand_in):
+    if not os.path.exists(stand_in) or (not any_age and meta.get('stamp') != _stamp(path)):
         return None
+    return stand_in
+
+
+def preview_for(path):
+    """The stand-in to draw for the font at `path` (see cached_preview and
+    _open_paths), or None."""
+    if not path:
+        return None
+    stand_in = cached_preview(path)
+    if stand_in is None and os.path.realpath(path) in _open_paths:
+        stand_in = cached_preview(path, any_age=True)
     return stand_in
 
 
@@ -119,6 +146,64 @@ def _url_path(url):
         return None
 
 
+def _list_controllers():
+    """The start window's lists of recent files (Glyphs builds them once, maybe
+    before this plugin is loaded)."""
+    import objc
+    from AppKit import NSApp
+    try:
+        cls = objc.lookUpClass('GSRecentDocumentTabItemViewController')
+    except objc.error:
+        return []
+    found, seen = [], set()
+
+    def walk(controller):
+        if controller is None or id(controller) in seen:
+            return
+        seen.add(id(controller))
+        if controller.isKindOfClass_(cls):
+            found.append(controller)
+        for child in controller.childViewControllers() or ():
+            walk(child)
+        if controller.respondsToSelector_(b'tabViewItems'):
+            for item in controller.tabViewItems() or ():
+                walk(item.viewController())
+    for window in NSApp.windows() or ():
+        walk(window.contentViewController())
+        try:
+            walk(window.windowController().contentViewController())
+        except Exception:
+            pass
+    return found
+
+
+def refresh_start_window():
+    """Have the start window's lists make their previews again, so they come
+    through hook()."""
+    controllers = _list_controllers()
+    for controller in controllers:
+        try:
+            controller.loadData()
+            view = controller.collectionView()
+            if view is not None:
+                view.reloadData()
+        except Exception:
+            print(traceback.format_exc())
+
+
+def schedule_refresh():
+    """Refresh the start window (see refresh_start_window) once Glyphs is done
+    with what it is doing now."""
+    from Foundation import NSOperationQueue
+
+    def refresh():
+        try:
+            refresh_start_window()
+        except Exception:
+            print(traceback.format_exc())
+    NSOperationQueue.mainQueue().addOperationWithBlock_(refresh)
+
+
 def hook():
     """Hand Glyphs the stand-in wherever it makes a preview of a font file that
     has one (see cached_preview)."""
@@ -134,7 +219,7 @@ def hook():
 
         def wrapper(self, url, *rest, original=original):
             try:
-                stand_in = cached_preview(_url_path(url))
+                stand_in = preview_for(_url_path(url))
                 if stand_in is not None:
                     url = NSURL.fileURLWithPath_(stand_in)
             except Exception:

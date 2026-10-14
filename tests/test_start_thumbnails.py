@@ -66,6 +66,19 @@ class StartThumbnailTests(unittest.TestCase):
         os.utime(self.source, (1, 1))
         self.assertIsNone(start_thumbnails.cached_preview(self.source))
 
+    def test_open_font_keeps_its_stand_in_while_it_is_being_saved(self):
+        start_thumbnails.write_preview(Font(['A', 'g'], []), self.source, lambda *args: True)
+        # Glyphs has written the file but not yet said so (the stand-in is
+        # written again then): the open font's stand-in still stands.
+        Path(self.source).write_text('font, saved again')
+        os.utime(self.source, (1, 1))
+        self.assertIsNone(start_thumbnails.preview_for(self.source))
+        start_thumbnails.note_open(self.source)
+        self.addCleanup(start_thumbnails.note_closed, self.source)
+        self.assertIsNotNone(start_thumbnails.preview_for(self.source))
+        start_thumbnails.note_closed(self.source)
+        self.assertIsNone(start_thumbnails.preview_for(self.source))
+
     def test_no_strokes_no_stand_in(self):
         font = Font(['A', 'g'], [])
         start_thumbnails.write_preview(font, self.source, lambda *args: True)

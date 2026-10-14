@@ -16,7 +16,8 @@ from AppKit import (NSBezierPath, NSColor, NSEvent, NSImage, NSMenu, NSMenuItem,
                     NSAttributedString, NSFont, NSFontAttributeName,
                     NSForegroundColorAttributeName)
 from GlyphsApp import (Glyphs, GSCallbackHandler, GSCustomParameter, GSComponent, OFFCURVE,
-                       DOCUMENTOPENED, DOCUMENTWASSAVED, UPDATEINTERFACE, DRAWBACKGROUND,
+                       DOCUMENTOPENED, DOCUMENTWASSAVED, DOCUMENTDIDCLOSE, UPDATEINTERFACE,
+                       DRAWBACKGROUND,
                        CONTEXTMENUCALLBACK, WINDOW_MENU)
 from GlyphsApp.plugins import SelectTool
 from vanilla import (Window, FloatingWindow, Group, SegmentedButton, TextBox, EditText, PopUpButton,
@@ -369,6 +370,7 @@ def _start_window_preview(font, stale_only=False):
         path = font.filepath
     except Exception:
         path = None
+    start_thumbnails.note_open(path)
     if not path or (stale_only and start_thumbnails.cached_preview(path) is not None):
         return
     glyphs = [font.glyphs[name] for name in start_thumbnails.PREVIEW_GLYPHS]
@@ -1667,6 +1669,7 @@ class VariableStrokeTool(SelectTool):
     def start(self):
         Glyphs.addCallback(self._on_document_opened, DOCUMENTOPENED)
         Glyphs.addCallback(self._on_document_saved, DOCUMENTWASSAVED)
+        Glyphs.addCallback(self._on_document_closed, DOCUMENTDIDCLOSE)
         Glyphs.addCallback(self._on_update, UPDATEINTERFACE)
         Glyphs.addCallback(self._draw_centerlines, DRAWBACKGROUND)
         GSCallbackHandler.addCallback_forOperation_(self._menu_callback, CONTEXTMENUCALLBACK)
@@ -1683,14 +1686,6 @@ class VariableStrokeTool(SelectTool):
             print(traceback.format_exc())
         try:
             _hook_compare_string()
-        except Exception:
-            print(traceback.format_exc())
-        try:
-            start_thumbnails.hook()
-        except Exception:
-            print(traceback.format_exc())
-        try:
-            _hook_node_description()
         except Exception:
             print(traceback.format_exc())
         title = _loc('Variable Stroke Settings…', '可変ストローク設定…')
@@ -2112,6 +2107,15 @@ class VariableStrokeTool(SelectTool):
         except Exception:
             print(traceback.format_exc())
         self._sync_export()
+
+    @objc.python_method
+    def _on_document_closed(self, notification=None):
+        try:
+            document = notification.object()
+            url = document.fileURL() if document is not None else None
+            start_thumbnails.note_closed(url.path() if url is not None else None)
+        except Exception:
+            print(traceback.format_exc())
 
     @objc.python_method
     def _on_document_saved(self, notification=None):
@@ -4222,3 +4226,18 @@ class VariableStrokeTool(SelectTool):
     @objc.python_method
     def __file__(self):
         return __file__
+
+
+# Glyphs imports this file at launch but makes the tool (and calls start())
+# only once it needs it, e.g. when a font window opens; the start window shows
+# before that. So the hooks that do not need the tool go in now, and the
+# start window, which may have made its previews already, makes them again.
+try:
+    start_thumbnails.hook()
+    start_thumbnails.schedule_refresh()
+except Exception:
+    print(traceback.format_exc())
+try:
+    _hook_node_description()
+except Exception:
+    print(traceback.format_exc())
