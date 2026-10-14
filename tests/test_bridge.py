@@ -1041,6 +1041,123 @@ class BridgeTests(unittest.TestCase):
                  for item in glyph.layers]
         self.assertEqual(kinds[0], kinds[1])
 
+    def _hook(self, shear=None, reverse=False):
+        # A stem turning at its foot (smooth node 4) into a rising exit.
+        points = [(115, 700, 'line'), (115, 400, 'line'), (115, 330, 'offcurve'),
+                  (180, 285, 'offcurve'), (310, 285, 'curve'), (410, 285, 'offcurve'),
+                  (510, 300, 'offcurve'), (600, 345, 'curve')]
+        if reverse:
+            points = points[::-1]
+            kinds = [kind for _, _, kind in points]
+            # On-curve types belong to the segment arriving at the node.
+            points = [(x, y, 'line' if i == 0 else
+                       ('curve' if kinds[i-1] == 'offcurve' and kind != 'offcurve' else
+                        kind if kind == 'offcurve' else 'line'))
+                      for i, (x, y, kind) in enumerate(points)]
+        path = Path([Node(x, y, kind) for x, y, kind in points])
+        for node in path.nodes:
+            node.userData.clear()
+        if shear is not None:
+            path.nodes[4 if not reverse else 3].userData[bridge.SHEAR_KEY] = shear
+        path.attributes[bridge.STROKE_WIDTH_KEY] = 110
+        path.attributes[bridge.STROKE_HEIGHT_KEY] = 30
+        Layer([path])
+        return path
+
+    def test_shear_leans_the_cross_section_along_the_tangents(self):
+        def foot(path, index=2):
+            edges = bridge._outline(path, bridge._resolve(None, path),
+                                    bridge.path_nodes(path))[1][2]
+            return sorted(edges[index], key=lambda point: -point[1])
+        plain = foot(self._hook())
+        top, bottom = foot(self._hook(20))
+        # Clockwise: the top (inside) node goes right, the bottom one left, each
+        # along its horizontal tangent by tan(20°) x its distance from the centerline.
+        self.assertAlmostEqual(top[1], plain[0][1])
+        self.assertAlmostEqual(bottom[1], plain[1][1])
+        self.assertAlmostEqual(top[0] - plain[0][0], math.tan(math.radians(20)) * 15)
+        self.assertAlmostEqual(bottom[0] - plain[1][0], -math.tan(math.radians(20)) * 15)
+        # Whatever way the path runs, the same lean on the page.
+        self.assertEqual([tuple(round(v, 6) for v in point) for point in foot(
+            self._hook(20, reverse=True), 1)], [tuple(round(v, 6) for v in point)
+                                             for point in (top, bottom)])
+
+    def test_shear_keeps_the_outline_structure_and_smoothness(self):
+        plain = bridge.curves_for_path(self._hook())
+        sheared = bridge.curves_for_path(self._hook(-25))
+        self.assertEqual([[kind for kind, _ in contour] for contour in plain],
+                         [[kind for kind, _ in contour] for contour in sheared])
+        for contour in sheared:
+            for (kind, points), (next_kind, following) in zip(contour, contour[1:] + contour[:1]):
+                if kind == 'cubic' and next_kind == 'cubic':
+                    a = (points[3][0] - points[2][0], points[3][1] - points[2][1])
+                    b = (following[1][0] - following[0][0], following[1][1] - following[0][1])
+                    self.assertAlmostEqual(a[0]*b[1] - a[1]*b[0], 0, places=6)
+        # The stem's corner at the top of the bend is not a smooth outline node.
+        self.assertEqual(plain[0][:1], sheared[0][:1])
+
+    @staticmethod
+    def _thicknesses(path, segments=(1, 2)):
+        """The stroke's thickness across the centerline at points along
+        `segments`: from the centerline to the outline on either side."""
+        import variable_stroke_core as core
+        points = []
+        for kind, p in bridge.curves_for_path(path)[0]:
+            for i in range(64):
+                u = i / 64.0
+                points.append(core.cubic(*p, u) if kind == 'cubic' else
+                              core.add(core.mul(p[0], 1 - u), core.mul(p[1], u)))
+
+        def ray(origin, direction):
+            best = None
+            for a, b in zip(points, points[1:] + points[:1]):
+                r = core.sub(b, a)
+                c = direction[0]*r[1] - direction[1]*r[0]
+                if abs(c) < 1e-12:
+                    continue
+                w = core.sub(a, origin)
+                s = (w[0]*r[1] - w[1]*r[0]) / c
+                u = (w[0]*direction[1] - w[1]*direction[0]) / c
+                if s > 0 and 0 <= u <= 1 and (best is None or s < best):
+                    best = s
+            return best
+        result = []
+        for kind, p, _, _ in bridge.segments_for_path(path)[segments[0]:segments[1] + 1]:
+            for i in range(1, 16):
+                o = core.cubic(*p, i / 16.0)
+                n = core.normal(core.unit(core.cubic_derivative(*p, i / 16.0)))
+                result.append(ray(o, n) + ray(o, core.mul(n, -1)))
+        return result
+
+    def test_shear_keeps_the_thickness_between_the_nodes(self):
+        import variable_stroke_core as core
+        plain = bridge.curves_for_path(self._hook())[0]
+        sheared = bridge.curves_for_path(self._hook(40))[0]
+        # The curves are redrawn onto the stroke as its widths make it, not
+        # dragged along with the nodes: the thickness between the nodes
+        # stays close to what it was.
+        for before, after in zip(self._thicknesses(self._hook()),
+                                 self._thicknesses(self._hook(40))):
+            self.assertAlmostEqual(before, after, delta=max(2.0, 0.06 * before))
+        # At the foot itself the curvature is (about) the same on both sides:
+        # no flat spot or bump where the redrawn curves meet.
+        for index in (1, 4):
+            k_in, k_out = core._end_curvatures(sheared[index], sheared[index + 1])
+            self.assertAlmostEqual(k_in / k_out, 1.0, delta=0.15)
+            self.assertEqual(sheared[index][1][3][1], sheared[index][1][2][1])  # level
+        # A slight lean changes the curves only slightly.
+        slight = bridge.curves_for_path(self._hook(1))[0]
+        for index in (1, 2, 4, 5):
+            self.assertLess(core._curve_distance(plain[index][1], slight[index][1]), 15 * 0.5**2)
+
+    def test_shear_blends_between_masters(self):
+        glyph = types.SimpleNamespace(layers={'a': Layer([self._hook(30)]),
+                                              'b': Layer([self._hook()])},
+                                      userData={bridge.GLYPH_KEY: True})
+        target = Layer([self._hook()])
+        self.assertTrue(bridge.interpolate_layer(target, glyph, {'a': 0.5, 'b': 0.5}))
+        self.assertAlmostEqual(target.paths[0].nodes[4].userData[bridge.SHEAR_KEY], 15)
+
     def test_fold_rounding_of_a_node_reaches_the_outline(self):
         # れ: the inside of the smooth top node folds; its rounding is a node value.
         def outline(rounding):

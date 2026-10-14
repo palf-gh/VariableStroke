@@ -10,7 +10,8 @@ from GlyphsApp import GSPath, GSNode, LINE, CURVE, OFFCURVE
 from variable_stroke_core import (outline_curves, joined_outline, contour_crossings,
                                   crossing_loops, ellipse_nib_edges, sub, add, mul,
                                   _area, _flat_piece, _reverse, _piece_tangent,
-                                  move_outline_vertices,
+                                  move_outline_vertices, shear_outline_vertices,
+                                  cubic_derivative,
                                   outline_direction_at_vertex, DEFAULT_CAP_CURVE)
 import width_profile
 
@@ -96,6 +97,10 @@ MITER_LIMIT_KEY = 'com.codex.VariableStroke.miterLimit'
 # much the outline rounds off the corner the fold leaves, in % (100: the core's
 # FOLD_ROUNDING; 0: the corner itself).
 FOLD_ROUND_KEY = 'com.codex.VariableStroke.foldRound'
+# Per node: how far the cross-section of the stroke leans there, in degrees,
+# clockwise on the page (see shear_outline_vertices); absent: square to the
+# centerline.
+SHEAR_KEY = 'com.codex.VariableStroke.shear'
 # Per bevelled node: the width and height percent after the corner (the
 # segment leaving the node); absent, the stroke goes on as thick as before it.
 AFTER_SCALE_KEY = 'com.codex.VariableStroke.scaleAfter'
@@ -1950,7 +1955,8 @@ def copy_stroke_settings(source, target):
     corner_keys = (CORNER_ON_KEY, CORNER_KEY, CORNER_INNER_KEY,
                    CORNER_TENSION_KEY, CORNER_INNER_TENSION_KEY,
                    CORNER_RATIO_KEY, CORNER_INNER_RATIO_KEY, JOIN_KEY, BEVEL_ANGLE_KEY,
-                   AFTER_SCALE_KEY, AFTER_HEIGHT_SCALE_KEY, MITER_LIMIT_KEY, FOLD_ROUND_KEY)
+                   AFTER_SCALE_KEY, AFTER_HEIGHT_SCALE_KEY, MITER_LIMIT_KEY, FOLD_ROUND_KEY,
+                   SHEAR_KEY)
     for index, (position, item) in enumerate(zip(target_positions, target_nodes)):
         node = item[0]
         width, height, offset_value, rotation_value = samples[index] if matching_nodes else \
@@ -2104,6 +2110,32 @@ def fold_round_of(data):
         return max(value, 0.0) if value is not None and math.isfinite(value) else None
     except (AttributeError, TypeError, ValueError):
         return None
+
+
+def shear_of(data):
+    """A node's shear in degrees (see SHEAR_KEY), or None."""
+    try:
+        value = data.get(SHEAR_KEY) if data is not None else None
+        value = float(value) if value is not None else None
+        return value if value is not None and math.isfinite(value) and value != 0 else None
+    except (AttributeError, TypeError, ValueError):
+        return None
+
+
+def _node_frames(segments, closed):
+    """(centerline point, tangent) at each node of `segments`."""
+    def tangent(kind, points, t):
+        if kind != 'cubic':
+            return sub(points[-1], points[0])
+        direction = cubic_derivative(*points, t)
+        if direction == (0.0, 0.0):
+            direction = sub(points[2], points[0]) if t == 0 else sub(points[3], points[1])
+        return direction
+    frames = [(points[0], tangent(kind, points, 0.0)) for kind, points, _, _ in segments]
+    if not closed and segments:
+        kind, points, _, _ = segments[-1]
+        frames.append((points[-1], tangent(kind, points, 1.0)))
+    return frames
 
 
 def fold_round_specs(path, items=None):
@@ -2489,6 +2521,7 @@ def _gathered_outline(path, defaults, items, hint=(), base_only=False, detect=Fa
         source_handles = [tuple(corner_handle_of(data, side, incoming)
                                 for side in ('left', 'right') for incoming in (True, False))
                           for _, _, _, data in _on_curve(items, closed)]
+        source_shears = tuple(shear_of(data) for _, _, _, data in _on_curve(items, closed))
         independent = any(spec['side'] != 'both' for spec in specs)
         if independent:
             left_specs = [spec for spec in specs if spec['side'] in ('left', 'both')]
@@ -2518,6 +2551,15 @@ def _gathered_outline(path, defaults, items, hint=(), base_only=False, detect=Fa
             fold_rounds = tuple(sorted(
                 (k, source_rounds[index]) for k, index in enumerate(node_map)
                 if index is not None and index in source_rounds)) or None
+        if not any(source_shears):
+            shears = None
+        elif independent:
+            shears = tuple((k, value) for k, value in enumerate(source_shears)
+                           if value is not None)
+        else:
+            shears = tuple((k, source_shears[index]) for k, index in enumerate(node_map)
+                           if index is not None and index < len(source_shears) and
+                           source_shears[index] is not None) or None
         segments = tuple(segments)
         key = ('curves', segments, right_segments, closed, caps, angles, cap_curves,
                defaults.italic_angle, tuple(sorted(breaks['left'])),
@@ -2526,7 +2568,8 @@ def _gathered_outline(path, defaults, items, hint=(), base_only=False, detect=Fa
                tuple(left_map) if independent else (),
                tuple(right_map) if independent else (),
                tuple(None if c is None else tuple(sorted(c.items())) for c in corners),
-               tuple(source_offsets), tuple(source_handles), bevels, crossing, fold_rounds)
+               tuple(source_offsets), tuple(source_handles), bevels, crossing, fold_rounds,
+               shears)
 
     def compute():
         collected, edges, cap_points = [], {}, {}
@@ -2544,6 +2587,11 @@ def _gathered_outline(path, defaults, items, hint=(), base_only=False, detect=Fa
                                   bevels=None if independent else bevels,
                                   right_bevels=bevels if independent else None,
                                   fold_rounds=dict(fold_rounds) if fold_rounds else None)
+        if shears:
+            frames = _node_frames(source_segments if independent else segments, closed)
+            contours = shear_outline_vertices(
+                contours, edges, {k: (angle,) + frames[k] for k, angle in shears
+                                  if k < len(frames)})
         if any(delta != (0.0, 0.0) for pair in source_offsets for delta in pair) or \
                 any(delta != (0.0, 0.0) for handles in source_handles for delta in handles):
             if independent:
@@ -3092,7 +3140,7 @@ def _source_values(path, defaults, key=None):
             corner_handle_of(data, 'left', True), corner_handle_of(data, 'left', False),
             corner_handle_of(data, 'right', True), corner_handle_of(data, 'right', False),
             join_of(data), bevel_angle_of(data), _after_size(data, base_w, base_h),
-            miter_limit_of(data), fold_round_of(data))
+            miter_limit_of(data), fold_round_of(data), shear_of(data))
     values = {'width': base_w, 'height': base_h, 'nodes': nodes}
     if key is not None:
         _remember(_SOURCE_OUTLINES, _SOURCE_OUTLINES_SIZE, key, values)
@@ -3421,7 +3469,7 @@ def _interpolate_layer(layer, glyph, interpolation, glyph_key=None):
             nodes = [(entry['nodes'][position], factor) for entry, factor in values]
             # (w, h, offset, rotation, corner spec or None, 2 offsets, 4 handles, join,
             #  bevel angle, (w, h) after a bevel or None, miter limit or None,
-            #  fold rounding or None)
+            #  fold rounding or None, shear or None)
             node.userData[SCALE_KEY] = sum(f * v[0] for v, f in nodes) / base_w * 100.0
             node.userData[HEIGHT_SCALE_KEY] = sum(f * v[1] for v, f in nodes) / base_h * 100.0
             node.userData[OFFSET_KEY] = sum(f * v[2] for v, f in nodes)
@@ -3468,6 +3516,11 @@ def _interpolate_layer(layer, glyph, interpolation, glyph_key=None):
                     if total > 1e-9 else 100.0
             elif FOLD_ROUND_KEY in node.userData:
                 del node.userData[FOLD_ROUND_KEY]
+            # A shear blends, a source without one square (0°).
+            if any(v[16] is not None for v, _ in nodes):
+                node.userData[SHEAR_KEY] = sum(f * (v[16] or 0.0) for v, f in nodes)
+            elif SHEAR_KEY in node.userData:
+                del node.userData[SHEAR_KEY]
             # An angle set in every source blends; one automatic cut keeps it automatic.
             angles = [(v[12], f) for v, f in nodes]
             if any(v[11] for v, _ in nodes) and all(a is not None for a, _ in angles):

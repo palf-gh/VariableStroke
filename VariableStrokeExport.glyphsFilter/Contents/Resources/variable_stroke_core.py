@@ -59,6 +59,322 @@ def move_outline_vertices(contours, edges, offsets, handle_offsets=None):
     return moved
 
 
+# How far a sheared outline node may slide towards the next outline node
+# along its tangent, as a share of the way there.
+SHEAR_REACH = 0.9
+SHEAR_LIMIT = 80.0  # degrees either way
+# Over this lean (degrees) a sheared node comes to equal curvature on both
+# sides; less, the generated outline's own relation blends into it.
+SHEAR_HARMONIZE = 10.0
+
+
+def shear_outline_vertices(contours, edges, shears):
+    """Lean the cross-section of the stroke at nodes, the way a designer moves
+    the outline nodes of a curve's extreme by hand, and redraw the curves
+    around them so the stroke keeps a natural thickness.
+
+    `shears` maps the edge index to (degrees, centerline point, centerline
+    tangent). Positive leans the cross-section clockwise on the page, whatever
+    the path direction: each side moves along the centerline by tan(angle)
+    times its distance to the left of it, the line across the stroke still
+    running through the centerline node.
+
+    Only a side where the outline runs smoothly through the node moves, along
+    its own tangent: it stays smooth and an extreme stays an extreme. Moving
+    the node alone (or with its handles) would pull the curves on both sides
+    off the stroke: the stroke would swell on one side of the node and pinch
+    on the other, between nodes whose widths say nothing of the kind. So the
+    curves are redrawn, their handles along the same directions:
+      * as close as they can be to the edge as it was (see _refit), so the
+        thickness between the nodes stays what the widths make it;
+      * with the same curvature on both sides of the moved node (see
+        _smooth_node; the first SHEAR_HARMONIZE degrees blend into it from
+        the plain outline's own relation), at the curvature that keeps the
+        curves closest to that edge, so no kink, flat spot or bump shows
+        where they meet.
+    Segments and kinds stay as they are, for interpolation between masters.
+    """
+    moves = {}  # original outline point -> (new point, tangent)
+    for index, (angle, center, tangent) in shears.items():
+        if index not in edges or abs(angle) < 1e-9:
+            continue
+        angle = max(-SHEAR_LIMIT, min(SHEAR_LIMIT, angle))
+        t = unit(tangent)
+        n = normal(t)
+        slope = math.tan(math.radians(angle))
+        for point in edges[index]:
+            ahead = _smooth_through(contours, point, t)
+            if ahead is None:
+                continue
+            u, reach_back, reach_ahead = ahead
+            along = _dot(u, t)
+            if along < 0.2:
+                continue
+            k = slope * _dot(sub(point, center), n) / along
+            k = max(-SHEAR_REACH * reach_back, min(SHEAR_REACH * reach_ahead, k))
+            if abs(k) > 1e-9:
+                moves[point] = (add(point, mul(u, k)), abs(angle))
+    if not moves:
+        return contours
+
+    def found(point):
+        for original, move in moves.items():
+            if length(sub(original, point)) < 1e-5:
+                return move
+        return None
+
+    def target(point):
+        move = found(point)
+        return move[0] if move is not None else None
+
+    result = []
+    for contour in contours:
+        count = len(contour)
+        # The curvature ratio to come to at each moved node.
+        ratios = {}
+        for i in range(count):
+            move = found(contour[i][1][-1])
+            if move is None:
+                continue
+            before = _end_curvatures(contour[i], contour[(i + 1) % count])
+            if before is not None:
+                share = min(1.0, move[1] / SHEAR_HARMONIZE)
+                ratios[i] = (before[0] / before[1]) ** (1.0 - share)
+        out = []
+        for kind, points in contour:
+            start, end = target(points[0]), target(points[-1])
+            if start is None and end is None:
+                out.append((kind, points))
+                continue
+            p0 = start if start is not None else points[0]
+            p3 = end if end is not None else points[-1]
+            if kind != 'cubic':
+                out.append((kind, (p0, p3)))
+                continue
+            out.append(('cubic', _refit(points, p0, p3)))
+        for i, ratio in ratios.items():
+            j = (i + 1) % count
+            out[i], out[j] = _smooth_node(contour[i], contour[j], out[i], out[j], ratio,
+                                          found(contour[i][1][0]) is None,
+                                          found(contour[j][1][-1]) is None)
+        result.append(out)
+    for index, pair in list(edges.items()):
+        edges[index] = tuple(moves[point][0] if point in moves else point for point in pair)
+    return result
+
+
+def _refit(points, p0, p3):
+    """The cubic `points` with its ends moved to p0, p3 along their tangents,
+    its handles (along the same directions) the closest fit to the curve as
+    it was: the rest of the edge stays where the stroke's widths put it."""
+    q0, q1, q2, q3 = points
+    if length(sub(q1, q0)) < EPS or length(sub(q3, q2)) < EPS:
+        return (p0, add(p0, sub(q1, q0)), add(p3, sub(q2, q3)), p3)
+    d0, d1 = unit(sub(q1, q0)), unit(sub(q3, q2))
+    count = 24
+    samples = [cubic(q0, q1, q2, q3, i / float(count)) for i in range(1, count)]
+    run = [0.0]
+    path = [p0] + samples + [p3]
+    for a, b in zip(path, path[1:]):
+        run.append(run[-1] + length(sub(b, a)))
+    us = [r / run[-1] for r in run[1:-1]] if run[-1] > EPS else \
+        [i / float(count) for i in range(1, count)]
+    chord = length(sub(p3, p0))
+    best = None
+    for _ in range(6):
+        controls = _handles(p0, p3, d0, d1, samples, us, chord)
+        curve = [cubic(*controls, i / 64.0) for i in range(65)]
+        nearest = _nearest_along(samples, curve)
+        error = sum(min(_point_segment_distance(p, curve[j], curve[j + 1])
+                        for j in (i - 1, i) if 0 <= j < 64) ** 2
+                    for p, i in zip(samples, nearest))
+        if best is None or error < best[0]:
+            best = (error, controls)
+        us = [min(max(i / 64.0, 1e-3), 1 - 1e-3) for i in nearest]
+    return best[1]
+
+
+def _smooth_node(was_in, was_out, incoming, outgoing, ratio, far_in, far_out):
+    """The two cubics meeting at a moved node, smooth there and as close to
+    the edge as it was. Their curvatures at the node come to `ratio` (1:
+    the same); the curvature they share there is the one, among a range
+    around the present one, whose curves (with their far handles refitted
+    to the edge, where `far_in` / `far_out` allow) stay closest to the
+    curves as they were: the stroke keeps the thickness its widths give it
+    instead of swelling or pinching next to the node."""
+    if _end_curvatures(incoming, outgoing) is None:
+        return incoming, outgoing
+
+    fit_in = [cubic(*was_in[1], i / 24.0) for i in range(1, 24)]
+    fit_out = [cubic(*was_out[1], i / 24.0) for i in range(1, 24)]
+    check = ([cubic(*was_in[1], i / 16.0) for i in range(1, 16)],
+             [cubic(*was_out[1], i / 16.0) for i in range(1, 16)])
+
+    def shaped(mean):
+        a, b = incoming, outgoing
+        for _ in range(2):
+            a, b = _curvature_ratio(a, b, ratio, mean)
+            if far_in:
+                a = ('cubic', _refit_far(fit_in, a[1], True))
+            if far_out:
+                b = ('cubic', _refit_far(fit_out, b[1], False))
+        a, b = _curvature_ratio(a, b, ratio, mean)
+        return a, b
+
+    def error(pair):
+        return sum(_curve_distance(samples, now[1]) for samples, now in zip(check, pair))
+    now = _end_curvatures(incoming, outgoing)
+    center = math.log(math.sqrt(now[0] * now[1]))
+    best = None
+    for step in range(-4, 5):
+        mean = math.exp(center + step * math.log(4.0) / 4.0)
+        pair = shaped(mean)
+        value = error(pair)
+        if best is None or value < best[0]:
+            best = (value, mean, pair)
+    lo, hi = math.log(best[1]) - math.log(4.0) / 4.0, math.log(best[1]) + math.log(4.0) / 4.0
+    a, b = hi - (hi - lo) * 0.618, lo + (hi - lo) * 0.618
+    error_a, error_b = error(shaped(math.exp(a))), error(shaped(math.exp(b)))
+    for _ in range(8):  # golden section around the best step
+        if error_a < error_b:
+            hi, b, error_b = b, a, error_a
+            a = hi - (hi - lo) * 0.618
+            error_a = error(shaped(math.exp(a)))
+        else:
+            lo, a, error_a = a, b, error_b
+            b = lo + (hi - lo) * 0.618
+            error_b = error(shaped(math.exp(b)))
+    pair = shaped(math.exp((lo + hi) / 2.0))
+    return pair if error(pair) <= best[0] else best[2]
+
+
+def _curve_distance(was, now, count=16):
+    """Sum of squared distances to the cubic `now` from points along `was`
+    (a cubic, or its points already)."""
+    steps = 32
+    curve = [cubic(*now, i / float(steps)) for i in range(steps + 1)]
+    samples = was if len(was) != 4 else [cubic(*was, i / float(count)) for i in range(1, count)]
+    total = 0.0
+    for p, i in zip(samples, _nearest_along(samples, curve, window=12)):
+        total += min(_point_segment_distance(p, curve[j], curve[j + 1])
+                     for j in (i - 1, i) if 0 <= j < steps) ** 2
+    return total
+
+
+# Bernstein weights at 1/24 .. 23/24: (v^3, 3v^2u, 3vu^2, u^3).
+_FIT_WEIGHTS = tuple(((1 - i/24.0)**3, 3*(1 - i/24.0)**2*(i/24.0),
+                      3*(1 - i/24.0)*(i/24.0)**2, (i/24.0)**3) for i in range(1, 24))
+
+
+def _refit_far(targets, controls, start):
+    """`controls` with the handle at its start (`start`) or end refitted to
+    `targets`, the points at 1/24 .. 23/24 of the curve it was (least squares
+    along the handle's direction), the other kept."""
+    p0, p1, p2, p3 = controls
+    anchor, handle, other = (p0, p1, p2) if start else (p3, p2, p1)
+    dx, dy = handle[0] - anchor[0], handle[1] - anchor[1]
+    reach = math.hypot(dx, dy)
+    if reach < EPS:
+        return controls
+    dx, dy = dx / reach, dy / reach
+    top = bottom = 0.0
+    for (b0, b1, b2, b3), (tx, ty) in zip(_FIT_WEIGHTS, targets):
+        w, w_other = (b1, b2) if start else (b2, b1)
+        rx = tx - (b0*p0[0] + b3*p3[0] + w*anchor[0] + w_other*other[0])
+        ry = ty - (b0*p0[1] + b3*p3[1] + w*anchor[1] + w_other*other[1])
+        top += w * (rx*dx + ry*dy)
+        bottom += w * w
+    reach = min(max(top / bottom, 0.0), 3.0 * length(sub(p3, p0)))
+    moved = (anchor[0] + dx*reach, anchor[1] + dy*reach)
+    return (p0, moved, p2, p3) if start else (p0, p1, moved, p3)
+
+
+def _tunni(p0, d0, p3, d1):
+    """Distances from p0 along d0 and back from p3 along d1 to where the two
+    tangent lines meet, or None when they do not meet ahead of both."""
+    cross = d0[0]*d1[1] - d0[1]*d1[0]
+    if abs(cross) < 1e-6:
+        return None
+    w = sub(p3, p0)
+    a = (w[0]*d1[1] - w[1]*d1[0]) / cross
+    b = (d0[0]*w[1] - d0[1]*w[0]) / cross
+    return (a, b) if a > EPS and b > EPS else None
+
+
+def _end_curvatures(incoming, outgoing):
+    """(curvature at the end of `incoming`, at the start of `outgoing`) where
+    two cubics meet smoothly bending the same way, each up to the same factor
+    (the far handle's distance from the tangent over the near handle
+    squared), or None."""
+    if incoming[0] != 'cubic' or outgoing[0] != 'cubic':
+        return None
+    a0, a1, a2, a3 = incoming[1]
+    b0, b1, b2, b3 = outgoing[1]
+    h_in, h_out = length(sub(a3, a2)), length(sub(b1, b0))
+    if h_in < EPS or h_out < EPS:
+        return None
+    u = unit(add(sub(a3, a2), sub(b1, b0)))
+    e_in = u[0]*(a1[1]-a3[1]) - u[1]*(a1[0]-a3[0])
+    e_out = u[0]*(b2[1]-b0[1]) - u[1]*(b2[0]-b0[0])
+    if e_in * e_out <= 0:
+        return None  # an inflection or a flat side: nothing to match
+    return (abs(e_in) / (h_in*h_in), abs(e_out) / (h_out*h_out))
+
+
+def _curvature_ratio(incoming, outgoing, ratio, mean=None):
+    """Set the handles at the node between two cubics so their curvatures
+    there come to `ratio` (incoming over outgoing; 1: harmonized) at the
+    geometric mean `mean` (default: as now); each handle changes at most by
+    half or double and stays short of Tunni's point."""
+    now = _end_curvatures(incoming, outgoing)
+    if now is None:
+        return incoming, outgoing
+    if mean is None:
+        mean = math.sqrt(now[0] * now[1])
+    goal_in, goal_out = mean * math.sqrt(ratio), mean / math.sqrt(ratio)
+    a0, a1, a2, a3 = incoming[1]
+    b0, b1, b2, b3 = outgoing[1]
+    h_in, h_out = length(sub(a3, a2)), length(sub(b1, b0))
+    # curvature ~ e / h^2, e unchanged: h = h_now * sqrt(k_now / k_goal)
+    new_in = h_in * min(2.0, max(0.5, math.sqrt(now[0] / goal_in)))
+    new_out = h_out * min(2.0, max(0.5, math.sqrt(now[1] / goal_out)))
+    d_in, d_out = unit(sub(a3, a2)), unit(sub(b1, b0))
+    reach_in = _tunni(a0, unit(sub(a1, a0)), a3, d_in) if length(sub(a1, a0)) > EPS else None
+    reach_out = _tunni(b0, d_out, b3, unit(sub(b3, b2))) if length(sub(b3, b2)) > EPS \
+        else None
+    if reach_in is not None:
+        new_in = min(new_in, 0.95 * reach_in[1])
+    if reach_out is not None:
+        new_out = min(new_out, 0.95 * reach_out[0])
+    return (('cubic', (a0, a1, sub(a3, mul(d_in, new_in)), a3)),
+            ('cubic', (b0, add(b0, mul(d_out, new_out)), b2, b3)))
+
+
+def _smooth_through(contours, point, tangent):
+    """(unit tangent along `tangent`, way back, way ahead) where the outline runs
+    smoothly through `point`, measured along the tangent to the neighbouring
+    outline nodes; None at a corner of the outline (or no node there)."""
+    for contour in contours:
+        count = len(contour)
+        for i, (kind, points) in enumerate(contour):
+            if length(sub(points[-1], point)) >= 1e-5:
+                continue
+            following = contour[(i + 1) % count]
+            if length(sub(following[1][0], point)) >= 1e-5:
+                return None
+            incoming = outline_direction_at_vertex([[(kind, points)]], point, True)
+            outgoing = outline_direction_at_vertex([[following]], point, False)
+            if incoming is None or outgoing is None or _dot(incoming, outgoing) < 0.9995:
+                return None
+            u = unit(add(incoming, outgoing))
+            back = abs(_dot(sub(points[0], point), u))
+            ahead = abs(_dot(sub(following[1][-1], point), u))
+            if _dot(u, tangent) < 0:
+                u, back, ahead = mul(u, -1.0), ahead, back
+            return u, back, ahead
+    return None
+
+
 def outline_direction_at_vertex(contours, point, prefer_incoming=True):
     """Prefer a touching line; otherwise use the nearest Bézier control handle."""
     lines, curves = [], []
