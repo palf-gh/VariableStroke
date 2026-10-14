@@ -4036,12 +4036,17 @@ class VariableStrokeTool(SelectTool):
             index = (0 if drag['side'] == 'left' else 2) + (0 if drag['incoming'] else 1)
             delta = (loc.x-start[0], loc.y-start[1])
             tangent = drag['tangent']
-            if tangent is not None and not (NSEvent.modifierFlags() & NSEventModifierFlagOption):
+            along = tangent is not None and \
+                not (NSEvent.modifierFlags() & NSEventModifierFlagOption)
+            if along:
                 distance = delta[0]*tangent[0] + delta[1]*tangent[1]
                 delta = (distance*tangent[0], distance*tangent[1])
+            # The third value says how it was made, so a move along the
+            # tangent follows the tangent when the centerline turns later
+            # (see move_outline_vertices); 0 keeps a free move as it is.
             drag['node'].userData[CORNER_HANDLE_KEYS[index]] = [
                 round(initial[0] + delta[0], 2),
-                round(initial[1] + delta[1], 2)]
+                round(initial[1] + delta[1], 2), 1 if along else 0]
             _invalidate(drag['layer'], [drag['path']])
             self._redraw()
             return

@@ -1175,6 +1175,26 @@ class BridgeTests(unittest.TestCase):
         ends = (36.0, 32.1)
         self.assertLess(max(sheared), max(ends + tuple(plain)) + 2.5)
 
+    def test_handle_move_along_a_smooth_node_follows_the_tangent(self):
+        # A handle lengthened along the tangent of the foot (Shift-drag) stays
+        # on it after the centerline there turns; a free move (Option) stays
+        # as it was made.
+        import variable_stroke_core as core
+
+        def bend(move):
+            path = self._hook()
+            path.nodes[5].position.y += 12  # the centerline turns at the foot
+            path.nodes[3].position.y -= 12
+            path.nodes[4].userData[bridge.CORNER_HANDLE_KEYS[0]] = move
+            contour = bridge.curves_for_path(path)[0]
+            incoming, outgoing = contour[1][1], contour[2][1]
+            a = core.unit(core.sub(incoming[3], incoming[2]))
+            b = core.unit(core.sub(outgoing[1], outgoing[0]))
+            return a[0]*b[1] - a[1]*b[0]
+        self.assertAlmostEqual(bend([-40.0, 0.0, 1]), 0.0, places=6)
+        self.assertAlmostEqual(bend([-40.0, 0.0]), 0.0, places=6)  # older, nearly along
+        self.assertNotAlmostEqual(bend([-40.0, 0.0, 0]), 0.0, places=3)
+
     def test_shear_blends_between_masters(self):
         glyph = types.SimpleNamespace(layers={'a': Layer([self._hook(30)]),
                                               'b': Layer([self._hook()])},

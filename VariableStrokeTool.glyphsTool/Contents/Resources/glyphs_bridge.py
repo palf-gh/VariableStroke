@@ -230,6 +230,19 @@ def corner_handle_of(data, side, incoming):
         return (0.0, 0.0)
 
 
+def corner_handle_mode_of(data, side, incoming):
+    """How a handle move was made: 'along' the tangent of a smooth node,
+    'free', or None (older moves: see move_outline_vertices)."""
+    key = CORNER_HANDLE_KEYS[(0 if side == 'left' else 2) + (0 if incoming else 1)]
+    value = data.get(key)
+    try:
+        if value is not None and len(value) > 2:
+            return 'along' if float(value[2]) else 'free'
+    except (TypeError, ValueError):
+        pass
+    return None
+
+
 def path_nodes(path):
     """[(node, type, (x, y), data)] for every node of a path, read once; `data`
     (see node_data) only for on-curve nodes, None for handles."""
@@ -2518,7 +2531,8 @@ def _gathered_outline(path, defaults, items, hint=(), base_only=False, detect=Fa
             crossing = crossing_spec(path)
         source_offsets = [(corner_offset_of(data, 'left'), corner_offset_of(data, 'right'))
                           for _, _, _, data in _on_curve(items, closed)]
-        source_handles = [tuple(corner_handle_of(data, side, incoming)
+        source_handles = [tuple(corner_handle_of(data, side, incoming) +
+                                (corner_handle_mode_of(data, side, incoming),)
                                 for side in ('left', 'right') for incoming in (True, False))
                           for _, _, _, data in _on_curve(items, closed)]
         source_shears = tuple(shear_of(data) for _, _, _, data in _on_curve(items, closed))
@@ -2593,7 +2607,7 @@ def _gathered_outline(path, defaults, items, hint=(), base_only=False, detect=Fa
                 contours, edges, {k: (angle,) + frames[k] for k, angle in shears
                                   if k < len(frames)})
         if any(delta != (0.0, 0.0) for pair in source_offsets for delta in pair) or \
-                any(delta != (0.0, 0.0) for handles in source_handles for delta in handles):
+                any(delta[:2] != (0.0, 0.0) for handles in source_handles for delta in handles):
             if independent:
                 # Independent sides report their edges by original node index.
                 offsets = dict(enumerate(source_offsets))

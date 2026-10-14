@@ -20,11 +20,24 @@ def normal(a): return (-a[1], a[0])
 def _dot(a, b): return a[0]*b[0] + a[1]*b[1]
 
 
+# A stored handle move older than its mode (see move_outline_vertices) that
+# leans off the outline's tangent by less than this was made along it.
+HANDLE_ALONG_TOLERANCE = math.sin(math.radians(25.0))
+
+
 def move_outline_vertices(contours, edges, offsets, handle_offsets=None):
     """Move individual sharp outline vertices and their adjacent cubic handles.
 
-    `offsets` maps the edge index to (left delta, right delta). The number and
-    kinds of segments stay fixed for interpolation between masters.
+    `offsets` maps the edge index to (left delta, right delta). `handle_offsets`
+    maps it to the four handle moves (left in, left out, right in, right out),
+    each (dx, dy) or (dx, dy, mode): 'along' for a move made along the
+    tangent of a smooth node, 'free' for one made freely. Where the outline
+    runs smoothly through the vertex, a move along the tangent follows the
+    tangent as it is now (it may have turned since the move was made: the
+    centerline was edited), so the node stays smooth; a move without a mode
+    counts as along when it leans off the tangent by less than
+    HANDLE_ALONG_TOLERANCE. The number and kinds of segments stay fixed for
+    interpolation between masters.
     """
     handle_offsets = handle_offsets or {}
     targets = []
@@ -33,8 +46,11 @@ def move_outline_vertices(contours, edges, offsets, handle_offsets=None):
         handles = handle_offsets.get(index, ((0, 0),) * 4)
         for side, (point, delta) in enumerate(zip(pair, vertex_pair)):
             incoming, outgoing = handles[side*2:side*2+2]
-            if any(value for vector in (delta, incoming, outgoing) for value in vector):
-                targets.append((point, delta, incoming, outgoing))
+            if any(value for vector in (delta, incoming[:2], outgoing[:2]) for value in vector):
+                smooth = _smooth_through(contours, point, (1.0, 0.0))
+                direction = smooth[0] if smooth is not None else None
+                targets.append((point, delta, _along(incoming, direction),
+                                _along(outgoing, direction)))
     if not targets:
         return contours
     moved = []
@@ -545,6 +561,20 @@ def _curvature_ratio(incoming, outgoing, ratio, mean=None):
         new_out = min(new_out, 0.95 * reach_out[0])
     return (('cubic', (a0, a1, sub(a3, mul(d_in, new_in)), a3)),
             ('cubic', (b0, add(b0, mul(d_out, new_out)), b2, b3)))
+
+
+def _along(move, direction):
+    """A stored handle move (see move_outline_vertices) as (dx, dy) to apply,
+    `direction` the outline's tangent at a smooth vertex or None."""
+    vector = (float(move[0]), float(move[1]))
+    mode = move[2] if len(move) > 2 else None
+    if direction is None or mode == 'free' or vector == (0.0, 0.0):
+        return vector
+    along = _dot(vector, direction)
+    if mode != 'along' and abs(vector[0]*direction[1] - vector[1]*direction[0]) > \
+            HANDLE_ALONG_TOLERANCE * length(vector):
+        return vector
+    return mul(direction, along)
 
 
 def _smooth_through(contours, point, tangent):
