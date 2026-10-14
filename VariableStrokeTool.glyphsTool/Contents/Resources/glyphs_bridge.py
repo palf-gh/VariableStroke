@@ -62,6 +62,9 @@ _CORNER_PAIRS = {'radius': (CORNER_KEY, CORNER_INNER_KEY),
 MASTER_WIDTH_KEY = 'com.codex.VariableStroke.defaultWidth'  # per master, font units
 MASTER_HEIGHT_KEY = 'com.codex.VariableStroke.defaultHeight'  # per master; unset = width
 MASTER_ANGLE_KEY = 'com.codex.VariableStroke.defaultAngle'  # ellipse axes on page
+# Per master, for lowercase glyphs; unset = the master's own width / height.
+MASTER_LC_WIDTH_KEY = 'com.codex.VariableStroke.lowercaseWidth'
+MASTER_LC_HEIGHT_KEY = 'com.codex.VariableStroke.lowercaseHeight'
 CAP_START_KEY = 'com.codex.VariableStroke.capStart'
 CAP_END_KEY = 'com.codex.VariableStroke.capEnd'
 CAP_START_ANGLE_KEY = 'com.codex.VariableStroke.capStartAngle'  # degrees, 'angle' caps
@@ -314,15 +317,55 @@ def master_default_angle(master):
         return 0.0
 
 
-def master_defaults(master):
+def master_lowercase_width(master):
+    """Default stroke width of a master's lowercase glyphs, or None to follow
+    the master's default width."""
+    try:
+        return _number(master.userData.get(MASTER_LC_WIDTH_KEY), None)
+    except AttributeError:
+        return None
+
+
+def master_lowercase_height(master):
+    """Default stroke height of a master's lowercase glyphs, or None to follow
+    the master's default height."""
+    try:
+        return _number(master.userData.get(MASTER_LC_HEIGHT_KEY), None)
+    except AttributeError:
+        return None
+
+
+GS_LOWERCASE = 2  # GSGlyph.case
+
+
+def is_lowercase(glyph):
+    """Whether a glyph takes its master's lowercase defaults."""
+    if glyph is None:
+        return False
+    try:
+        if glyph.case == GS_LOWERCASE:
+            return True
+    except Exception:
+        pass
+    try:
+        return glyph.subCategory == 'Lowercase'
+    except Exception:
+        return False
+
+
+def master_defaults(master, lowercase=False):
     if master is None:
         return StrokeDefaults()
     try:
         angle = float(master.italicAngle or 0.0)
     except (AttributeError, TypeError, ValueError):
         angle = 0.0
-    return StrokeDefaults(master_default_width(master), master_default_height(master), angle,
-                          master_default_angle(master))
+    width, height = master_default_width(master), master_default_height(master)
+    if lowercase:
+        lc_width, lc_height = master_lowercase_width(master), master_lowercase_height(master)
+        width = width if lc_width is None else lc_width
+        height = height if lc_height is None else lc_height
+    return StrokeDefaults(width, height, angle, master_default_angle(master))
 
 
 def layer_master(layer):
@@ -339,8 +382,13 @@ def layer_master(layer):
     return master
 
 
+def layer_is_lowercase(layer):
+    return is_lowercase(getattr(layer, 'parent', None))
+
+
 def layer_defaults(layer):
-    defaults = master_defaults(layer_master(layer)) if layer is not None else StrokeDefaults()
+    defaults = master_defaults(layer_master(layer), layer_is_lowercase(layer)) \
+        if layer is not None else StrokeDefaults()
     if layer is not None:
         try:
             value = layer.userData.get(LAYER_NIB_ANGLE_KEY)

@@ -1627,6 +1627,26 @@ class BridgeTests(unittest.TestCase):
         self.assertEqual(bridge.stroke_width(path), 120)
         self.assertFalse(bridge.normalize_layer(layer, True) and bridge.has_width_override(path))
 
+    def test_lowercase_glyphs_use_lowercase_defaults(self):
+        master = types.SimpleNamespace(userData={bridge.MASTER_WIDTH_KEY: 80,
+                                                 bridge.MASTER_HEIGHT_KEY: 20,
+                                                 bridge.MASTER_LC_WIDTH_KEY: 60})
+        path = Path([Node(0, 0), Node(100, 0)])
+        for node in path.nodes:
+            node.userData = {}
+        layer = Layer([path])
+        layer.master = master
+        layer.parent = types.SimpleNamespace(case=bridge.GS_LOWERCASE, userData={})
+        self.assertEqual((bridge.stroke_width(path), bridge.stroke_height(path)), (60, 20))
+        master.userData[bridge.MASTER_LC_HEIGHT_KEY] = 15
+        self.assertEqual(bridge.stroke_height(path), 15)
+        layer.parent = types.SimpleNamespace(case=1, subCategory=None, userData={})
+        self.assertEqual((bridge.stroke_width(path), bridge.stroke_height(path)), (80, 20))
+        layer.parent = types.SimpleNamespace(subCategory='Lowercase', userData={})
+        self.assertEqual(bridge.stroke_width(path), 60)
+        path.attributes[bridge.STROKE_WIDTH_KEY] = 50
+        self.assertEqual(bridge.stroke_width(path), 50)
+
     def test_height_and_offset_per_node(self):
         master = types.SimpleNamespace(userData={bridge.MASTER_WIDTH_KEY: 80,
                                                  bridge.MASTER_HEIGHT_KEY: 20}, italicAngle=10)

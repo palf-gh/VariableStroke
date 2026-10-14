@@ -40,7 +40,9 @@ from glyphs_bridge import (CAP_START_KEY, CAP_END_KEY, CAP_START_ANGLE_KEY, CAP_
                            CORNER_HANDLE_KEYS,
                            ROTATION_KEY, MASTER_HEIGHT_KEY, MASTER_ANGLE_KEY,
                            LAYER_NIB_ANGLE_KEY, master_default_height, master_default_angle,
-                           master_defaults,
+                           master_defaults, MASTER_LC_WIDTH_KEY, MASTER_LC_HEIGHT_KEY,
+                           master_lowercase_width, master_lowercase_height,
+                           layer_is_lowercase,
                            layer_defaults, stroke_height, has_height_override, offset, rotation,
                            edges_for_path, corner_slide_direction, corner_bezier_controls,
                            selected_nib_nodes, ellipse_cap_nodes,
@@ -864,7 +866,7 @@ class VariableStrokeLayerProcessor(NSObject):
             state = _glyph_state(source)
             if state is False or not any(enabled(path) for path in source.paths) and not state:
                 return
-            defaults = master_defaults(_master_for(source))
+            defaults = master_defaults(_master_for(source), layer_is_lowercase(source))
             outline = source.copy()
             if expand_layer(outline, state, defaults):
                 request.setObject_forKey_(outline, 'outlineLayer')
@@ -890,7 +892,7 @@ class VariableStrokeLayerProcessor(NSObject):
             paths = list(layer.paths)
             if not paths or (state is None and not any(enabled(path) for path in paths)):
                 return True, None
-            defaults = master_defaults(_master_for(layer))
+            defaults = master_defaults(_master_for(layer), layer_is_lowercase(layer))
             try:
                 italic = layer.userData.get(LAYER_ITALIC_KEY)
             except Exception:
@@ -1099,18 +1101,24 @@ class VariableStrokeSettings(object):
 
     def __init__(self):
         self.font = None
-        self.w = FloatingWindow((440, 260), _loc('Variable Stroke Settings', '可変ストローク設定'),
-                                minSize=(380, 190))
-        self.w.note = TextBox((12, 10, -12, 42), _loc(
+        self.w = FloatingWindow((600, 270), _loc('Variable Stroke Settings', '可変ストローク設定'),
+                                minSize=(520, 200))
+        self.w.note = TextBox((12, 10, -12, 50), _loc(
             'Paths without their own width use the default of their master. '
-            'Empty height = 40 units. Nib angle rotates width and height on the page.',
+            'Empty height = 40 units. Lowercase glyphs use the lowercase width and '
+            'height; empty = the master default. Nib angle rotates width and height on the page.',
             'パスごとの線幅を指定していないストロークは、マスターの既定値に従います。'
-            '高さが空欄なら40ユニット。角度で幅と高さの軸を回転します。'),
+            '高さが空欄なら40ユニット。小文字のグリフは小文字幅・小文字高さに従い、'
+            '空欄なら既定幅・既定高さと同じです。角度で幅と高さの軸を回転します。'),
             sizeStyle='small')
-        self.w.masters = List((12, 56, -12, -44), [], columnDescriptions=[
+        self.w.masters = List((12, 64, -12, -44), [], columnDescriptions=[
             {'title': _loc('Master', 'マスター'), 'key': 'name', 'editable': False},
             {'title': _loc('Width', '既定幅'), 'key': 'width', 'editable': True, 'width': 70},
             {'title': _loc('Height', '既定高さ'), 'key': 'height', 'editable': True, 'width': 70},
+            {'title': _loc('LC Width', '小文字幅'), 'key': 'lcWidth', 'editable': True,
+             'width': 70},
+            {'title': _loc('LC Height', '小文字高さ'), 'key': 'lcHeight', 'editable': True,
+             'width': 70},
             {'title': _loc('Angle', '既定角度'), 'key': 'angle', 'editable': True, 'width': 70}],
             editCallback=self.edited, allowsMultipleSelection=True)
         self.w.reset = Button((12, -34, -12, 22),
@@ -1140,8 +1148,12 @@ class VariableStrokeSettings(object):
             rows = []
             for master in (font.masters if font else []):
                 height = master_default_height(master)
+                lc_width, lc_height = master_lowercase_width(master), \
+                    master_lowercase_height(master)
                 rows.append({'name': master.name, 'width': '%g' % master_default_width(master),
                              'height': '%g' % height if height is not None else '',
+                             'lcWidth': '%g' % lc_width if lc_width is not None else '',
+                             'lcHeight': '%g' % lc_height if lc_height is not None else '',
                              'angle': '%g' % master_default_angle(master),
                              'id': master.id})
             self.w.masters.set(rows)
@@ -1177,6 +1189,11 @@ class VariableStrokeSettings(object):
                 else:
                     master.userData[MASTER_HEIGHT_KEY] = height
                 changed = True
+            for key, store, current in (('lcWidth', MASTER_LC_WIDTH_KEY, master_lowercase_width),
+                                        ('lcHeight', MASTER_LC_HEIGHT_KEY,
+                                         master_lowercase_height)):
+                if self._set_optional(master, item.get(key), store, current):
+                    changed = True
             try:
                 angle = float(item['angle']) % 180.0
             except (TypeError, ValueError):
@@ -1187,6 +1204,25 @@ class VariableStrokeSettings(object):
             if changed:
                 self._invalidate_master(master.id)
         Glyphs.redraw()
+
+    @staticmethod
+    def _set_optional(master, text, key, current):
+        """Store an optional size typed into the list (empty: unset). Returns
+        whether it changed; a value out of range leaves it as it is."""
+        text = str(text or '').strip()
+        try:
+            value = float(text) if text else None
+        except ValueError:
+            return False
+        if value is not None and not 0 < value < 10000:
+            return False
+        if value == current(master):
+            return False
+        if value is None:
+            del master.userData[key]
+        else:
+            master.userData[key] = value
+        return True
 
     def resetOverrides(self, sender):
         if self.font is None:
