@@ -378,6 +378,40 @@ def _start_window_preview(font, stale_only=False):
     start_thumbnails.write_preview(font, path, _expand_for_preview)
 
 
+# -[GSNode elementString] writes the node and the text of its userData into a
+# fixed buffer of about 590 bytes without checking the length, and
+# -[GSNode description] calls it; Glyphs' undo manager asks for a node's
+# description whenever it records a change to the node. With the stroke
+# settings' long keys, a node with a dozen or so of them overflows that buffer
+# and Glyphs aborts. Such nodes are described briefly instead.
+_SAFE_DESCRIPTION = 400  # characters of userData text that still fit
+_hooked_description = []
+
+
+def _hook_node_description():
+    if _hooked_description:
+        return
+    cls = objc.lookUpClass('GSNode')
+    name = b'description'
+    original = cls.instanceMethodForSelector_(name)
+
+    def wrapper(self, original=original):
+        try:
+            data = self.pyobjc_instanceMethods.userData()
+            if data is not None and data.count() > 4 and \
+                    data.description().length() > _SAFE_DESCRIPTION:
+                position = self.pyobjc_instanceMethods.position()
+                return '<GSNode %g %g, %d userData keys>' % (position.x, position.y,
+                                                             data.count())
+        except Exception:
+            pass
+        return original(self)
+
+    objc.classAddMethod(cls, name, objc.selector(wrapper, selector=name,
+                                                 signature=original.signature))
+    _hooked_description.append(True)
+
+
 def _invalidate(layer, paths=None):
     """Tell Glyphs the layer changed so it prepares its preview outline again."""
     for path in (paths if paths is not None else list(layer.paths)):
@@ -1653,6 +1687,10 @@ class VariableStrokeTool(SelectTool):
             print(traceback.format_exc())
         try:
             start_thumbnails.hook()
+        except Exception:
+            print(traceback.format_exc())
+        try:
+            _hook_node_description()
         except Exception:
             print(traceback.format_exc())
         title = _loc('Variable Stroke Settings…', '可変ストローク設定…')
