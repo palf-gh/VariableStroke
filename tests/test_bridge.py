@@ -1150,6 +1150,31 @@ class BridgeTests(unittest.TestCase):
         for index in (1, 2, 4, 5):
             self.assertLess(core._curve_distance(plain[index][1], slight[index][1]), 15 * 0.5**2)
 
+    def test_shear_does_not_swell_the_stroke_past_its_node(self):
+        # g's link (Wide ExtraLight Low-Contrast): sheared at its left side,
+        # the stroke beyond the node swelled thicker than either end.
+        def link(shear):
+            points = [(146, 107, 'line', {bridge.HEIGHT_SCALE_KEY: 81.7,
+                                          bridge.ROTATION_KEY: 33.2}),
+                      (113, 89, 'offcurve'), (91, 70, 'offcurve'),
+                      (91, 49, 'curve', {bridge.ROTATION_KEY: 28.3}),
+                      (91, 12, 'offcurve'), (147, -6, 'offcurve'),
+                      (305, -8, 'curve', {bridge.ROTATION_KEY: 37.1}),
+                      (463, -10, 'offcurve'), (531, -40, 'offcurve'), (531, -102, 'curve')]
+            path = Path([Node(x, y, kind) for x, y, kind, *_ in points])
+            for node, item in zip(path.nodes, points):
+                node.userData = dict(item[3]) if len(item) > 3 else {}
+            if shear:
+                path.nodes[3].userData[bridge.SHEAR_KEY] = shear
+            path.attributes[bridge.STROKE_WIDTH_KEY] = 38
+            path.attributes[bridge.STROKE_HEIGHT_KEY] = 28
+            Layer([path])
+            return path
+        plain, sheared = self._thicknesses(link(None), (1, 1)), \
+            self._thicknesses(link(-16), (1, 1))
+        ends = (36.0, 32.1)
+        self.assertLess(max(sheared), max(ends + tuple(plain)) + 2.5)
+
     def test_shear_blends_between_masters(self):
         glyph = types.SimpleNamespace(layers={'a': Layer([self._hook(30)]),
                                               'b': Layer([self._hook()])},

@@ -127,8 +127,8 @@ def shear_outline_vertices(contours, edges, shears):
         move = found(point)
         return move[0] if move is not None else None
 
-    result = []
-    for contour in contours:
+    result, shapers = [], {}  # (contour, piece arriving at the node): shaper
+    for c, contour in enumerate(contours):
         count = len(contour)
         # The curvature ratio to come to at each moved node.
         ratios = {}
@@ -154,13 +154,84 @@ def shear_outline_vertices(contours, edges, shears):
             out.append(('cubic', _refit(points, p0, p3)))
         for i, ratio in ratios.items():
             j = (i + 1) % count
-            out[i], out[j] = _smooth_node(contour[i], contour[j], out[i], out[j], ratio,
-                                          found(contour[i][1][0]) is None,
-                                          found(contour[j][1][-1]) is None)
+            shaper = _NodeShaper(contour[i], contour[j], out[i], out[j], ratio,
+                                 found(contour[i][1][0]) is None,
+                                 found(contour[j][1][-1]) is None)
+            shaper.search()
+            if shaper.mean is not None:
+                out[i], out[j] = shaper.pair
+                shapers[(c, i)] = shaper
         result.append(out)
+    _balance_sides(contours, result, edges, moves, shapers)
     for index, pair in list(edges.items()):
         edges[index] = tuple(moves[point][0] if point in moves else point for point in pair)
     return result
+
+
+def _balance_sides(contours, result, edges, moves, shapers):
+    """Where both sides of a node moved, choose their curvatures at the node
+    and the lengths of their far handles together (see _StrokeBand.score):
+    the stroke between this node and the next on either side should neither
+    swell nor pinch beyond what its ends give it, nor slide off its
+    centerline (the two edges straying the same way). Keeping the node an
+    extreme leaves a little of both close to the node."""
+    at = {}
+    for (c, i), shaper in shapers.items():
+        node = result[c][i][1][-1]
+        for original, (moved, _) in moves.items():
+            if length(sub(moved, node)) < 1e-5:
+                at[original] = (c, i)
+    for pair in edges.values():
+        keys = [at.get(point) for point in pair]
+        if None in keys:
+            continue
+        (ca, ia), (cb, ib) = keys
+        a, b = shapers[(ca, ia)], shapers[(cb, ib)]
+        # Each edge piece next to the node with the other side's piece over
+        # the same stretch: the one whose far end is nearer.
+        bands = []
+        for k in (0, 1):
+            was_a = a.was[k]
+            far_a = was_a[1][0] if k == 0 else was_a[1][-1]
+            choices = [(length(sub(far_a, b.was[m][1][0] if m == 0 else b.was[m][1][-1])), m)
+                       for m in (0, 1)]
+            m = min(choices)[1]
+            # Run both edges the same way for the band (b's piece reversed).
+            band = _StrokeBand(was_a, ('cubic', tuple(reversed(b.was[m][1]))))
+            bands.append((k, m, band))
+
+        def score(pair_a, pair_b):
+            return sum(band.score(pair_a[k], ('cubic', tuple(reversed(pair_b[m][1]))))
+                       for k, m, band in bands)
+
+        def total(shaper, other, mine, pair):
+            return score(pair, other.pair) if mine == 0 else score(other.pair, pair)
+        for shaper, other, mine in ((a, b, 0), (b, a, 1)):
+            # The shared curvature at the node, then each far handle.
+            for knob in ('mean', 0, 1):
+                if knob == 'mean':
+                    def make(x):
+                        return math.exp(x), list(shaper.stretch)
+                    lo, hi = math.log(shaper.mean) - math.log(2.0), \
+                        math.log(shaper.mean) + math.log(2.0)
+                else:
+                    if not shaper.far[knob]:
+                        continue
+
+                    def make(x, knob=knob):
+                        stretch = list(shaper.stretch)
+                        stretch[knob] = x
+                        return shaper.mean, stretch
+                    lo, hi = shaper.stretch[knob] * 0.6, shaper.stretch[knob] * 1.5
+                x = _golden(lambda x: total(shaper, other, mine, shaper.shaped(*make(x))),
+                            lo, hi, 5)
+                mean, stretch = make(x)
+                pair = shaper.shaped(mean, stretch)
+                if total(shaper, other, mine, pair) < total(shaper, other, mine, shaper.pair):
+                    shaper.mean, shaper.stretch, shaper.pair = mean, stretch, pair
+        for (c, i), shaper in ((keys[0], a), (keys[1], b)):
+            j = (i + 1) % len(result[c])
+            result[c][i], result[c][j] = shaper.pair
 
 
 def _refit(points, p0, p3):
@@ -194,58 +265,184 @@ def _refit(points, p0, p3):
     return best[1]
 
 
-def _smooth_node(was_in, was_out, incoming, outgoing, ratio, far_in, far_out):
-    """The two cubics meeting at a moved node, smooth there and as close to
-    the edge as it was. Their curvatures at the node come to `ratio` (1:
-    the same); the curvature they share there is the one, among a range
-    around the present one, whose curves (with their far handles refitted
-    to the edge, where `far_in` / `far_out` allow) stay closest to the
-    curves as they were: the stroke keeps the thickness its widths give it
-    instead of swelling or pinching next to the node."""
-    if _end_curvatures(incoming, outgoing) is None:
-        return incoming, outgoing
+class _NodeShaper(object):
+    """The two cubics meeting at a moved node, smooth there: their
+    curvatures at the node come to `ratio` (1: the same), at a shared
+    curvature `mean` to choose, with their far handles refitted to the edge
+    as it was (where `far_in` / `far_out` allow)."""
 
-    fit_in = [cubic(*was_in[1], i / 24.0) for i in range(1, 24)]
-    fit_out = [cubic(*was_out[1], i / 24.0) for i in range(1, 24)]
-    check = ([cubic(*was_in[1], i / 16.0) for i in range(1, 16)],
-             [cubic(*was_out[1], i / 16.0) for i in range(1, 16)])
+    def __init__(self, was_in, was_out, incoming, outgoing, ratio, far_in, far_out):
+        self.was = (was_in, was_out)
+        self.now = (incoming, outgoing)
+        self.ratio, self.far = ratio, (far_in, far_out)
+        self.fits = tuple([cubic(*was[1], i / 24.0) for i in range(1, 24)] for was in self.was)
+        self.checks = tuple([cubic(*was[1], i / 16.0) for i in range(1, 16)]
+                            for was in self.was)
+        self.usable = _end_curvatures(incoming, outgoing) is not None
+        self.mean = None
+        self.stretch = [1.0, 1.0]  # far handles, beyond their fit to the edge
+        self.pair = self.now
 
-    def shaped(mean):
-        a, b = incoming, outgoing
+    def shaped(self, mean, stretch=None):
+        stretch = self.stretch if stretch is None else stretch
+        a, b = self.now
         for _ in range(2):
-            a, b = _curvature_ratio(a, b, ratio, mean)
-            if far_in:
-                a = ('cubic', _refit_far(fit_in, a[1], True))
-            if far_out:
-                b = ('cubic', _refit_far(fit_out, b[1], False))
-        a, b = _curvature_ratio(a, b, ratio, mean)
-        return a, b
+            a, b = _curvature_ratio(a, b, self.ratio, mean)
+            if self.far[0]:
+                a = ('cubic', _stretch_far(_refit_far(self.fits[0], a[1], True), True,
+                                           stretch[0]))
+            if self.far[1]:
+                b = ('cubic', _stretch_far(_refit_far(self.fits[1], b[1], False), False,
+                                           stretch[1]))
+        return _curvature_ratio(a, b, self.ratio, mean)
 
-    def error(pair):
-        return sum(_curve_distance(samples, now[1]) for samples, now in zip(check, pair))
-    now = _end_curvatures(incoming, outgoing)
-    center = math.log(math.sqrt(now[0] * now[1]))
-    best = None
-    for step in range(-4, 5):
-        mean = math.exp(center + step * math.log(4.0) / 4.0)
-        pair = shaped(mean)
-        value = error(pair)
-        if best is None or value < best[0]:
-            best = (value, mean, pair)
-    lo, hi = math.log(best[1]) - math.log(4.0) / 4.0, math.log(best[1]) + math.log(4.0) / 4.0
-    a, b = hi - (hi - lo) * 0.618, lo + (hi - lo) * 0.618
-    error_a, error_b = error(shaped(math.exp(a))), error(shaped(math.exp(b)))
-    for _ in range(8):  # golden section around the best step
-        if error_a < error_b:
-            hi, b, error_b = b, a, error_a
-            a = hi - (hi - lo) * 0.618
-            error_a = error(shaped(math.exp(a)))
+    def error(self, pair):
+        return sum(_curve_distance(samples, now[1]) for samples, now in zip(self.checks, pair))
+
+    def search(self):
+        """The shared curvature whose curves stay closest to the edge as it
+        was (so the stroke keeps the thickness its widths give it)."""
+        if not self.usable:
+            return
+        now = _end_curvatures(*self.now)
+        center = math.log(math.sqrt(now[0] * now[1]))
+        best = None
+        for step in range(-4, 5):
+            mean = math.exp(center + step * math.log(4.0) / 4.0)
+            pair = self.shaped(mean)
+            value = self.error(pair)
+            if best is None or value < best[0]:
+                best = (value, mean, pair)
+        log_mean = _golden(lambda x: self.error(self.shaped(math.exp(x))),
+                           math.log(best[1]) - math.log(4.0) / 4.0,
+                           math.log(best[1]) + math.log(4.0) / 4.0, 8)
+        pair = self.shaped(math.exp(log_mean))
+        if self.error(pair) <= best[0]:
+            self.mean, self.pair = math.exp(log_mean), pair
         else:
-            lo, a, error_a = a, b, error_b
+            self.mean, self.pair = best[1], best[2]
+
+
+def _stretch_far(controls, start, factor):
+    """`controls` with the handle at its start (`start`) or end `factor` times
+    as long."""
+    if factor == 1.0:
+        return controls
+    p0, p1, p2, p3 = controls
+    if start:
+        return (p0, add(p0, mul(sub(p1, p0), factor)), p2, p3)
+    return (p0, p1, add(p3, mul(sub(p2, p3), factor)), p3)
+
+
+def _golden(f, lo, hi, steps):
+    """Where f is lowest between lo and hi (golden section, `steps` rounds)."""
+    a, b = hi - (hi - lo) * 0.618, lo + (hi - lo) * 0.618
+    fa, fb = f(a), f(b)
+    for _ in range(steps):
+        if fa < fb:
+            hi, b, fb = b, a, fa
+            a = hi - (hi - lo) * 0.618
+            fa = f(a)
+        else:
+            lo, a, fa = a, b, fb
             b = lo + (hi - lo) * 0.618
-            error_b = error(shaped(math.exp(b)))
-    pair = shaped(math.exp((lo + hi) / 2.0))
-    return pair if error(pair) <= best[0] else best[2]
+            fb = f(b)
+    return (lo + hi) / 2.0
+
+
+# Weight of the stroke growing thicker (or thinner) than its widths allow
+# between two nodes next to a sheared node, against the edges moving.
+SHEAR_SWELL_WEIGHT = 25.0
+# Weight of the stroke sliding off its centerline there (both edges moving
+# the same way).
+SHEAR_CENTER_WEIGHT = 40.0
+
+
+class _StrokeBand(object):
+    """One stretch of stroke between two nodes as it was: its two edges
+    (cubics on either side), sampled, with which way is out on each side,
+    its thickness there and the range its ends allow."""
+
+    def __init__(self, side_a, side_b):
+        self.sides = (side_a, side_b)
+        self.samples = tuple([cubic(*side[1], i / 12.0) for i in range(1, 12)]
+                             for side in self.sides)
+        polylines = tuple([cubic(*side[1], i / 24.0) for i in range(25)] for side in self.sides)
+        self.outward, self.opposite, self.thickness = [], [], []
+        for k in (0, 1):
+            outs, opposite, thick = [], [], []
+            for p in self.samples[k]:
+                q, _ = _nearest_on(polylines[1 - k], p)
+                distance = length(sub(p, q))
+                outs.append(unit(sub(p, q)) if distance > EPS else (0.0, 0.0))
+                thick.append(distance)
+                others = self.samples[1 - k]
+                opposite.append(min(range(len(others)),
+                                    key=lambda j: length(sub(others[j], q))))
+            self.outward.append(outs)
+            self.opposite.append(opposite)
+            self.thickness.append(thick)
+        ends = [length(sub(polylines[0][0], polylines[1][0])),
+                length(sub(polylines[0][-1], polylines[1][-1]))]
+        values = ends + self.thickness[0] + self.thickness[1]
+        self.low, self.high = min(values), max(values)
+
+    def score(self, side_a, side_b):
+        """How far the new edges stray: squared moves of both edges, and
+        heavily where the stroke grows thicker or thinner than its ends and
+        its course allow."""
+        deviations = []
+        for k, side in enumerate((side_a, side_b)):
+            curve = [cubic(*side[1], i / 24.0) for i in range(25)]
+            deviations.append([(q[0] - p[0]) * out[0] + (q[1] - p[1]) * out[1]
+                               for p, q, out in zip(self.samples[k],
+                                                    _nearest_walk(curve, self.samples[k]),
+                                                    self.outward[k])])
+        total = sum(d * d for values in deviations for d in values)
+        for k in (0, 1):
+            for i, d in enumerate(deviations[k]):
+                across = deviations[1 - k][self.opposite[k][i]]
+                thick = self.thickness[k][i] + d + across
+                swell = max(0.0, thick - self.high) + max(0.0, self.low - thick)
+                shift = (d - across) / 2.0
+                total += SHEAR_SWELL_WEIGHT * swell * swell + SHEAR_CENTER_WEIGHT * shift * shift
+        return total
+
+
+def _nearest_walk(polyline, points):
+    """The nearest point of `polyline` to each of `points`, which run along
+    it in order: each search starts a little before the last match."""
+    result, start, last = [], 0, len(polyline) - 1
+    for px, py in points:
+        best = None
+        for i in range(max(0, start - 2), min(last, start + 6)):
+            ax, ay = polyline[i]
+            bx, by = polyline[i + 1]
+            abx, aby = bx - ax, by - ay
+            denominator = abx*abx + aby*aby
+            t = 0.0 if denominator < EPS else \
+                max(0.0, min(1.0, ((px - ax)*abx + (py - ay)*aby) / denominator))
+            qx, qy = ax + abx*t, ay + aby*t
+            d = (px - qx)**2 + (py - qy)**2
+            if best is None or d < best[0]:
+                best = (d, qx, qy, i)
+        result.append((best[1], best[2]))
+        start = best[3]
+    return result
+
+
+def _nearest_on(polyline, p):
+    """The point of `polyline` nearest to p, and its segment index."""
+    best = None
+    for i, (a, b) in enumerate(zip(polyline, polyline[1:])):
+        ab = sub(b, a)
+        denominator = _dot(ab, ab)
+        t = 0.0 if denominator < EPS else max(0.0, min(1.0, _dot(sub(p, a), ab) / denominator))
+        q = add(a, mul(ab, t))
+        d = length(sub(p, q))
+        if best is None or d < best[0]:
+            best = (d, q, i)
+    return best[1], best[2]
 
 
 def _curve_distance(was, now, count=16):
