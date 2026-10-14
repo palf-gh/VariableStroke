@@ -16,7 +16,8 @@ from AppKit import (NSBezierPath, NSColor, NSEvent, NSImage, NSMenu, NSMenuItem,
                     NSAttributedString, NSFont, NSFontAttributeName,
                     NSForegroundColorAttributeName)
 from GlyphsApp import (Glyphs, GSCallbackHandler, GSCustomParameter, GSComponent, OFFCURVE,
-                       DOCUMENTOPENED, UPDATEINTERFACE, DRAWBACKGROUND, CONTEXTMENUCALLBACK, WINDOW_MENU)
+                       DOCUMENTOPENED, DOCUMENTWASSAVED, UPDATEINTERFACE, DRAWBACKGROUND,
+                       CONTEXTMENUCALLBACK, WINDOW_MENU)
 from GlyphsApp.plugins import SelectTool
 from vanilla import (Window, FloatingWindow, Group, SegmentedButton, TextBox, EditText, PopUpButton,
                      ImageButton, Button, List, HorizontalLine)
@@ -65,6 +66,7 @@ from glyphs_bridge import (PROFILE_KEY as PATH_PROFILE_KEY, profiles, profile_id
                            profile_node_factors, forget_profiles)
 from profile_editor import VariableStrokeProfileEditor, fill_popup, sorted_profiles
 from clipboard_export import svg_document, pdf_document
+import start_thumbnails
 from variable_stroke_core import (unit, sub, add, mul, length, outline_curves,
                                   cap_curve_coordinates,
                                   nib_edges, ellipse_nib_edges)
@@ -347,6 +349,33 @@ def _hook_compare_string():
     objc.classAddMethod(cls, name, objc.selector(wrapper, selector=name,
                                                  signature=original.signature))
     _hooked_compare.append(True)
+
+
+def _expand_for_preview(layer, glyph, master):
+    """Turn the strokes of `layer`, a detached copy of `glyph`'s layer for
+    `master`, into outlines; True when it had any."""
+    state = glyph_enabled(glyph) if glyph.userData.get(GLYPH_KEY) is not None else None
+    if state is False:
+        return False
+    defaults = master_defaults(master, layer_is_lowercase(glyph.layers[master.id]))
+    return bool(expand_layer(layer, state, defaults))
+
+
+def _start_window_preview(font, stale_only=False):
+    """Write the stand-in Glyphs' start window shows for `font`'s file (see
+    start_thumbnails); with `stale_only`, only when it is missing or out of
+    date."""
+    try:
+        path = font.filepath
+    except Exception:
+        path = None
+    if not path or (stale_only and start_thumbnails.cached_preview(path) is not None):
+        return
+    glyphs = [font.glyphs[name] for name in start_thumbnails.PREVIEW_GLYPHS]
+    if not any(glyph is not None and glyph_enabled(glyph) for glyph in glyphs):
+        start_thumbnails.forget_preview(path)  # no strokes: Glyphs' own preview is right
+        return
+    start_thumbnails.write_preview(font, path, _expand_for_preview)
 
 
 def _invalidate(layer, paths=None):
@@ -1603,6 +1632,7 @@ class VariableStrokeTool(SelectTool):
     @objc.python_method
     def start(self):
         Glyphs.addCallback(self._on_document_opened, DOCUMENTOPENED)
+        Glyphs.addCallback(self._on_document_saved, DOCUMENTWASSAVED)
         Glyphs.addCallback(self._on_update, UPDATEINTERFACE)
         Glyphs.addCallback(self._draw_centerlines, DRAWBACKGROUND)
         GSCallbackHandler.addCallback_forOperation_(self._menu_callback, CONTEXTMENUCALLBACK)
@@ -1621,6 +1651,10 @@ class VariableStrokeTool(SelectTool):
             _hook_compare_string()
         except Exception:
             print(traceback.format_exc())
+        try:
+            start_thumbnails.hook()
+        except Exception:
+            print(traceback.format_exc())
         title = _loc('Variable Stroke Settings…', '可変ストローク設定…')
         menu = Glyphs.menu[WINDOW_MENU]
         existing_items = [item for item in menu.submenu().itemArray()
@@ -1636,6 +1670,7 @@ class VariableStrokeTool(SelectTool):
             menu.append(item)
         for font in Glyphs.fonts:
             self._cleanup_font(font)
+            _start_window_preview(font, stale_only=True)
         self._sync_export()
 
     @objc.python_method
@@ -2034,7 +2069,18 @@ class VariableStrokeTool(SelectTool):
             self._cleanup_font(notification.object().font)
         except Exception:
             pass
+        try:
+            _start_window_preview(notification.object().font, stale_only=True)
+        except Exception:
+            print(traceback.format_exc())
         self._sync_export()
+
+    @objc.python_method
+    def _on_document_saved(self, notification=None):
+        try:
+            _start_window_preview(notification.object().font)
+        except Exception:
+            print(traceback.format_exc())
 
     @objc.python_method
     def _centerline(self, source):
