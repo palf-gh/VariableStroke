@@ -75,6 +75,66 @@ def move_outline_vertices(contours, edges, offsets, handle_offsets=None):
     return moved
 
 
+def cap_side_handle(contours, corner, inward):
+    """(contour, segment, handle index) of the control point by which the side
+    of a stroke leaves its cap corner, or None.
+
+    Two segments meet at the corner: the cap, across the stroke, and the side,
+    along it. The side is the one that leaves the corner most along `inward`
+    (the centerline's direction into the stroke). None where the corner is
+    not on the outline (rounded off) or the side is a straight line."""
+    best = None
+    for c, contour in enumerate(contours):
+        for s, (kind, points) in enumerate(contour):
+            for endpoint, handle, other in ((0, 1, -1), (-1, -2, 0)):
+                if length(sub(points[endpoint], corner)) >= 1e-5:
+                    continue
+                away = sub(points[handle], corner)
+                if length(away) < 1e-9:
+                    away = sub(points[other], corner)
+                size = length(away)
+                if size < 1e-9:
+                    continue
+                along = (away[0]*inward[0] + away[1]*inward[1]) / size
+                if best is None or along > best[0]:
+                    best = (along, kind, (c, s, handle if kind == 'cubic' else None))
+    if best is None or best[1] != 'cubic' or best[0] <= 0.0:
+        return None
+    return best[2]
+
+
+def aim_cap_handles(contours, targets):
+    """Turn the control point by which each side leaves a cap corner to an
+    angle on the page, keeping its length.
+
+    `targets` is [(corner, inward, degrees)]: the angle gives a line, and the
+    handle goes along it the way it went before (into the stroke), so 90 is
+    vertical whether the stroke runs up or down. A side that is a straight
+    line has no handle and stays as it is: the number and kinds of segments
+    stay fixed for interpolation between masters."""
+    moved = [list(contour) for contour in contours]
+    for corner, inward, degrees in targets:
+        found = cap_side_handle(moved, corner, inward)
+        if found is None:
+            continue
+        c, s, handle = found
+        kind, points = moved[c][s]
+        points = list(points)
+        away = sub(points[handle], corner)
+        size = length(away)
+        if size < 1e-9:
+            far = points[-1] if handle == 1 else points[0]
+            size = length(sub(far, corner)) / 3.0
+            away = inward
+        angle = math.radians(degrees)
+        direction = (math.cos(angle), math.sin(angle))
+        if direction[0]*away[0] + direction[1]*away[1] < 0:
+            direction = (-direction[0], -direction[1])
+        points[handle] = add(corner, mul(direction, size))
+        moved[c][s] = (kind, tuple(points))
+    return moved
+
+
 # How far a sheared outline node may slide towards the next outline node
 # along its tangent, as a share of the way there.
 SHEAR_REACH = 0.9
@@ -3438,6 +3498,9 @@ def _independent_outline_curves(left_segments, right_segments, closed, cap_start
                               lefts[0].start, rights[0].start, lefts[0].n0, slant,
                               cap_start_curve)
     if cap_out is not None:
+        # Where each side meets the cap (at a cut, past the node's edges).
+        cap_out['corners'] = {'start': (lefts[0].start, rights[0].start),
+                              'end': (lefts[-1].end, rights[-1].end)}
         if cap_end == 'curve' or (cap_end_curve is not None and
                                   cap_end not in ('round', 'ellipse')):
             cap_out['end'] = end_cap[0][1]
@@ -3652,6 +3715,9 @@ def outline_curves(segments, closed=False, cap_start='flat', cap_end='flat',
                               lefts[0].start, rights[0].start, first.n0, slant,
                               cap_start_curve)
     if cap_out is not None:
+        # Where each side meets the cap (at a cut, past the node's edges).
+        cap_out['corners'] = {'start': (lefts[0].start, rights[0].start),
+                              'end': (lefts[-1].end, rights[-1].end)}
         if cap_end == 'curve' or (cap_end_curve is not None and
                                   cap_end not in ('round', 'ellipse')):
             cap_out['end'] = end_cap[0][1]

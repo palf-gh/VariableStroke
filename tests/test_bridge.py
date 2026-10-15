@@ -49,6 +49,86 @@ bridge = importlib.import_module('glyphs_bridge')
 
 
 class BridgeTests(unittest.TestCase):
+    def falling_stroke(self):
+        """A left-falling stroke: down from the top, curving off to the left."""
+        path = Path([Node(170, 700), Node(170, 400, 'offcurve'),
+                     Node(120, 150, 'offcurve'), Node(25, 0, 'curve')])
+        for node in path.nodes:
+            node.userData.clear()
+        path.nodes[0].userData[bridge.SCALE_KEY] = 300
+        path.nodes[-1].userData[bridge.SCALE_KEY] = 20
+        path.attributes[bridge.CAP_START_KEY] = 'horizontal'
+        return path
+
+    def cap_controls(self, path):
+        return {(item['at_end'], item['side']): item
+                for item in bridge.cap_tangent_controls(path)}
+
+    def test_cap_tangent_turns_the_side_handle_and_keeps_its_length(self):
+        path = self.falling_stroke()
+        before = self.cap_controls(path)
+        self.assertEqual(set(before), {(False, 'left'), (False, 'right'),
+                                       (True, 'left'), (True, 'right')})
+        widget = before[(False, 'right')]
+        self.assertIsNone(widget['angle'])
+        self.assertEqual(widget['node'], path.nodes[0])
+        reach = math.dist(widget['corner'], widget['control'])
+        kinds = [[kind for kind, _ in contour] for contour in bridge.curves_for_path(path)]
+        path.attributes[bridge.CAP_TANGENT_KEYS[(False, 'right')]] = 90
+        after = self.cap_controls(path)[(False, 'right')]
+        self.assertEqual(after['angle'], 90.0)
+        self.assertEqual(after['corner'], widget['corner'])
+        self.assertAlmostEqual(after['control'][0], after['corner'][0])
+        self.assertLess(after['control'][1], after['corner'][1])  # into the stroke
+        self.assertAlmostEqual(math.dist(after['corner'], after['control']), reach)
+        self.assertEqual([[kind for kind, _ in contour]
+                          for contour in bridge.curves_for_path(path)], kinds)
+        # The other side and the other end keep the handles the stroke makes.
+        self.assertEqual(self.cap_controls(path)[(False, 'left')]['control'],
+                         before[(False, 'left')]['control'])
+
+    def test_cap_tangent_holds_its_angle_when_the_centerline_changes(self):
+        path = self.falling_stroke()
+        path.attributes[bridge.CAP_TANGENT_KEYS[(False, 'right')]] = '90'
+        path.nodes[1].position = types.SimpleNamespace(x=230, y=420)
+        widget = self.cap_controls(path)[(False, 'right')]
+        self.assertAlmostEqual(widget['control'][0], widget['corner'][0])
+        self.assertLess(widget['control'][1], widget['corner'][1])
+
+    def test_cap_tangent_at_the_end_points_back_into_the_stroke(self):
+        path = self.falling_stroke()
+        path.attributes[bridge.CAP_TANGENT_KEYS[(True, 'left')]] = 0
+        widget = self.cap_controls(path)[(True, 'left')]
+        self.assertAlmostEqual(widget['control'][1], widget['corner'][1])
+        self.assertGreater(widget['control'][0], widget['corner'][0])
+
+    def test_cap_tangent_with_a_curved_cap_and_a_moved_corner(self):
+        path = self.falling_stroke()
+        path.attributes[bridge.CAP_START_CURVE_ON_KEY] = True
+        path.nodes[0].userData[bridge.CORNER_OFFSET_RIGHT_KEY] = [-10, 0]
+        path.attributes[bridge.CAP_TANGENT_KEYS[(False, 'right')]] = 90
+        widget = self.cap_controls(path)[(False, 'right')]
+        self.assertAlmostEqual(widget['control'][0], widget['corner'][0])
+        self.assertLess(widget['control'][1], widget['corner'][1])
+        # The turned handle is the outline's own.
+        outline = bridge.curves_for_path(path)
+        self.assertTrue(any(points[0] == widget['corner'] or points[-1] == widget['corner']
+                            for contour in outline for kind, points in contour
+                            if kind == 'cubic' and widget['control'] in points))
+
+    def test_no_cap_tangent_handles_on_straight_sides_or_round_caps(self):
+        path = Path([Node(0, 0), Node(0, 300)])
+        self.assertEqual(bridge.cap_tangent_controls(path), [])
+        path = self.falling_stroke()
+        path.attributes[bridge.CAP_START_KEY] = 'round'
+        path.attributes[bridge.CAP_TANGENT_KEYS[(False, 'right')]] = 90
+        self.assertEqual({(item['at_end'], item['side'])
+                          for item in bridge.cap_tangent_controls(path)},
+                         {(True, 'left'), (True, 'right')})
+
+    def test_cap_tangent_is_copied_by_the_eyedropper(self):
+        self.assertIn(bridge.CAP_TANGENT_KEYS[(False, 'left')], bridge._STROKE_ATTRIBUTES)
+
     def test_generated_corner_bezier_control_is_visible_and_editable(self):
         corner = Node(100, 0, 'curve')
         path = Path([Node(0, 0), Node(30, 30, 'offcurve'),

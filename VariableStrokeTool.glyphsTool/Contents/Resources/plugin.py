@@ -26,6 +26,7 @@ from glyphs_bridge import (CAP_START_KEY, CAP_END_KEY, CAP_START_ANGLE_KEY, CAP_
                            CAP_START_CURVE_KEY, CAP_END_CURVE_KEY,
                            CAP_START_CURVE_ON_KEY, CAP_END_CURVE_ON_KEY,
                            cap_curve_of, cap_curve_enabled, cap_curve_widget,
+                           CAP_TANGENT_KEYS, cap_tangent_of, cap_tangent_controls,
                            WIDTH_KEY, HEIGHT_SCALE_KEY, CORNER_KEY, CORNER_ON_KEY, CORNER_INNER_KEY,
                            CORNER_TENSION_KEY, CORNER_RATIO_KEY, DEFAULT_CORNER_RADIUS,
                            CORNER_INNER_TENSION_KEY, CORNER_INNER_RATIO_KEY,
@@ -615,7 +616,7 @@ def _normalize_quietly(layer):
 _PATH_KEYS = (STROKE_WIDTH_KEY, STROKE_HEIGHT_KEY, CAP_START_KEY, CAP_END_KEY,
               CAP_START_ANGLE_KEY, CAP_END_ANGLE_KEY, CAP_START_CURVE_KEY,
               CAP_END_CURVE_KEY, CAP_START_CURVE_ON_KEY, CAP_END_CURVE_ON_KEY, VIRTUAL_KEY,
-              CROSSING_HOLES_KEY)
+              CROSSING_HOLES_KEY) + tuple(CAP_TANGENT_KEYS.values())
 _NODE_KEYS = (SCALE_KEY, HEIGHT_SCALE_KEY, OFFSET_KEY, CORNER_OFFSET_LEFT_KEY,
               CORNER_OFFSET_RIGHT_KEY) + CORNER_HANDLE_KEYS + (ROTATION_KEY, WIDTH_KEY,
               CORNER_ON_KEY, CORNER_KEY, CORNER_INNER_KEY,
@@ -630,6 +631,9 @@ CORNER_FIELDS = {'radius': CORNER_KEY, 'innerRadius': CORNER_INNER_KEY,
                  'ratio': CORNER_RATIO_KEY, 'innerRatio': CORNER_INNER_RATIO_KEY}
 # Node fields of the size after a bevelled corner and the key each one writes.
 AFTER_FIELDS = {'scaleAfter': AFTER_SCALE_KEY, 'heightScaleAfter': AFTER_HEIGHT_SCALE_KEY}
+# Cap fields of the angle the outline leaves each cap corner along: (at end, side).
+TANGENT_FIELDS = {'startLeftTangent': (False, 'left'), 'startRightTangent': (False, 'right'),
+                  'endLeftTangent': (True, 'left'), 'endRightTangent': (True, 'right')}
 NODE_FIELDS = ('scale', 'heightScale', 'offset', 'rotation', 'bevelAngle', 'miterLimit',
                'foldRound', 'shear') + \
     tuple(CORNER_FIELDS) + tuple(AFTER_FIELDS)
@@ -660,6 +664,12 @@ def _number_or_none(value):
 def _same(values):
     """True when every value is set and (nearly) equal, so one number can show."""
     return bool(values) and all(v is not None and abs(v-values[0]) < 0.001 for v in values)
+
+
+def _outline_control_color():
+    """Handles that shape the generated outline itself (its control points
+    at moved corners and caps, and the direction it leaves a cap) are magenta."""
+    return NSColor.colorWithCalibratedRed_green_blue_alpha_(0.85, 0.2, 0.55, 1.0)
 
 
 def _corner_color(which):
@@ -727,7 +737,7 @@ def _parse_field(name, text):
         if name == 'virtualAngle':
             return value if math.isfinite(value) else None
         return value if math.isfinite(value) and 0 < value < 10000 else None
-    if name in ('rotation', 'bevelAngle'):
+    if name in ('rotation', 'bevelAngle') or name in TANGENT_FIELDS:
         return value % 180.0 if math.isfinite(value) else None
     if name == 'miterLimit':
         return value if math.isfinite(value) and 0 <= value < 1000 else None
@@ -829,12 +839,25 @@ def _apply_field(name, value, paths, nodes):
             node.userData[CORNER_ON_KEY] = True  # typing a corner value switches it on
         if nodes and paths:
             note_corner(paths[0])
+    elif name in TANGENT_FIELDS:
+        _set_cap_tangent(paths, TANGENT_FIELDS[name], value)
     else:
         key, angle_key = ((CAP_START_KEY, CAP_START_ANGLE_KEY) if name == 'startAngle'
                           else (CAP_END_KEY, CAP_END_ANGLE_KEY))
         for path in paths:
             path.attributes[angle_key] = value
             path.attributes[key] = 'angle'  # typing an angle selects the angle cut
+
+
+def _set_cap_tangent(paths, end_side, value):
+    """Store the angle a cap corner's outline leaves along; None: automatic."""
+    key = CAP_TANGENT_KEYS[end_side]
+    for path in paths:
+        if value is None:
+            if path.attributes.get(key) is not None:
+                del path.attributes[key]
+        else:
+            path.attributes[key] = value
 
 
 def _field_is(name, value, paths, nodes):
@@ -864,6 +887,8 @@ def _field_is(name, value, paths, nodes):
         key = {'scale': SCALE_KEY, 'heightScale': HEIGHT_SCALE_KEY, 'offset': OFFSET_KEY,
                'rotation': ROTATION_KEY}[name]
         return all(node.userData.get(key) == value for node in nodes)
+    if name in TANGENT_FIELDS:
+        return all(cap_tangent_of(path, *TANGENT_FIELDS[name]) == value for path in paths)
     key, angle_key = ((CAP_START_KEY, CAP_START_ANGLE_KEY) if name == 'startAngle'
                       else (CAP_END_KEY, CAP_END_ANGLE_KEY))
     return all(path.attributes.get(key) == 'angle' and path.attributes.get(angle_key) == value
@@ -1448,7 +1473,7 @@ class VariableStrokeTool(SelectTool):
                                      sizeStyle='small')
 
         caps = [{'imageObject': _cap_icon(value), 'width': 21} for value in CAP_VALUES]
-        cap = group.capsTab = Group((0, TAB_TOP, -0, 48))
+        cap = group.capsTab = Group((0, TAB_TOP, -0, 72))
         cap.startLabel = TextBox((6, 4, 30, 14), _loc('Start', '始点'), sizeStyle='small')
         cap.startCap = SegmentedButton((36, 0, 147, 20), caps,
                                        callback=self.startCapFromInspector_, sizeStyle='small')
@@ -1468,8 +1493,28 @@ class VariableStrokeTool(SelectTool):
                                             callback=self.endCurveModeFromInspector_,
                                             sizeStyle='small')
         cap.curveHint = TextBox((405, 29, 130, 14),
-                                _loc('Drag purple handles', '紫のハンドルを操作'),
+                                _loc('Drag magenta handles', 'マゼンタのハンドルを操作'),
                                 sizeStyle='small')
+        # The angle the outline leaves each cap corner along (left / right of
+        # the path's direction); empty: as the stroke makes it.
+        cap.startTangentLabel = TextBox((6, 52, 30, 14), _loc('Dir', '向き'), sizeStyle='small')
+        cap.startLeftLabel = TextBox((36, 52, 14, 14), _loc('L', '左'), sizeStyle='small')
+        cap.startLeftTangent = SteppingEditText((50, 48, 36, 19), sizeStyle='small')
+        cap.startLeftUnit = TextBox((88, 52, 10, 14), '°', sizeStyle='small')
+        cap.startRightLabel = TextBox((98, 52, 14, 14), _loc('R', '右'), sizeStyle='small')
+        cap.startRightTangent = SteppingEditText((112, 48, 36, 19), sizeStyle='small')
+        cap.startRightUnit = TextBox((150, 52, 10, 14), '°', sizeStyle='small')
+        cap.endTangentLabel = TextBox((254, 52, 30, 14), _loc('Dir', '向き'), sizeStyle='small')
+        cap.endLeftLabel = TextBox((284, 52, 14, 14), _loc('L', '左'), sizeStyle='small')
+        cap.endLeftTangent = SteppingEditText((298, 48, 36, 19), sizeStyle='small')
+        cap.endLeftUnit = TextBox((336, 52, 10, 14), '°', sizeStyle='small')
+        cap.endRightLabel = TextBox((346, 52, 14, 14), _loc('R', '右'), sizeStyle='small')
+        cap.endRightTangent = SteppingEditText((360, 48, 36, 19), sizeStyle='small')
+        cap.endRightUnit = TextBox((398, 52, 10, 14), '°', sizeStyle='small')
+        cap.tangentHint = TextBox((405, 52, 190, 14),
+                                  _loc('Select an end, drag its squares',
+                                       '端点を選び四角をドラッグ'),
+                                  sizeStyle='small')
 
         corner = group.cornerTab = Group((0, TAB_TOP, -0, 48))
         corner.toggle = SegmentedButton((6, 0, 64, 20), [{'title': 'ON'}, {'title': 'OFF'}],
@@ -1594,6 +1639,16 @@ class VariableStrokeTool(SelectTool):
             field.getNSTextField().setToolTip_(_loc(
                 'Cut angle on the page (0 horizontal, 90 vertical); typing one selects the angle cut',
                 'カットの角度（ページ上、0 で水平、90 で垂直）。入力すると角度カットになります'))
+        for field in (cap.startLeftTangent, cap.startRightTangent,
+                      cap.endLeftTangent, cap.endRightTangent):
+            field.getNSTextField().setToolTip_(_loc(
+                'Angle on the page (0 horizontal, 90 vertical) along which the outline leaves '
+                'this cap corner (left / right of the path direction). Empty: as the stroke '
+                'makes it. Drag the magenta square on the canvas; Shift snaps to vertical or '
+                'horizontal.',
+                '線端の角から輪郭が出ていく向き（ページ上の角度、0 で水平、90 で垂直）。'
+                '左右はパスの進行方向から見た側です。空欄なら自動。キャンバスのマゼンタの四角を'
+                'ドラッグしても設定でき、Shift で縦横にスナップします。'))
         for control in (cap.startCap, cap.endCap):
             segmented = control.getNSSegmentedButton()
             for index, (_, english, japanese) in enumerate(CAP_NAMES):
@@ -1633,6 +1688,10 @@ class VariableStrokeTool(SelectTool):
                   ('scaleAfter', node.scaleAfterField),
                   ('heightScaleAfter', node.heightScaleAfterField),
                   ('startAngle', cap.startAngle), ('endAngle', cap.endAngle),
+                  ('startLeftTangent', cap.startLeftTangent),
+                  ('startRightTangent', cap.startRightTangent),
+                  ('endLeftTangent', cap.endLeftTangent),
+                  ('endRightTangent', cap.endRightTangent),
                   ('radius', corner.outerField), ('innerRadius', corner.innerField),
                   ('tension', corner.tensionField), ('innerTension', corner.innerTensionField),
                   ('ratio', corner.ratioField), ('innerRatio', corner.innerRatioField),
@@ -2336,7 +2395,9 @@ class VariableStrokeTool(SelectTool):
                              cut_angle(path, CAP_START_ANGLE_KEY),
                              cut_angle(path, CAP_END_ANGLE_KEY),
                              cap_curve_enabled(path, False),
-                             cap_curve_enabled(path, True)) for path in open_paths)
+                             cap_curve_enabled(path, True)) +
+                            tuple(cap_tangent_of(path, *TANGENT_FIELDS[name])
+                                  for name in TANGENT_FIELDS) for path in open_paths)
         else:
             entries = self._target_entries(paths, selected) if paths else []
             if tab == 'node':
@@ -2578,6 +2639,15 @@ class VariableStrokeTool(SelectTool):
                 mode.set(1 if states[0] else 0)
             else:
                 mode.getNSSegmentedButton().setSelectedSegment_(-1)
+        for k, name in enumerate(TANGENT_FIELDS):
+            at_end = TANGENT_FIELDS[name][0]
+            eligible = [item for item in details
+                        if item[1 if at_end else 0] not in ('round', 'ellipse')]
+            values = [item[6 + k] for item in eligible]
+            field = getattr(tab, name)
+            field.enable(bool(eligible))
+            field.set(('%g' % values[0]) if values and _same(values) and
+                      values[0] is not None else '')
 
     @objc.python_method
     def _show_corner_tab(self, tab, editable, details, cap_mode, crossings=(None,)):
@@ -2807,7 +2877,7 @@ class VariableStrokeTool(SelectTool):
         paths = self._edit_paths(layer)
         if name in HOLE_FIELDS:
             return [path for path in paths if path == self._hole_path], []
-        if name in ('startAngle', 'endAngle'):
+        if name in ('startAngle', 'endAngle') or name in TANGENT_FIELDS:
             return [path for path in paths if not path.closed], []
         if name in NODE_FIELDS:
             return paths, (self._target_nodes(layer, paths) if paths else [])
@@ -2851,7 +2921,7 @@ class VariableStrokeTool(SelectTool):
         value = _parse_field(name, text)
         clear_scale = name in ('scale', 'heightScale', 'bevelAngle', 'miterLimit',
                                'foldRound', 'shear') + \
-            tuple(AFTER_FIELDS) and not str(text).strip()
+            tuple(AFTER_FIELDS) + tuple(TANGENT_FIELDS) and not str(text).strip()
         if not paths or (name in NODE_FIELDS and not nodes):
             return
         if commit and str(text) == self._shown.get(name):
@@ -3228,6 +3298,23 @@ class VariableStrokeTool(SelectTool):
                     yield path, widget
 
     @objc.python_method
+    def _cap_tangent_handles(self, strokes, defaults, selected):
+        """(path, widget) for the handles by which the outline leaves the cap
+        corners: on the caps tab, at the selected end nodes only."""
+        if self._tab != 'caps' or not selected:
+            return
+        for path, items in strokes:
+            if path.closed:
+                continue
+            try:
+                widgets = cap_tangent_controls(path, defaults, items)
+            except ValueError:
+                continue
+            for widget in widgets:
+                if widget['node'] in selected:
+                    yield path, widget
+
+    @objc.python_method
     def _corner_bezier_handles(self, strokes, defaults, selected):
         for path, items in strokes:
             if not any(node in selected and data is not None and
@@ -3398,7 +3485,11 @@ class VariableStrokeTool(SelectTool):
         self._draw_curve_caps(strokes, defaults, scale)
         selected = set(layer.selection)
         handles = list(self._handles(strokes, defaults))
-        bezier_handles = list(self._corner_bezier_handles(strokes, defaults, selected))
+        tangent_handles = list(self._cap_tangent_handles(strokes, defaults, selected))
+        bezier_handles = [(path, widget) for path, widget in
+                          self._corner_bezier_handles(strokes, defaults, selected)
+                          if not any(length(sub(widget['control'], other['control'])) < 1e-3
+                                     for _, other in tangent_handles)]
         selected_nibs = list(self._selected_nibs(strokes, defaults, selected))
         previews = [item for item in selected_nibs if item[4]]
         for kind, _, widget, position in self._corner_parts(strokes, defaults, selected):
@@ -3455,7 +3546,7 @@ class VariableStrokeTool(SelectTool):
             color.set()
             for x, y in (left, right):
                 NSBezierPath.bezierPathWithRect_(((x-small, y-small), (small*2, small*2))).fill()
-        control_color = NSColor.colorWithCalibratedRed_green_blue_alpha_(0.55, 0.27, 0.83, 1.0)
+        control_color = _outline_control_color()
         for _, widget in bezier_handles:
             corner, control = widget['corner'], widget['control']
             control_color.colorWithAlphaComponent_(0.6).set()
@@ -3467,6 +3558,23 @@ class VariableStrokeTool(SelectTool):
             control_color.set()
             NSBezierPath.bezierPathWithOvalInRect_(
                 ((control[0]-small, control[1]-small), (small*2, small*2))).fill()
+        # Cap corners: a square, filled where the angle is set.
+        for _, widget in tangent_handles:
+            corner, control = widget['corner'], widget['control']
+            control_color.colorWithAlphaComponent_(0.6).set()
+            line = NSBezierPath.bezierPath()
+            line.moveToPoint_(corner)
+            line.lineToPoint_(control)
+            line.setLineWidth_(1.0 / scale)
+            line.stroke()
+            control_color.set()
+            square = NSBezierPath.bezierPathWithRect_(
+                ((control[0]-small, control[1]-small), (small*2, small*2)))
+            if widget['angle'] is None:
+                square.setLineWidth_(1.3 / scale)
+                square.stroke()
+            else:
+                square.fill()
         angle_color = NSColor.colorWithCalibratedRed_green_blue_alpha_(0.5, 0.25, 0.85, 1.0)
         for _, _, middle, nib, _ in previews:
             angle = math.radians(nib[3])
@@ -3499,7 +3607,7 @@ class VariableStrokeTool(SelectTool):
         for axis, _, _, middle, _, tip in self._nib_size_handles(previews):
             color = (NSColor.colorWithCalibratedRed_green_blue_alpha_(0.05, 0.48, 0.82, 1.0)
                      if axis == 'width' else
-                     NSColor.colorWithCalibratedRed_green_blue_alpha_(0.1, 0.58, 0.34, 1.0))
+                     NSColor.colorWithCalibratedRed_green_blue_alpha_(0.25, 0.65, 0.88, 1.0))
             line = NSBezierPath.bezierPath()
             line.moveToPoint_(middle)
             line.lineToPoint_(tip)
@@ -3533,7 +3641,7 @@ class VariableStrokeTool(SelectTool):
 
     @objc.python_method
     def _draw_curve_caps(self, strokes, defaults, scale):
-        color = NSColor.colorWithCalibratedRed_green_blue_alpha_(0.62, 0.24, 0.72, 1.0)
+        color = _outline_control_color()
         radius = 4.0 / scale
         for _, widget in self._curve_cap_handles(strokes, defaults):
             first, control1, control2, last = widget['points']
@@ -3770,6 +3878,21 @@ class VariableStrokeTool(SelectTool):
                     layer.beginChanges()
                     self._drag = {'kind': 'cap-curve', 'layer': layer, 'path': path,
                                   'widget': widget, 'control': index}
+                    self._select_tab('caps')
+                    self._last_ui_state = None
+                    self._refresh_ui()
+                    return
+            tangent_hits = [(length(sub(point, widget['control'])), path, widget)
+                            for path, widget in self._cap_tangent_handles(
+                                strokes, defaults, set(layer.selection))]
+            if tangent_hits:
+                distance, path, widget = min(tangent_hits, key=lambda hit: hit[0])
+                if distance <= threshold:
+                    self._select_node(layer, widget['node'])
+                    layer.beginChanges()
+                    self._drag = {'kind': 'cap-tangent', 'layer': layer, 'path': path,
+                                  'corner': widget['corner'],
+                                  'end_side': (widget['at_end'], widget['side'])}
                     self._select_tab('caps')
                     self._last_ui_state = None
                     self._refresh_ui()
@@ -4068,6 +4191,18 @@ class VariableStrokeTool(SelectTool):
             drag['node'].userData[key] = value
             _invalidate(drag['layer'], [drag['path']])
             self._redraw()
+            return
+        if drag.get('kind') == 'cap-tangent':
+            away = sub((loc.x, loc.y), drag['corner'])
+            if length(away) > 1e-6:
+                angle = math.degrees(math.atan2(away[1], away[0])) % 180.0
+                if NSEvent.modifierFlags() & NSEventModifierFlagShift:
+                    angle = 90.0 if 45.0 <= angle < 135.0 else 0.0
+                _set_cap_tangent([drag['path']], drag['end_side'], round(angle, 1) % 180.0)
+                _invalidate(drag['layer'], [drag['path']])
+                self._last_ui_state = None
+                self._refresh_ui()
+                self._redraw()
             return
         if drag.get('kind') == 'cap-curve':
             widget = drag['widget']

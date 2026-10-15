@@ -11,6 +11,7 @@ from variable_stroke_core import (outline_curves, joined_outline, contour_crossi
                                   crossing_loops, ellipse_nib_edges, sub, add, mul,
                                   _area, _flat_piece, _reverse, _piece_tangent,
                                   move_outline_vertices, shear_outline_vertices,
+                                  aim_cap_handles, cap_side_handle, length,
                                   cubic_derivative,
                                   outline_direction_at_vertex, DEFAULT_CAP_CURVE)
 import width_profile
@@ -74,6 +75,14 @@ CAP_START_CURVE_KEY = 'com.codex.VariableStroke.capStartCurve'
 CAP_END_CURVE_KEY = 'com.codex.VariableStroke.capEndCurve'
 CAP_START_CURVE_ON_KEY = 'com.codex.VariableStroke.capStartCurveOn'
 CAP_END_CURVE_ON_KEY = 'com.codex.VariableStroke.capEndCurveOn'
+# Degrees on the page (0 horizontal, 90 vertical) of the line along which the
+# outline leaves a cap corner, per end and side (left of the path's
+# direction); absent: as the stroke makes it.
+CAP_TANGENT_KEYS = {
+    (False, 'left'): 'com.codex.VariableStroke.capStartLeftTangent',
+    (False, 'right'): 'com.codex.VariableStroke.capStartRightTangent',
+    (True, 'left'): 'com.codex.VariableStroke.capEndLeftTangent',
+    (True, 'right'): 'com.codex.VariableStroke.capEndRightTangent'}
 # Width profiles (see width_profile): the font's library {id: profile} and, per
 # path, the id of the profile it uses. Interpolated layers cannot reach their
 # font, so they carry the profile itself.
@@ -129,7 +138,7 @@ LEGACY_HAIRLINE_KEY = 'com.codex.VariableStroke.hairline'
 _STROKE_ATTRIBUTES = (PATH_KEY, CAP_START_KEY, CAP_END_KEY, CAP_START_ANGLE_KEY,
                       CAP_END_ANGLE_KEY, CAP_START_CURVE_KEY, CAP_END_CURVE_KEY,
                       CAP_START_CURVE_ON_KEY, CAP_END_CURVE_ON_KEY, PROFILE_KEY,
-                      CROSSING_HOLES_KEY)
+                      CROSSING_HOLES_KEY) + tuple(CAP_TANGENT_KEYS.values())
 
 # Outline geometry is recomputed constantly (Glyphs' preview, handle drawing,
 # hit tests) for unchanged input, so results are kept by their exact input.
@@ -1771,6 +1780,81 @@ def corner_bezier_controls(path, defaults=None, items=None):
     return result
 
 
+def cap_tangent_of(path, at_end, side):
+    """Page angle (degrees, 0 to 180) the outline leaves a cap corner along,
+    or None where the stroke decides."""
+    value = path.attributes.get(CAP_TANGENT_KEYS[(at_end, side)])
+    try:
+        angle = float(value)
+    except (TypeError, ValueError):
+        return None
+    return angle % 180.0 if math.isfinite(angle) else None
+
+
+def _cap_tangent_targets(path, caps, segments, corners, tangents):
+    """[(at_end, side, corner, inward, degrees or None)] for the cap corners of
+    an open stroke whose caps have corners (not round or ellipse). `corners`
+    is {'start'/'end': (left, right)}, where the sides meet the caps."""
+    if path.closed or not segments or not corners:
+        return []
+    frames = _node_frames(segments, False)
+    result = []
+    for at_end, (_, tangent) in ((False, frames[0]), (True, frames[-1])):
+        pair = corners.get('end' if at_end else 'start')
+        if pair is None or caps[at_end] in ('round', 'ellipse'):
+            continue
+        size = length(tangent)
+        if size < 1e-9:
+            continue
+        inward = mul(tangent, (-1.0 if at_end else 1.0) / size)
+        for side, corner in zip(('left', 'right'), pair):
+            result.append((at_end, side, corner, inward, tangents[(at_end, side)]))
+    return result
+
+
+def _moved_cap_corners(corners, before, after):
+    """Cap corners after move_outline_vertices: a corner on a node's edge
+    moved with it (`before` and `after` are the edges around the move)."""
+    moved = {}
+    for name, pair in corners.items():
+        result = []
+        for k, corner in enumerate(pair):
+            for index, points in before.items():
+                if length(sub(points[k], corner)) < 1e-5 and index in after:
+                    corner = after[index][k]
+                    break
+            result.append(corner)
+        moved[name] = tuple(result)
+    return moved
+
+
+def cap_tangent_controls(path, defaults=None, items=None):
+    """The control points by which the outline leaves the cap corners:
+    [{'node', 'at_end', 'side', 'corner', 'control', 'angle'}], where the side
+    is a curve (a straight side has none). `angle` is the stored one or None."""
+    defaults = _resolve(defaults, path)
+    items = path_nodes(path) if items is None else items
+    on_curve = _on_curve(items, bool(path.closed))
+    if path.closed or not on_curve:
+        return []
+    segments, cached, _ = _outline(path, defaults, items)
+    contours, corners = cached[0], cached[4].get('corners')
+    attributes = path.attributes
+    caps = (attributes.get(CAP_START_KEY, 'flat'), attributes.get(CAP_END_KEY, 'flat'))
+    tangents = {key: cap_tangent_of(path, *key) for key in CAP_TANGENT_KEYS}
+    result = []
+    for at_end, side, corner, inward, angle in _cap_tangent_targets(
+            path, caps, segments, corners, tangents):
+        found = cap_side_handle(contours, corner, inward)
+        if found is None:
+            continue
+        c, s, handle = found
+        result.append({'node': on_curve[-1 if at_end else 0][0], 'at_end': at_end,
+                       'side': side, 'corner': corner,
+                       'control': contours[c][s][1][handle], 'angle': angle})
+    return result
+
+
 def cut_angle(path, key):
     try:
         return float(path.attributes.get(key, DEFAULT_CUT_ANGLE))
@@ -1948,7 +2032,8 @@ def copy_stroke_settings(source, target):
     attributes[STROKE_WIDTH_KEY] = source_width
     attributes[STROKE_HEIGHT_KEY] = source_height
     for key in (CAP_START_KEY, CAP_END_KEY, CAP_START_ANGLE_KEY, CAP_END_ANGLE_KEY,
-                CAP_START_CURVE_ON_KEY, CAP_END_CURVE_ON_KEY, CROSSING_HOLES_KEY):
+                CAP_START_CURVE_ON_KEY, CAP_END_CURVE_ON_KEY,
+                CROSSING_HOLES_KEY) + tuple(CAP_TANGENT_KEYS.values()):
         if key in source.attributes:
             attributes[key] = source.attributes[key]
         else:
@@ -2519,6 +2604,7 @@ def _gathered_outline(path, defaults, items, hint=(), base_only=False, detect=Fa
             angles = (cut_angle(path, CAP_START_ANGLE_KEY), cut_angle(path, CAP_END_ANGLE_KEY))
             cap_curves = (cap_curve_of(path, False) if cap_curve_enabled(path, False) else None,
                           cap_curve_of(path, True) if cap_curve_enabled(path, True) else None)
+            tangents = {key: cap_tangent_of(path, *key) for key in CAP_TANGENT_KEYS}
         with PROFILE.section('  inputs: virtual nodes'):
             specs = virtual_nodes(path, len(source_segments), items)
         with PROFILE.section('  inputs: width profile'):
@@ -2583,7 +2669,7 @@ def _gathered_outline(path, defaults, items, hint=(), base_only=False, detect=Fa
                tuple(right_map) if independent else (),
                tuple(None if c is None else tuple(sorted(c.items())) for c in corners),
                tuple(source_offsets), tuple(source_handles), bevels, crossing, fold_rounds,
-               shears)
+               shears, tuple(sorted(tangents.items())))
 
     def compute():
         collected, edges, cap_points = [], {}, {}
@@ -2619,7 +2705,17 @@ def _gathered_outline(path, defaults, items, hint=(), base_only=False, detect=Fa
                 handles = {expanded_index: source_handles[original_index]
                            for expanded_index, original_index in enumerate(node_map)
                            if original_index is not None and original_index < len(source_handles)}
+            before = dict(edges)
             contours = move_outline_vertices(contours, edges, offsets, handles)
+            if 'corners' in cap_points:
+                cap_points['corners'] = _moved_cap_corners(cap_points['corners'],
+                                                           before, edges)
+        if any(value is not None for value in tangents.values()):
+            targets = [(corner, inward, angle) for _, _, corner, inward, angle in
+                       _cap_tangent_targets(path, caps, segments,
+                                            cap_points.get('corners'), tangents)
+                       if angle is not None]
+            contours = aim_cap_handles(contours, targets)
         crossings = contour_crossings(contours, holes_only=False) if look else ()
         layout = tuple(((first[0], first[1]), (second[0], second[1]))
                        for _, first, second, _ in crossings)

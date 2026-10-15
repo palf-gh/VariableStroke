@@ -307,23 +307,34 @@ class SelectorTests(unittest.TestCase):
 
         tab = types.SimpleNamespace(**{name: Control() for name in (
             'curveHint', 'startCap', 'endCap', 'startAngle', 'endAngle',
-            'startCurveMode', 'endCurveMode')})
+            'startCurveMode', 'endCurveMode', 'startLeftTangent', 'startRightTangent',
+            'endLeftTangent', 'endRightTangent')})
         namespace = {'CAP_VALUES': ['flat', 'round', 'ellipse', 'square',
                                     'horizontal', 'vertical', 'angle'],
+                     'TANGENT_FIELDS': {'startLeftTangent': (False, 'left'),
+                                        'startRightTangent': (False, 'right'),
+                                        'endLeftTangent': (True, 'left'),
+                                        'endRightTangent': (True, 'right')},
                      'NSColor': types.SimpleNamespace(labelColor=lambda: None,
                                                       secondaryLabelColor=lambda: None),
                      '_same': lambda values: len(set(values)) == 1}
         exec(compile(ast.fix_missing_locations(ast.Module(body=[method], type_ignores=[])),
                      str(PLUGIN), 'exec'), namespace)
         namespace['_show_caps_tab'](None, tab, True,
-                                    (('round', 'ellipse', 45, 45, False, False),))
+                                    (('round', 'ellipse', 45, 45, False, False,
+                                      None, None, None, None),))
         self.assertFalse(tab.startCurveMode.enabled)
         self.assertFalse(tab.endCurveMode.enabled)
+        self.assertFalse(tab.startRightTangent.enabled)
+        self.assertFalse(tab.endLeftTangent.enabled)
         namespace['_show_caps_tab'](None, tab, True,
-                                    (('flat', 'horizontal', 45, 45, True, False),))
+                                    (('flat', 'horizontal', 45, 45, True, False,
+                                      None, 90.0, None, None),))
         self.assertTrue(tab.startCurveMode.enabled)
         self.assertTrue(tab.endCurveMode.enabled)
         self.assertEqual((tab.startCurveMode.value, tab.endCurveMode.value), (1, 0))
+        self.assertTrue(tab.startRightTangent.enabled)
+        self.assertEqual((tab.startLeftTangent.value, tab.startRightTangent.value), ('', '90'))
 
     def test_eyedropper_applies_clicked_source_to_selected_destination(self):
         module = ast.parse(PLUGIN.read_text())
@@ -433,9 +444,8 @@ class SelectorTests(unittest.TestCase):
     def test_panel_shows_one_tab_below_the_stroke_row(self):
         source = PLUGIN.read_text()
         self.assertIn('group.tabs = SegmentedButton(', source)
-        for tab in ('capsTab', 'cornerTab'):
-            self.assertIn('group.' + tab + ' = Group((0, TAB_TOP, -0, 48))', source)
-        for tab in ('nodeTab', 'virtualTab'):
+        self.assertIn('group.cornerTab = Group((0, TAB_TOP, -0, 48))', source)
+        for tab in ('nodeTab', 'virtualTab', 'capsTab'):
             self.assertIn('group.' + tab + ' = Group((0, TAB_TOP, -0, 72))', source)
         self.assertIn("('virtual', 'Virtual', '仮想')", source)
         self.assertIn('group.profileTab = Group((0, TAB_TOP, -0, 48))', source)
