@@ -779,6 +779,30 @@ def _without_undo(layer):
             manager.enableUndoRegistration()
 
 
+@contextlib.contextmanager
+def undo_disabled(*owners):
+    """No undo steps while working on copies: Glyphs records an edit of a
+    copied layer or font in the undo history of the font the copy came from
+    (or nowhere), and the history does not keep the copy alive. Undoing
+    such a step once the copy is gone makes Glyphs crash. `owners` are the
+    glyphs (or anything with undoManager()) whose undo managers to hold."""
+    managers = []
+    for owner in owners:
+        try:
+            manager = owner.undoManager() if owner is not None else None
+        except Exception:
+            manager = None
+        if manager is not None and all(manager is not other for other in managers):
+            managers.append(manager)
+    for manager in managers:
+        manager.disableUndoRegistration()
+    try:
+        yield
+    finally:
+        for manager in managers:
+            manager.enableUndoRegistration()
+
+
 def _kept_store(layer):
     """The layer's own object holding the kept sections (see _kept_sections)."""
     try:

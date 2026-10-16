@@ -79,6 +79,20 @@ class StartThumbnailTests(unittest.TestCase):
         start_thumbnails.note_closed(self.source)
         self.assertIsNone(start_thumbnails.preview_for(self.source))
 
+    def test_stand_in_is_made_outside_the_undo_history(self):
+        import contextlib
+        quiet, during = [], []
+
+        @contextlib.contextmanager
+        def undo_off(*owners):
+            quiet.append(True)
+            yield
+            quiet.pop()
+        start_thumbnails.write_preview(
+            Font(['A', 'g'], []), self.source,
+            lambda layer, glyph, master: during.append(bool(quiet)) or True, undo_off)
+        self.assertEqual(during, [True, True])
+
     def test_no_strokes_no_stand_in(self):
         font = Font(['A', 'g'], [])
         start_thumbnails.write_preview(font, self.source, lambda *args: True)

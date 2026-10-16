@@ -10,6 +10,7 @@ While that is up to date with the font's file, Glyphs is handed the stand-in
 instead when it asks for the preview, and draws it as it draws any font.
 The font's own file is never touched.
 """
+import contextlib
 import hashlib
 import json
 import os
@@ -96,13 +97,14 @@ def forget_preview(path):
             pass
 
 
-def write_preview(font, path, expand):
+def write_preview(font, path, expand, quiet=None):
     """Write the stand-in for `font`, saved at `path`: a copy of the font
     (its masters, metrics and settings place the preview) with only the
     preview glyphs, their strokes turned into outlines by `expand(layer,
     glyph, master)`, which says whether a layer had any. Without strokes in
     the preview glyphs, any old stand-in goes: Glyphs' own preview is right
-    then."""
+    then. `quiet(*glyphs)`, a context manager, keeps the work on the copy
+    out of the undo history (see glyphs_bridge.undo_disabled)."""
     if not path:
         return False
     if not any(font.glyphs[name] is not None for name in PREVIEW_GLYPHS):
@@ -111,6 +113,24 @@ def write_preview(font, path, expand):
     stand_in = font.copy()
     stand_in.removeGlyphs_([glyph for glyph in stand_in.glyphs
                             if glyph.name not in PREVIEW_GLYPHS])
+    owners = [font.glyphs[name] for name in PREVIEW_GLYPHS] + list(stand_in.glyphs)
+    with (quiet(*owners) if quiet is not None else contextlib.nullcontext()):
+        any_stroke = _expand_preview_glyphs(font, stand_in, expand)
+    if not any_stroke:
+        forget_preview(path)
+        return False
+    os.makedirs(CACHE_DIR, exist_ok=True)
+    key = _key(path)
+    target = os.path.join(CACHE_DIR, key + '.glyphs')
+    temporary = os.path.join(CACHE_DIR, key + '.tmp.glyphs')
+    stand_in.save(temporary)
+    os.replace(temporary, target)
+    with open(os.path.join(CACHE_DIR, key + '.json'), 'w') as handle:
+        json.dump({'path': os.path.realpath(path), 'stamp': _stamp(path)}, handle)
+    return True
+
+
+def _expand_preview_glyphs(font, stand_in, expand):
     any_stroke = False
     for glyph in stand_in.glyphs:
         source = font.glyphs[glyph.name]
@@ -125,18 +145,7 @@ def write_preview(font, path, expand):
                 pass
             if expand(layer, source, master):
                 any_stroke = True
-    if not any_stroke:
-        forget_preview(path)
-        return False
-    os.makedirs(CACHE_DIR, exist_ok=True)
-    key = _key(path)
-    target = os.path.join(CACHE_DIR, key + '.glyphs')
-    temporary = os.path.join(CACHE_DIR, key + '.tmp.glyphs')
-    stand_in.save(temporary)
-    os.replace(temporary, target)
-    with open(os.path.join(CACHE_DIR, key + '.json'), 'w') as handle:
-        json.dump({'path': os.path.realpath(path), 'stamp': _stamp(path)}, handle)
-    return True
+    return any_stroke
 
 
 def _url_path(url):

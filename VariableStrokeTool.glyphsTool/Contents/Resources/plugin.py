@@ -35,7 +35,7 @@ from glyphs_bridge import (CAP_START_KEY, CAP_END_KEY, CAP_START_ANGLE_KEY, CAP_
                            cut_angle, STROKE_WIDTH_KEY, SCALE_KEY, EXPORT_FILTER,
                            enabled, stroke_width, scale, height_scale, migrate_path, interpolate_layer,
                            convert_glyph, layer_state, LAYER_ITALIC_KEY,
-                           expand_layer, generated,
+                           expand_layer, generated, undo_disabled,
                            cleanup_legacy_layer, glyph_enabled, GLYPH_KEY, set_glyph_enabled,
                            normalize_layer, MASTER_WIDTH_KEY, master_default_width,
                            has_width_override, reset_width_overrides, STROKE_HEIGHT_KEY,
@@ -378,7 +378,7 @@ def _start_window_preview(font, stale_only=False):
     if not any(glyph is not None and glyph_enabled(glyph) for glyph in glyphs):
         start_thumbnails.forget_preview(path)  # no strokes: Glyphs' own preview is right
         return
-    start_thumbnails.write_preview(font, path, _expand_for_preview)
+    start_thumbnails.write_preview(font, path, _expand_for_preview, undo_disabled)
 
 
 # -[GSNode elementString] writes the node and the text of its userData into a
@@ -971,7 +971,10 @@ class VariableStrokeLayerProcessor(NSObject):
                 return
             defaults = master_defaults(_master_for(source), layer_is_lowercase(source))
             outline = source.copy()
-            if expand_layer(outline, state, defaults):
+            with undo_disabled(getattr(source, 'parent', None),
+                               getattr(outline, 'parent', None)):
+                expanded = expand_layer(outline, state, defaults)
+            if expanded:
                 request.setObject_forKey_(outline, 'outlineLayer')
         except Exception:
             print(traceback.format_exc())
