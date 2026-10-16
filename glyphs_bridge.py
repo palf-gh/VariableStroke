@@ -3771,6 +3771,158 @@ def convert_glyph(glyph, keep_marks=True):
     return count
 
 
+# The export's PreInterpolationFilter converts every glyph of each style's copy
+# of the font, and one glyph's copies are alike in every style (same masters,
+# same strokes), so 54 static styles computed the same outlines 54 times, on
+# threads that take turns at Python's lock. A conversion is kept by everything
+# convert_glyph reads from the glyph; an alike glyph takes copies of its
+# outlines (one call per path instead of one GSNode per point).
+_CONVERSIONS = collections.OrderedDict()  # signature: per layer ((index, templates), ...)
+_CONVERSIONS_SIZE = 20000
+_CONVERSIONS_LOCK = threading.Lock()
+# Glyphs interpolates the styles side by side, each going through the glyphs in
+# the same order, so the styles meet at one glyph while it is being computed:
+# signature -> Event set once that conversion is done (see convert_glyph_cached).
+_CONVERTING = {}
+_CONVERTING_WAIT = 300.0  # seconds; then a waiting style computes it itself
+CONVERSION_STATS = collections.Counter()  # 'glyphs', 'reused', 'seconds'
+
+
+def _stored(owner, name):
+    """_described of a stored dictionary, read from Glyphs directly: the
+    GlyphsApp proxies (glyph.userData, ...) do not describe their contents."""
+    try:
+        return _described(getattr(owner.pyobjc_instanceMethods, name)())
+    except AttributeError:  # plain Python objects (tests)
+        return _described(getattr(owner, name, None))
+
+
+def _shape_signature(shape):
+    if not isinstance(shape, GSPath):
+        return None  # components and the like: only their place among the shapes
+    profile = path_profile(shape)
+    return (bool(shape.closed), _stored(shape, 'attributes'),
+            tuple((kind, position, None if data is None else repr(sorted(data.items())))
+                  for _, kind, position, data in path_nodes(shape)),
+            None if profile is None else repr(profile))
+
+
+def _glyph_signature(glyph):
+    """What convert_glyph reads from a glyph, as one hashable value: per layer
+    its identity, settings, master defaults and every path's nodes (positions,
+    types, userData), attributes and width profile."""
+    layers = []
+    for layer in glyph.layers:
+        defaults = layer_defaults(layer)
+        layers.append((getattr(layer, 'layerId', None), getattr(layer, 'associatedMasterId', None),
+                       getattr(layer, 'name', None),
+                       _stored(layer, 'attributes'), _stored(layer, 'userData'),
+                       (defaults.width, defaults.height, defaults.italic_angle,
+                        defaults.nib_angle),
+                       tuple(_shape_signature(shape) for shape in list(layer.shapes))))
+    return (getattr(glyph, 'name', None), _stored(glyph, 'userData'), tuple(layers))
+
+
+def _position_of(shapes, path):
+    for index, shape in enumerate(shapes):
+        if shape is path:
+            return index
+    return None
+
+
+def convert_glyph_cached(glyph, before_computing=None):
+    """convert_glyph(glyph) for export copies, taking the outlines of an alike
+    glyph converted before. `before_computing(glyph)` runs only when the outlines
+    are computed (reports that the first style already gave). (count, reused)."""
+    if not glyph_enabled(glyph):
+        return 0, False
+    started = time.perf_counter()
+    layers = list(glyph.layers)
+    for layer in layers:
+        cleanup_legacy_layer(layer)
+    key = _glyph_signature(glyph)
+    found, done, mine = _kept_conversion(key)
+    if found is None and not mine:
+        done.wait(_CONVERTING_WAIT)  # lets go of Python's lock while it waits
+        found, done, mine = _kept_conversion(key)  # not mine: still computing; compute too
+    if found is not None:
+        count = _reuse_conversion(layers, found)
+        _count_conversion(started, True)
+        return count, True
+    try:
+        return _compute_conversion(glyph, layers, key, before_computing, started)
+    finally:
+        if mine:
+            with _CONVERSIONS_LOCK:
+                _CONVERTING.pop(key, None)
+            done.set()
+
+
+def _kept_conversion(key):
+    """(kept conversion, None, False); (None, Event to wait for, False) while
+    another style computes it; or (None, Event, True) when this caller is to
+    compute it and set the Event."""
+    with _CONVERSIONS_LOCK:
+        found = _CONVERSIONS.get(key)
+        if found is not None:
+            _CONVERSIONS.move_to_end(key)
+            return found, None, False
+        waiting = _CONVERTING.get(key)
+        if waiting is not None:
+            return None, waiting, False
+        done = _CONVERTING[key] = threading.Event()
+        return None, done, True
+
+
+def _reuse_conversion(layers, found):
+    count = 0
+    for layer, steps in zip(layers, found):
+        shapes = list(layer.shapes)
+        for index, templates in steps:
+            layer.shapes.remove(shapes[index])
+            for template in templates:
+                layer.shapes.append(template.copy())
+            count += 1
+    return count
+
+
+def _compute_conversion(glyph, layers, key, before_computing, started):
+    if before_computing is not None:
+        before_computing(glyph)
+    writes = _BOOKKEEPING[0]
+    plans = [(layer, _expansion_plan(layer, True, upright=True)) for layer in layers]
+    # A run that bound virtual anchors wrote to the glyph after it was read.
+    record = [] if _BOOKKEEPING[0] == writes else None
+    for layer, plan in (plans if record is not None else ()):
+        shapes = list(layer.shapes)
+        steps = []
+        for path, replacements in plan:
+            index = _position_of(shapes, path)
+            if index is None or not all(hasattr(new, 'copy') for new in replacements):
+                steps = None
+                break
+            steps.append((index, tuple(replacement.copy() for replacement in replacements)))
+        if steps is None:
+            record = None
+            break
+        record.append(tuple(steps))
+    count = sum(_apply_plan(layer, plan) for layer, plan in plans)
+    if record is not None:
+        with _CONVERSIONS_LOCK:
+            _CONVERSIONS[key] = tuple(record)
+            while len(_CONVERSIONS) > _CONVERSIONS_SIZE:
+                _CONVERSIONS.popitem(last=False)
+    _count_conversion(started, False)
+    return count, False
+
+
+def _count_conversion(started, reused):
+    with _CONVERSIONS_LOCK:
+        CONVERSION_STATS['glyphs'] += 1
+        CONVERSION_STATS['reused'] += int(reused)
+        CONVERSION_STATS['seconds'] += time.perf_counter() - started
+
+
 _HOLES = collections.OrderedDict()  # id(base outline): (base outline, holes)
 
 

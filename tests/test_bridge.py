@@ -2252,5 +2252,159 @@ class BridgeTests(unittest.TestCase):
             ('line', ((0.0, 0.0), (100.0, 0.0))),
             ('cubic', ((100.0, 0.0), (100.0, 50.0), (0.0, 50.0), (0.0, 0.0)))])
 
+def _copied_path(path):
+    copy = Path([Node(node.position.x, node.position.y, node.type) for node in path.nodes],
+                path.closed)
+    for new, old in zip(copy.nodes, path.nodes):
+        new.userData = dict(old.userData)
+    copy.attributes = dict(path.attributes)
+    return copy
+
+
+class CachedConversionTests(unittest.TestCase):
+    """convert_glyph_cached: the export's PreInterpolationFilter in every style."""
+
+    def setUp(self):
+        bridge._CONVERSIONS.clear()
+        Path.copy = _copied_path  # GSPath.copy; plain Paths elsewhere have none
+
+    def tearDown(self):
+        del Path.copy
+        bridge._CONVERSIONS.clear()
+
+    def glyph(self, x=100, extra=()):
+        layers = [Layer(list(extra) + [Path([Node(0, 0), Node(x, 0), Node(x, 200)])]),
+                  Layer(list(extra) + [Path([Node(0, 0), Node(x + 50, 0), Node(x + 50, 200)])])]
+        glyph = types.SimpleNamespace(name='a', layers=layers,
+                                      userData={bridge.GLYPH_KEY: True})
+        for index, layer in enumerate(layers):
+            layer.parent = glyph
+            layer.layerId = 'm%d' % index
+        return glyph
+
+    @staticmethod
+    def outlines(glyph):
+        return [[(type(shape).__name__, bridge.is_outline(shape) if isinstance(shape, Path)
+                  else None,
+                  [(node.type, node.position.x, node.position.y) for node in shape.nodes]
+                  if isinstance(shape, Path) else None)
+                 for shape in layer.shapes] for layer in glyph.layers]
+
+    def test_an_alike_glyph_takes_the_same_outlines(self):
+        expected = self.glyph()
+        bridge.convert_glyph(expected)
+        first, second = self.glyph(), self.glyph()
+        self.assertEqual(bridge.convert_glyph_cached(first), (2, False))
+        self.assertEqual(bridge.convert_glyph_cached(second), (2, True))
+        self.assertEqual(self.outlines(first), self.outlines(expected))
+        self.assertEqual(self.outlines(second), self.outlines(expected))
+        # copies, not the kept templates or the first glyph's paths
+        self.assertIsNot(second.layers[0].shapes[0], first.layers[0].shapes[0])
+
+    def test_any_change_computes_again(self):
+        bridge.convert_glyph_cached(self.glyph())
+        moved = self.glyph(x=120)
+        self.assertEqual(bridge.convert_glyph_cached(moved)[1], False)
+        wider = self.glyph()
+        wider.layers[1].shapes[0].nodes[1].userData[bridge.SCALE_KEY] = 200
+        self.assertEqual(bridge.convert_glyph_cached(wider)[1], False)
+        capped = self.glyph()
+        capped.layers[0].shapes[0].attributes[bridge.CAP_END_KEY] = 'round'
+        self.assertEqual(bridge.convert_glyph_cached(capped)[1], False)
+        nib = self.glyph()
+        nib.layers[0].userData[bridge.LAYER_NIB_ANGLE_KEY] = 30
+        self.assertEqual(bridge.convert_glyph_cached(nib)[1], False)
+        expected = self.glyph()
+        expected.layers[0].shapes[0].attributes[bridge.CAP_END_KEY] = 'round'
+        bridge.convert_glyph(expected)
+        self.assertEqual(self.outlines(capped), self.outlines(expected))
+
+    def test_other_shapes_keep_their_place(self):
+        class Other(object):
+            pass
+        marker = Other()
+        expected = self.glyph(extra=[marker])
+        bridge.convert_glyph(expected)
+        bridge.convert_glyph_cached(self.glyph(extra=[marker]))
+        second = self.glyph(extra=[marker])
+        self.assertTrue(bridge.convert_glyph_cached(second)[1])
+        self.assertEqual(self.outlines(second), self.outlines(expected))
+        self.assertIs(second.layers[0].shapes[0], marker)
+
+    def test_reports_run_once_and_glyphs_without_strokes_stay(self):
+        seen = []
+        bridge.convert_glyph_cached(self.glyph(), seen.append)
+        bridge.convert_glyph_cached(self.glyph(), seen.append)
+        self.assertEqual(len(seen), 1)
+        off = self.glyph()
+        off.userData[bridge.GLYPH_KEY] = False
+        before = self.outlines(off)
+        self.assertEqual(bridge.convert_glyph_cached(off, seen.append), (0, False))
+        self.assertEqual(self.outlines(off), before)
+        self.assertEqual(len(seen), 1)
+
+    def test_styles_meeting_at_a_glyph_compute_it_once(self):
+        import threading
+        import time
+        calls = []
+        original = bridge._expansion_plan
+
+        def slow_plan(*args, **kwargs):
+            calls.append(1)
+            time.sleep(0.05)  # the other styles arrive meanwhile
+            return original(*args, **kwargs)
+        glyphs = [self.glyph() for _ in range(6)]
+        results = [None] * len(glyphs)
+
+        def convert(index):
+            results[index] = bridge.convert_glyph_cached(glyphs[index])
+        bridge._expansion_plan = slow_plan
+        try:
+            threads = [threading.Thread(target=convert, args=(i,)) for i in range(6)]
+            for thread in threads:
+                thread.start()
+            for thread in threads:
+                thread.join(5)
+        finally:
+            bridge._expansion_plan = original
+        self.assertEqual(len(calls), 2)  # one glyph's two layers
+        self.assertEqual(sorted(reused for _, reused in results), [False] + [True] * 5)
+        self.assertTrue(all(self.outlines(glyph) == self.outlines(glyphs[0])
+                            for glyph in glyphs))
+        self.assertEqual(bridge._CONVERTING, {})
+
+    def test_a_failed_conversion_lets_the_waiting_styles_compute(self):
+        import threading
+        original = bridge._expansion_plan
+        started, release = threading.Event(), threading.Event()
+
+        def failing_plan(*args, **kwargs):
+            started.set()
+            release.wait(5)
+            raise RuntimeError('broken glyph')
+        failed = []
+
+        def first():
+            try:
+                bridge.convert_glyph_cached(self.glyph())
+            except RuntimeError:
+                failed.append(True)
+        bridge._expansion_plan = failing_plan
+        thread = threading.Thread(target=first)
+        thread.start()
+        started.wait(5)
+        bridge._expansion_plan = original  # the next style's own computation works
+        second_result = []
+        second = threading.Thread(
+            target=lambda: second_result.append(bridge.convert_glyph_cached(self.glyph())))
+        second.start()
+        release.set()
+        thread.join(5)
+        second.join(5)
+        self.assertEqual(failed, [True])
+        self.assertEqual(second_result, [(2, False)])
+        self.assertEqual(bridge._CONVERTING, {})
+
+
 if __name__ == '__main__':
     unittest.main()
