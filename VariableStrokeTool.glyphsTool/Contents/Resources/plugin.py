@@ -69,6 +69,7 @@ from glyphs_bridge import (PROFILE_KEY as PATH_PROFILE_KEY, profiles, profile_id
 from profile_editor import VariableStrokeProfileEditor, fill_popup, sorted_profiles
 from clipboard_export import svg_document, pdf_document
 import start_thumbnails
+import file_icon
 from variable_stroke_core import (unit, sub, add, mul, length, outline_curves,
                                   cap_curve_coordinates,
                                   nib_edges, ellipse_nib_edges)
@@ -379,6 +380,22 @@ def _start_window_preview(font, stale_only=False):
         start_thumbnails.forget_preview(path)  # no strokes: Glyphs' own preview is right
         return
     start_thumbnails.write_preview(font, path, _expand_for_preview, undo_disabled)
+
+
+def _file_icon(font, stale_only=False):
+    """Give `font`'s file the icon of its start window stand-in, or take ours
+    off when it has none (see file_icon); with `stale_only`, only when ours
+    is missing or older than the file."""
+    try:
+        path = font.filepath
+    except Exception:
+        path = None
+    if not path:
+        return
+    try:
+        file_icon.update(path, start_thumbnails.cached_preview(path), stale_only)
+    except Exception:
+        print(traceback.format_exc())
 
 
 # -[GSNode elementString] writes the node and the text of its userData into a
@@ -1766,6 +1783,7 @@ class VariableStrokeTool(SelectTool):
         for font in Glyphs.fonts:
             self._cleanup_font(font)
             _start_window_preview(font, stale_only=True)
+            _file_icon(font, stale_only=True)
         self._sync_export()
 
     @objc.python_method
@@ -2166,6 +2184,7 @@ class VariableStrokeTool(SelectTool):
             pass
         try:
             _start_window_preview(notification.object().font, stale_only=True)
+            _file_icon(notification.object().font, stale_only=True)
         except Exception:
             print(traceback.format_exc())
         self._sync_export()
@@ -2183,6 +2202,7 @@ class VariableStrokeTool(SelectTool):
     def _on_document_saved(self, notification=None):
         try:
             _start_window_preview(notification.object().font)
+            _file_icon(notification.object().font)
         except Exception:
             print(traceback.format_exc())
 

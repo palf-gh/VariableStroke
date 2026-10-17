@@ -220,7 +220,17 @@ Glyphs のスタートウィンドウに並ぶ最近のファイルのプレビ�
 - そこで、ストロークのあるフォントを Glyphs で開いたときと保存したときに、A と g のストロークを輪郭にした控えのファイルを `~/Library/Caches/com.codex.VariableStroke/StartWindow` に書き出します。フォント本体のファイルは変更しません。
 - Glyphs がプレビューを作るとき、そのファイルの控えが最新なら（保存後にファイルが変わっていなければ）、控えのほうを描かせます。控えがない・古い場合は Glyphs 本来のプレビューのままです。
 - スタートウィンドウはプラグインの読み込みより前に一覧を作るため、読み込み後に一覧を作り直させます。開いているフォントは、保存の途中で控えが一時的に古く見えても控えを使います（保存の直後に書き直すため）。
-- A と g にストロークがないフォントでは何もしません。Finder の Quick Look は Glyphs の外で動くため変わりません。
+- A と g にストロークがないフォントでは何もしません。
+
+## Finder のアイコン
+
+Finder に出る .glyphs ファイルのアイコン（「Ag」）にも、ストロークの輪郭が出ます。
+
+- Finder のアイコンも、Glyphs の Quick Look 拡張がプラグインなしでファイルから直接描くため、そのままでは中心線しか出ません。この拡張は Glyphs の外で動くので、プラグインからは割り込めません。
+- そこで、Glyphs で開いたときと保存したときに、スタートウィンドウの控えを同じ Quick Look 拡張に描かせ、その画像をファイルのカスタムアイコンにします（Finder の「情報を見る」でアイコンを貼るのと同じです）。アイコンはファイルの拡張属性（`com.apple.ResourceFork` と `com.apple.FinderInfo`）に入り、フォントのデータは変わりません。プラグインが付けたアイコンには、印の拡張属性 `com.codex.VariableStroke.icon` を付けます。
+- A と g からストロークがなくなると、印のあるアイコンだけを外します。自分で貼ったカスタムアイコンには触りません。
+- `.glyphspackage` は対象外です。Glyphs の外でファイルを書き換えた場合は、次に Glyphs で開くか保存するまで古いアイコンのままです。git やクラウドへのコピーでは拡張属性が落ちるため、Glyphs 本来のアイコンに戻ります。
+- スペースキーで開く Quick Look のプレビューは変わりません。
 
 ## 仕組み
 
@@ -259,6 +269,7 @@ Glyphs.defaults["com.codex.VariableStroke.inspectorMode"] = "callback"
 | マスターの既定の幅・高さ・角度 | マスターの `userData` |
 | 線幅プロファイル（曲線・名前・分割数） | フォントの `userData` |
 | スタートウィンドウのプレビューの控え | `~/Library/Caches/com.codex.VariableStroke/StartWindow` |
+| Finder のアイコンと、プラグインが付けた印 | ファイルの拡張属性（`com.apple.ResourceFork`・`com.apple.FinderInfo`・`com.codex.VariableStroke.icon`） |
 | ストロークが使うプロファイルの ID | パスの `attributes` |
 
 以前の版で保存したノードごとの絶対幅は、ファイルを開いたときに、パス内の最大幅を基準にした％へ換算されます。
