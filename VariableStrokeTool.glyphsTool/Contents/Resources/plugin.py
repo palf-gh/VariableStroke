@@ -70,6 +70,7 @@ from profile_editor import VariableStrokeProfileEditor, fill_popup, sorted_profi
 from clipboard_export import svg_document, pdf_document
 import start_thumbnails
 import file_icon
+import file_preview
 from variable_stroke_core import (unit, sub, add, mul, length, outline_curves,
                                   cap_curve_coordinates,
                                   nib_edges, ellipse_nib_edges)
@@ -394,6 +395,22 @@ def _file_icon(font, stale_only=False):
         return
     try:
         file_icon.update(path, start_thumbnails.cached_preview(path), stale_only)
+    except Exception:
+        print(traceback.format_exc())
+
+
+def _file_preview(font, stale_only=False):
+    """Keep the picture Quick Look shows with `font`'s file: its start window
+    stand-in drawn large, or none when it has none (see file_preview); with
+    `stale_only`, only when the file has none for its contents."""
+    try:
+        path = font.filepath
+    except Exception:
+        path = None
+    if not path:
+        return
+    try:
+        file_preview.update(path, start_thumbnails.cached_preview(path), stale_only)
     except Exception:
         print(traceback.format_exc())
 
@@ -1784,6 +1801,7 @@ class VariableStrokeTool(SelectTool):
             self._cleanup_font(font)
             _start_window_preview(font, stale_only=True)
             _file_icon(font, stale_only=True)
+            _file_preview(font, stale_only=True)
         self._sync_export()
 
     @objc.python_method
@@ -2185,6 +2203,7 @@ class VariableStrokeTool(SelectTool):
         try:
             _start_window_preview(notification.object().font, stale_only=True)
             _file_icon(notification.object().font, stale_only=True)
+            _file_preview(notification.object().font, stale_only=True)
         except Exception:
             print(traceback.format_exc())
         self._sync_export()
@@ -2203,6 +2222,7 @@ class VariableStrokeTool(SelectTool):
         try:
             _start_window_preview(notification.object().font)
             _file_icon(notification.object().font)
+            _file_preview(notification.object().font)
         except Exception:
             print(traceback.format_exc())
 

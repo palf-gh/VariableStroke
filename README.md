@@ -230,7 +230,20 @@ Finder に出る .glyphs ファイルのアイコン（「Ag」）にも、ス�
 - そこで、Glyphs で開いたときと保存したときに、スタートウィンドウの控えを同じ Quick Look 拡張に描かせ、その画像をファイルのカスタムアイコンにします（Finder の「情報を見る」でアイコンを貼るのと同じです）。アイコンはファイルの拡張属性（`com.apple.ResourceFork` と `com.apple.FinderInfo`）に入り、フォントのデータは変わりません。プラグインが付けたアイコンには、印の拡張属性 `com.codex.VariableStroke.icon` を付けます。
 - A と g からストロークがなくなると、印のあるアイコンだけを外します。自分で貼ったカスタムアイコンには触りません。
 - `.glyphspackage` は対象外です。Glyphs の外でファイルを書き換えた場合は、次に Glyphs で開くか保存するまで古いアイコンのままです。git やクラウドへのコピーでは拡張属性が落ちるため、Glyphs 本来のアイコンに戻ります。
-- スペースキーで開く Quick Look のプレビューは変わりません。
+- スペースキーで開く Quick Look のプレビューは、次の「Quick Look のプレビュー」を参照してください。
+
+## Quick Look のプレビュー
+
+Finder でスペースキーを押したときの Quick Look のプレビューにも、ストロークの輪郭が出ます。これには、別に Quick Look 拡張を入れる必要があります。
+
+```bash
+QuickLook/install.sh
+```
+
+- Glyphs で開いたときと保存したときに、スタートウィンドウの控え（A と g のストロークを輪郭にしたもの）を Glyphs の Quick Look 拡張に大きく描かせ、その PNG をファイルの拡張属性 `com.codex.VariableStroke.preview` に入れます。どの状態のファイルから作ったか（更新日時とサイズ）は `com.codex.VariableStroke.previewStamp` に書きます。フォントのデータは変わりません。
+- `QuickLook/install.sh` は、`VariableStroke Quick Look.app` をビルドして `~/Applications` に入れ、その Quick Look 拡張を登録します。同じ種類のファイルに拡張が複数あると Quick Look がどれを使うかは決まらないので、Glyphs 3／4 の Quick Look 拡張は使わない設定にします（`pluginkit -e ignore`）。この Mac だけで動く署名（ad-hoc）です。
+- 拡張は、PNG が今のファイルから作られたものなら、それを出します。PNG がない、または古い場合（A と g にストロークがない、プラグインなしで保存した、Glyphs の外で書き換えた、`.glyphspackage` など）は、Glyphs 本来のサムネイル（「Ag」）を大きく出します。
+- やめるときは `QuickLook/uninstall.sh` を実行します。拡張を外し、Glyphs の Quick Look 拡張を元に戻します。
 
 ## 仕組み
 
@@ -269,6 +282,7 @@ Glyphs.defaults["com.codex.VariableStroke.inspectorMode"] = "callback"
 | マスターの既定の幅・高さ・角度 | マスターの `userData` |
 | 線幅プロファイル（曲線・名前・分割数） | フォントの `userData` |
 | スタートウィンドウのプレビューの控え | `~/Library/Caches/com.codex.VariableStroke/StartWindow` |
+| Quick Look のプレビューの PNG と、その元のファイルの状態 | ファイルの拡張属性（`com.codex.VariableStroke.preview`・`com.codex.VariableStroke.previewStamp`） |
 | Finder のアイコンと、プラグインが付けた印 | ファイルの拡張属性（`com.apple.ResourceFork`・`com.apple.FinderInfo`・`com.codex.VariableStroke.icon`） |
 | ストロークが使うプロファイルの ID | パスの `attributes` |
 

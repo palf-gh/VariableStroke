@@ -151,18 +151,19 @@ def _on_main_thread(work):
         NSOperationQueue.mainQueue().addOperationWithBlock_(run)
 
 
-def render_thumbnail(stand_in, done):
-    """Have Glyphs' own Quick Look thumbnail extension draw `stand_in` as an
-    icon, as Finder would draw the font's file, and pass the NSImage (or None)
-    to `done`, on the main thread."""
+def render_thumbnail(stand_in, done, size=ICON_SIZE, icon_mode=True):
+    """Have Glyphs' own Quick Look thumbnail extension draw `stand_in`, `size`
+    points square (as an icon, as Finder would draw the font's file, with
+    `icon_mode`), and pass the NSImage (or None) to `done`, on the main
+    thread."""
     from Foundation import NSURL
     from QuickLookThumbnailing import (QLThumbnailGenerator, QLThumbnailGenerationRequest,
                                        QLThumbnailGenerationRequestRepresentationTypeThumbnail)
     request = QLThumbnailGenerationRequest.alloc() \
         .initWithFileAtURL_size_scale_representationTypes_(
-            NSURL.fileURLWithPath_(stand_in), (ICON_SIZE, ICON_SIZE), 2.0,
+            NSURL.fileURLWithPath_(stand_in), (size, size), 2.0,
             QLThumbnailGenerationRequestRepresentationTypeThumbnail)
-    request.setIconMode_(True)
+    request.setIconMode_(icon_mode)
 
     def finished(representation, error):
         image = None
@@ -170,7 +171,7 @@ def render_thumbnail(stand_in, done):
             if representation is not None:
                 image = representation.NSImage()
                 if image is not None:  # 2x pixels on a 1x canvas
-                    image.setSize_((ICON_SIZE, ICON_SIZE))
+                    image.setSize_((size, size))
         except Exception:
             print(traceback.format_exc())
         _on_main_thread(lambda: done(image))
