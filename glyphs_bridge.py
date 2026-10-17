@@ -3136,8 +3136,11 @@ def _replace_user_data(node, data):
 # path index). interpolate_layer gives each blended path a token (BLEND_KEY)
 # naming its entry in _BLENDS, together with the positions and values the blend
 # was made for, so a layer that differs from them computes its own outline.
+# Vertical Axis Reversal reads the masters of some 235 glyphs per static style
+# (about 3500 entries: records, outlines and values); the size keeps them all
+# from one style to the next.
 _SOURCE_OUTLINES = collections.OrderedDict()
-_SOURCE_OUTLINES_SIZE = 4096
+_SOURCE_OUTLINES_SIZE = 16384
 _BLENDS = collections.OrderedDict()
 _BLENDS_SIZE = 4096
 # Interpolated values a blend is checked against (all plain numbers).
