@@ -1,3 +1,4 @@
+import collections
 import importlib
 import math
 import sys
@@ -2301,6 +2302,11 @@ class CachedConversionTests(unittest.TestCase):
         # copies, not the kept templates or the first glyph's paths
         self.assertIsNot(second.layers[0].shapes[0], first.layers[0].shapes[0])
 
+    def test_conversions_are_kept_by_a_short_digest(self):
+        bridge.convert_glyph_cached(self.glyph())
+        self.assertEqual([(type(key), len(key)) for key in bridge._CONVERSIONS],
+                         [(bytes, 20)])
+
     def test_any_change_computes_again(self):
         bridge.convert_glyph_cached(self.glyph())
         moved = self.glyph(x=120)
@@ -2404,6 +2410,56 @@ class CachedConversionTests(unittest.TestCase):
         self.assertEqual(failed, [True])
         self.assertEqual(second_result, [(2, False)])
         self.assertEqual(bridge._CONVERTING, {})
+
+
+class ExportHoldTests(unittest.TestCase):
+    """hold_export_caches: an export keeps every master outline it read."""
+
+    def setUp(self):
+        self.size = bridge._SOURCE_OUTLINES_SIZE
+        bridge._SOURCE_OUTLINES_SIZE = 3
+        bridge._SOURCE_OUTLINES.clear()
+        bridge._EXPORT_HOLDS.clear()
+
+    def tearDown(self):
+        bridge._SOURCE_OUTLINES_SIZE = self.size
+        bridge._SOURCE_OUTLINES.clear()
+        bridge._EXPORT_HOLDS.clear()
+
+    def remember(self, count):
+        for index in range(count):
+            bridge._remember(bridge._SOURCE_OUTLINES, bridge._SOURCE_OUTLINES_SIZE,
+                             ('k', index), index)
+
+    def test_nothing_leaves_while_held_and_the_latest_stay_after(self):
+        self.remember(5)
+        self.assertEqual(len(bridge._SOURCE_OUTLINES), 3)  # not held: the usual size
+        bridge._SOURCE_OUTLINES.clear()
+        bridge.hold_export_caches('style 1')
+        bridge.hold_export_caches('style 2')
+        self.remember(10)
+        self.assertEqual(len(bridge._SOURCE_OUTLINES), 10)
+        bridge.release_export_caches('style 1')
+        self.assertEqual(len(bridge._SOURCE_OUTLINES), 10)  # style 2 still exports
+        bridge.release_export_caches('style 2')
+        self.assertEqual(list(bridge._SOURCE_OUTLINES), [('k', 7), ('k', 8), ('k', 9)])
+        bridge.release_export_caches('never held')  # harmless
+
+    def test_other_tables_keep_their_size(self):
+        bridge.hold_export_caches('style')
+        table = collections.OrderedDict()
+        for index in range(5):
+            bridge._remember(table, 3, index, index)
+        self.assertEqual(list(table), [2, 3, 4])
+
+    def test_a_hold_never_released_lapses(self):
+        bridge.hold_export_caches('failed style')
+        bridge._EXPORT_HOLDS['failed style'] -= bridge._EXPORT_HOLD_LIMIT + 1
+        bridge.hold_export_caches('next export')
+        self.assertEqual(list(bridge._EXPORT_HOLDS), ['next export'])
+        self.remember(5)
+        bridge.release_export_caches('next export')
+        self.assertEqual(len(bridge._SOURCE_OUTLINES), 3)
 
 
 if __name__ == '__main__':

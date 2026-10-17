@@ -1,6 +1,7 @@
 """Glyphs 3 adapters shared by the editing tool and the export filter."""
 import collections
 import contextlib
+import hashlib
 import json
 import math
 import threading
@@ -3136,11 +3137,14 @@ def _replace_user_data(node, data):
 # path index). interpolate_layer gives each blended path a token (BLEND_KEY)
 # naming its entry in _BLENDS, together with the positions and values the blend
 # was made for, so a layer that differs from them computes its own outline.
-# Vertical Axis Reversal reads the masters of some 235 glyphs per static style
-# (about 3500 entries: records, outlines and values); the size keeps them all
-# from one style to the next.
+# While an export holds them (hold_export_caches), nothing leaves: Vertical Axis
+# Reversal reads the masters of every CJK glyph with strokes in each static
+# style (about 20 entries a glyph), and with any fixed size a font with more
+# glyphs than fit would find none left by the next style.
 _SOURCE_OUTLINES = collections.OrderedDict()
-_SOURCE_OUTLINES_SIZE = 16384
+_SOURCE_OUTLINES_SIZE = 4096
+_EXPORT_HOLDS = {}  # token: time held (see hold_export_caches)
+_EXPORT_HOLD_LIMIT = 3600.0  # seconds; a hold never released (failed export) lapses
 _BLENDS = collections.OrderedDict()
 _BLENDS_SIZE = 4096
 # Interpolated values a blend is checked against (all plain numbers).
@@ -3153,8 +3157,37 @@ def _remember(table, size, key, value):
     with _CACHE_LOCK:
         table[key] = value
         table.move_to_end(key)
+        if table is _SOURCE_OUTLINES and _EXPORT_HOLDS:
+            return
         while len(table) > size:
             table.popitem(last=False)
+
+
+def hold_export_caches(token):
+    """Keep every master outline read until release_export_caches(token): an
+    export reads the same masters again for each of its styles. Holds older
+    than _EXPORT_HOLD_LIMIT lapse, so a style that never finished does not keep
+    the cache unbounded."""
+    with _CACHE_LOCK:
+        now = time.time()
+        for stale in [key for key, since in _EXPORT_HOLDS.items()
+                      if now - since > _EXPORT_HOLD_LIMIT]:
+            del _EXPORT_HOLDS[stale]
+        _EXPORT_HOLDS[token] = now
+
+
+def release_export_caches(token):
+    """End the hold `token` took; with the last one gone the cache shrinks
+    back to its size, keeping the latest entries."""
+    with _CACHE_LOCK:
+        _EXPORT_HOLDS.pop(token, None)
+        if not _EXPORT_HOLDS:
+            _trim_source_outlines()
+
+
+def _trim_source_outlines():
+    while len(_SOURCE_OUTLINES) > _SOURCE_OUTLINES_SIZE:
+        _SOURCE_OUTLINES.popitem(last=False)
 
 
 def _number_or_none(value):
@@ -3811,9 +3844,10 @@ def _shape_signature(shape):
 
 
 def _glyph_signature(glyph):
-    """What convert_glyph reads from a glyph, as one hashable value: per layer
-    its identity, settings, master defaults and every path's nodes (positions,
-    types, userData), attributes and width profile."""
+    """What convert_glyph reads from a glyph, as a digest of: per layer its
+    identity, settings, master defaults and every path's nodes (positions,
+    types, userData), attributes and width profile. (The contents themselves
+    took more memory than the outlines they keep.)"""
     layers = []
     for layer in glyph.layers:
         defaults = layer_defaults(layer)
@@ -3823,7 +3857,9 @@ def _glyph_signature(glyph):
                        (defaults.width, defaults.height, defaults.italic_angle,
                         defaults.nib_angle),
                        tuple(_shape_signature(shape) for shape in list(layer.shapes))))
-    return (getattr(glyph, 'name', None), _stored(glyph, 'userData'), tuple(layers))
+    contents = (getattr(glyph, 'name', None), _stored(glyph, 'userData'), tuple(layers))
+    return hashlib.blake2b(repr(contents).encode('utf-8', 'surrogatepass'),
+                           digest_size=20).digest()
 
 
 def _position_of(shapes, path):
