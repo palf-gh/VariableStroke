@@ -181,9 +181,15 @@ def render_thumbnail(stand_in, done):
 def set_icon(image, path):
     """Set `image` as the custom icon of the file at `path`, or with None,
     take it off (Finder clears its flag but keeps the resource fork, which
-    held nothing else)."""
+    held nothing else). The file's modification time is put back: Finder
+    moves it on, and Glyphs would then take the file for changed by another
+    program (and the start window's stand-in for out of date)."""
     from AppKit import NSWorkspace
-    done = bool(NSWorkspace.sharedWorkspace().setIcon_forFile_options_(image, path, 0))
-    if image is None:
-        remove_xattr(path, _RESOURCE_FORK)
+    before = os.stat(path)
+    try:
+        done = bool(NSWorkspace.sharedWorkspace().setIcon_forFile_options_(image, path, 0))
+        if image is None:
+            remove_xattr(path, _RESOURCE_FORK)
+    finally:
+        os.utime(path, ns=(before.st_atime_ns, before.st_mtime_ns))
     return done
